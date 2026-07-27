@@ -1020,3 +1020,40 @@ func TestProbeMetricsUseOnlyActiveTraceV3Snapshots(t *testing.T) {
 		t.Fatalf("probe metrics endpoint did not expose metrics: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestOperatorEffectiveActionBecomesTheLearnedSymptomRemediation(t *testing.T) {
+	// The evaluation form records what actually fixed the incident
+	// (EffectiveAction -> case card successful_actions). The compiled symptom
+	// must carry it as its resolved_by edge: a learned symptom without actions
+	// is a matcher that can never help an operator.
+	snapshot := eligibleKnowledgeSnapshot()
+	card := snapshot.Snapshot["case_card"].(map[string]any)
+	card["successful_actions"] = []any{"raise the project quota", "retried after quota bump"}
+	card["failed_actions"] = []any{"retried after quota bump", "restarted the scheduler"}
+
+	candidate := knowledgeCandidateForSnapshot(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("expected ready candidate, got %+v", candidate)
+	}
+	compiled := candidate.Payload["compiled"].(map[string]any)
+	symptom := compiled["failure_modes"].([]any)[0].(map[string]any)["symptoms"].([]any)[0].(map[string]any)
+	actions := symptom["actions"].([]string)
+	if len(actions) != 1 || actions[0] != "raise the project quota" {
+		t.Fatalf("expected the confirmed-effective action only (ineffective ones excluded), got %v", actions)
+	}
+
+	// No recorded effective action -> empty, never invented.
+	bare := cloneCaseSnapshot(snapshot)
+	bareCard := bare.Snapshot["case_card"].(map[string]any)
+	delete(bareCard, "successful_actions")
+	delete(bareCard, "failed_actions")
+	bareCandidate := knowledgeCandidateForSnapshot(&bare)
+	if bareCandidate == nil {
+		t.Fatalf("expected candidate without actions to still compile")
+	}
+	bareCompiled := bareCandidate.Payload["compiled"].(map[string]any)
+	bareSymptom := bareCompiled["failure_modes"].([]any)[0].(map[string]any)["symptoms"].([]any)[0].(map[string]any)
+	if got := bareSymptom["actions"].([]string); len(got) != 0 {
+		t.Fatalf("expected no fabricated actions, got %v", got)
+	}
+}
