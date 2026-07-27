@@ -216,6 +216,7 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
               >
                 <span className="knowledge-candidate-topline"><Status value={candidate.status} /><time>{formatTime(candidate.created_at || '')}</time></span>
                 <strong>{candidate.title || 'Untitled incident-derived candidate'}</strong>
+                {candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world' && <strong>novel · matcher-only</strong>}
                 <span>{candidate.root_cause_family || 'Unclassified family'} · {candidate.kind || 'kind not reported'} · {supportingCaseLabel(candidate)}</span>
               </button>
             ))}
@@ -291,7 +292,7 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
   );
 }
 
-function CandidateDetail({
+export function CandidateDetail({
   candidate,
   matchingPackage,
   busy,
@@ -305,7 +306,15 @@ function CandidateDetail({
   const evidence = candidate.evidence_summaries ?? [];
   const canReview = candidate.status === 'ready_for_review';
   const canActivate = candidate.status === 'shadow';
-  const provenance = safeProvenanceEntries(candidate.provenance);
+  // Reviewers judge the knowledge CHAIN (family ← symptom → action), so those
+  // lead the grid. Analysis hash and case id are backend identity plumbing —
+  // they stay in the payload but never on screen.
+  const provenance = safeProvenanceEntries(candidate.provenance)
+    .filter(([key]) => key !== 'case_id' && key !== 'incident_id');
+  const symptoms = (candidate.payload?.compiled?.failure_modes ?? []).flatMap((mode) => mode.symptoms ?? []);
+  const mechanism = candidate.payload?.mechanism || symptoms[0]?.name || '';
+  const confirmedActions = symptoms.flatMap((symptom) => symptom.actions ?? []);
+  const matcherOnly = candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world';
   return (
     <>
       <div className="knowledge-panel-head candidate-detail-head">
@@ -313,17 +322,24 @@ function CandidateDetail({
           <p className="eyebrow">Candidate detail</p>
           <h3>{candidate.title || 'Untitled incident-derived candidate'}</h3>
           <span>{candidate.root_cause_family || 'Unclassified family'} · confidence {formatConfidence(candidate.confidence)}</span>
+          {matcherOnly && <strong>novel · matcher-only</strong>}
         </div>
         <Status value={candidate.status} />
       </div>
       <div className="knowledge-detail-content">
         <p className="knowledge-summary">{candidate.summary || 'No candidate summary was reported.'}</p>
         <dl className="knowledge-provenance">
-          <div><dt>Incident</dt><dd>{candidate.incident_id || 'not reported'}</dd></div>
-          <div><dt>Kind</dt><dd>{candidate.kind || 'not reported'}</dd></div>
+          <div><dt>Family</dt><dd><code>{candidate.root_cause_family || 'unclassified'}</code></dd></div>
+          <div><dt>Symptom (mechanism)</dt><dd>{mechanism || 'not reported'}</dd></div>
+          <div>
+            <dt>Confirmed actions</dt>
+            <dd>{confirmedActions.length > 0
+              ? confirmedActions.join(' · ')
+              : 'none recorded — add the effective action in the evaluation review'}</dd>
+          </div>
           <div><dt>Supporting cases</dt><dd>{supportingCaseLabel(candidate)}</dd></div>
+          <div><dt>Incident</dt><dd>{candidate.incident_id || 'not reported'}</dd></div>
           <div><dt>Analysis run</dt><dd>{candidate.analysis_run_id || 'not reported'}</dd></div>
-          <div><dt>Analysis hash</dt><dd><code>{candidate.analysis_hash || 'not reported'}</code></dd></div>
           <div><dt>Observed</dt><dd>{candidate.created_at ? formatTime(candidate.created_at) : 'not reported'}</dd></div>
           {candidate.decided_at && <div><dt>Decided</dt><dd>{formatTime(candidate.decided_at)}</dd></div>}
           {candidate.decided_by && <div><dt>Decided by</dt><dd>{candidate.decided_by}</dd></div>}
@@ -392,6 +408,7 @@ export function IngestionPreview({ candidate }: { candidate: KnowledgeCandidate 
   return (
     <section className="knowledge-ingestion-preview">
       <strong>Ingestion preview — what activation writes</strong>
+      {candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world' && <small>Activation matches future incidents but never names the headline family.</small>}
       {symptoms.map((symptom, index) => (
         <div className="knowledge-ingestion-symptom" key={symptom.name || index}>
           <span>

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -659,6 +660,7 @@ def load_architecture(path: str) -> dict[str, dict[str, Any]]:
             "family": str(entry.get("family") or ""),
             "owns_schema": str(entry.get("owns_schema") or ""),
             "depends_on": [str(d) for d in (entry.get("depends_on") or [])],
+            "services": [str(s) for s in (entry.get("services") or [])],
             "checks": [str(c) for c in (entry.get("checks") or [])],
             "saas_only": bool(entry.get("saas_only")),
         }
@@ -1600,6 +1602,11 @@ def match_failure_mode_symptoms(
         kept.append((family, {**symptom, "matched_keywords": hits}))
         kept_hits.append(hits)
     return kept
+
+
+def is_matcher_only_family(family: str) -> bool:
+    """True for learned/open-world families that may match but never lead RCA."""
+    return family.startswith("novel_")
 
 
 _GENERIC_CONTEXT_HITS = {

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import re
 import sys
 from datetime import datetime
@@ -31,6 +32,7 @@ from typing import Any
 from app.collectors.base import resolve_target
 from app.config import load_settings
 from app.knowledge import load_family_catalog
+from app.masking import build_masker
 from app.ontology.typedb_client import escape_typeql as esc
 from ontology.incident import OntologyIncident
 from ontology.load_knowledge import (
@@ -40,6 +42,10 @@ from ontology.load_knowledge import (
     _relate_indicates,
     _relate_resolved_by,
 )
+from ontology.normalization import confidence_score
+
+_log = logging.getLogger(__name__)
+_MASKER = build_masker((r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b",))
 
 _SELECT_INCIDENTS = """
 SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
@@ -420,11 +426,49 @@ def _replace_attr(
         f'match $x isa {etype}, has {key_attr} "{esc(key_value)}", has {attr} $old; '
         f"delete has $old of $x;"
     ).resolve()
+    if attr == "confidence":
+        score = confidence_score(new_value)
+        if score is not None and etype in {"analysis_run", "evidence", "hypothesis", "root_cause"}:
+            _replace_attr(tx, etype, key_attr, key_value, "confidence_score", score, quoted=False)
     value = f'"{esc(str(new_value))}"' if quoted else str(new_value)
     tx.query(
         f'match $x isa {etype}, has {key_attr} "{esc(key_value)}"; '
         f"insert $x has {attr} {value};"
     ).resolve()
+
+
+def _iso_or_empty(value: object) -> str:
+    """Keep only ISO-8601 UTC strings; string-backed schema stays compatible."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        _log.warning("dropping malformed ontology timestamp: %r", text)
+        return ""
+    if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+        _log.warning("dropping non-UTC ontology timestamp: %r", text)
+        return ""
+    return text
+
+
+def _safe_text(value: object, limit: int) -> str:
+    return " ".join(_MASKER.mask_text(str(value or "")).split())[:limit]
+
+
+def _evidence_type(item: dict[str, Any]) -> str:
+    source = f"{item.get('source') or item.get('agent') or ''} {item.get('source_group') or ''}".lower()
+    predicate = str(item.get("predicate") or "").lower()
+    if "loki" in source:
+        return "log_evidence"
+    if "prometheus" in source:
+        return "metric_evidence"
+    if "event" in source or "event" in predicate:
+        return "event_evidence"
+    if source or predicate:
+        return "state_evidence"
+    return "evidence"
 
 
 def _relate(
@@ -535,6 +579,16 @@ def _ensure_diagnosis(
             f"match {match} $d isa diagnosis, links (run: $r, incident: $i, cause: $c), has {attr} $old; "
             f"delete has $old of $d;"
         ).resolve()
+    score = confidence_score(confidence)
+    if score is not None:
+        tx.query(
+            f"match {match} $d isa diagnosis, links (run: $r, incident: $i, cause: $c), has confidence_score $old; "
+            "delete has $old of $d;"
+        ).resolve()
+        tx.query(
+            f"match {match} $d isa diagnosis, links (run: $r, incident: $i, cause: $c); "
+            f"insert $d has confidence_score {score};"
+        ).resolve()
         literal = value if attr == "harness_score" else f'"{esc(value)}"'
         tx.query(
             f"match {match} $d isa diagnosis, links (run: $r, incident: $i, cause: $c); "
@@ -547,12 +601,12 @@ def _ensure_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any]) -> st
     if not inc.run_id or not evidence_id:
         return ""
     key = f"{inc.run_id}:{evidence_id}"
-    _ensure(tx, "evidence", "evidence_id", key)
+    _ensure(tx, _evidence_type(item), "evidence_id", key)
     values = {
         "artifact_ref": key,
         "source": str(item.get("source") or item.get("agent") or ""),
         "evidence_type": str(item.get("type") or ""),
-        "summary": " ".join(str(item.get("summary") or "").split())[:1200],
+        "summary": _safe_text(item.get("summary"), 1200),
         "confidence": str(item.get("confidence") or "low"),
     }
     for attr, value in values.items():
@@ -586,7 +640,7 @@ def _ensure_trace_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any])
     if not local_id:
         return ""
     evidence_id = _trace_key(inc, local_id)
-    _ensure(tx, "evidence", "evidence_id", evidence_id)
+    _ensure(tx, _evidence_type(item), "evidence_id", evidence_id)
     # Every field below is supplied by the trace-v3 evidence object itself.
     # In particular, do not copy these values from an artifact or a v1/v2 trace.
     window = item.get("observation_window")
@@ -594,16 +648,16 @@ def _ensure_trace_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any])
     values = {
         "artifact_ref": local_id,
         "trace_local_id": local_id,
-        "source": _trace_text(item.get("source"), 120),
-        "observed_entity": _trace_text(item.get("entity"), 300),
-        "source_group": _trace_text(item.get("source_group"), 120),
-        "predicate": _trace_text(item.get("predicate"), 300),
-        "observed_value": _trace_text(item.get("value"), 500),
+        "source": _safe_text(item.get("source"), 120),
+        "observed_entity": _safe_text(item.get("entity"), 300),
+        "source_group": _safe_text(item.get("source_group"), 120),
+        "predicate": _safe_text(item.get("predicate"), 300),
+        "observed_value": _safe_text(item.get("value"), 500),
         "polarity": _trace_text(item.get("polarity"), 80),
         "coverage": _trace_text(item.get("coverage"), 120),
         "quality": _trace_text(item.get("quality"), 120),
-        "observed_window_start": _trace_text(window.get("start"), 80),
-        "observed_window_end": _trace_text(window.get("end"), 80),
+        "observed_window_start": _iso_or_empty(window.get("start")),
+        "observed_window_end": _iso_or_empty(window.get("end")),
     }
     for attr, value in values.items():
         if value:
@@ -737,7 +791,7 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident) -> None:
         for attr, value in {
             "trace_local_id": local_execution_id,
             "probe_verdict": _trace_text(item.get("verdict"), 80),
-            "executed_at": _trace_text(item.get("executed_at"), 80),
+            "executed_at": _iso_or_empty(item.get("executed_at")),
         }.items():
             if value:
                 _replace_attr(tx, "probe_execution", "probe_execution_id", execution_id, attr, value)
@@ -819,7 +873,8 @@ def _ensure_case_projection(tx: Any, inc: OntologyIncident, family: str) -> None
     if inc.analysis_hash:
         _replace_attr(tx, "case_snapshot", "case_id", inc.case_id, "analysis_hash", inc.analysis_hash)
     if inc.user_approved_at:
-        _replace_attr(tx, "case_snapshot", "case_id", inc.case_id, "approved_at", inc.user_approved_at)
+        if approved_at := _iso_or_empty(inc.user_approved_at):
+            _replace_attr(tx, "case_snapshot", "case_id", inc.case_id, "approved_at", approved_at)
     # Keep the immutable approval record self-describing for the retrieval
     # projection. Empty mechanism values are represented inside case_card rather
     # than forced as TypeDB attributes, so legacy snapshots remain queryable.
@@ -1023,15 +1078,22 @@ def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
 
 
 def _write_incident(tx: Any, inc: OntologyIncident) -> None:
-    # keyed singletons (match-or-insert)
-    _ensure(tx, "cluster", "name", inc.cluster)
+    # keyed singletons (match-or-insert). The infra layer is deliberately just
+    # node + workload; cluster/namespace/project/queue ride as attributes
+    # (2026-07-27 simplification — they were entities with write-only relations).
     _ensure(tx, "node", "name", inc.node)
-    _ensure(tx, "namespace", "name", inc.namespace)
-    _ensure(tx, "project", "name", inc.project)
-    _ensure(tx, "queue", "name", inc.queue)
     _ensure(tx, "workload", "name", inc.workload_name)
     _ensure(tx, "incident", "incident_id", inc.incident_id)
     _ensure(tx, "alert", "alert_id", inc.alert_id)
+    if inc.node:
+        _replace_attr(tx, "node", "name", inc.node, "cluster_name", inc.cluster)
+    if inc.workload_name:
+        for attr, value in (
+            ("namespace_name", inc.namespace),
+            ("project_name", inc.project),
+            ("queue_name", inc.queue),
+        ):
+            _replace_attr(tx, "workload", "name", inc.workload_name, attr, value)
 
     # incident attributes (replace-in-place so re-projection updates, not duplicates)
     for attr, value in (
@@ -1039,12 +1101,12 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
         ("severity", inc.severity),
         ("status", inc.status),
         ("correlation_key", inc.correlation_key),
-        ("analysis_summary", inc.analysis_summary),
+        ("analysis_summary", _safe_text(inc.analysis_summary, 1200)),
     ):
         _replace_attr(tx, "incident", "incident_id", inc.incident_id, attr, value)
-    if inc.user_approved_at:
+    if approved_at := _iso_or_empty(inc.user_approved_at):
         _replace_attr(
-            tx, "incident", "incident_id", inc.incident_id, "approved_at", inc.user_approved_at
+            tx, "incident", "incident_id", inc.incident_id, "approved_at", approved_at
         )
 
     # alert attributes + grouped_into(incident, alert). Replace-in-place (like the
@@ -1056,6 +1118,10 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
             ("severity", inc.severity),
             ("status", inc.status),
             ("fingerprint", inc.fingerprint),
+            # Where it fired: attributes, so node/namespace incident history is
+            # a one-line filter instead of a relation walk.
+            ("node_name", inc.node),
+            ("namespace_name", inc.namespace),
         ):
             _replace_attr(tx, "alert", "alert_id", inc.alert_id, attr, value)
         _replace_attr(
@@ -1069,27 +1135,54 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
             "grouped_into", "incident", "member",
         )
 
-    # topology relations (each skipped when either end is missing)
-    _relate(tx, ("cluster", "name", inc.cluster), ("node", "name", inc.node),
-            "scopes", "scope", "member")
-    _relate(tx, ("cluster", "name", inc.cluster), ("project", "name", inc.project),
-            "scopes", "scope", "member")
-    _relate(tx, ("project", "name", inc.project), ("workload", "name", inc.workload_name),
-            "in_project", "project", "member")
-    _relate(tx, ("queue", "name", inc.queue), ("workload", "name", inc.workload_name),
-            "submitted_to", "queue", "job")
-
-    # pods (occurrence) -> runs_on node + belongs_to workload + contains namespace
-    for pod in inc.occurrence_pods[:25]:
-        _ensure(tx, "pod", "name", pod)
-        _relate(tx, ("node", "name", inc.node), ("pod", "name", pod),
-                "runs_on", "host", "guest")
-        _relate(tx, ("workload", "name", inc.workload_name), ("pod", "name", pod),
-                "belongs_to", "owner", "member")
-        _relate(tx, ("namespace", "name", inc.namespace), ("pod", "name", pod),
-                "contains", "space", "occupant")
+    # The one topology relation: node hosts workload (skipped when either end
+    # is missing). Pods are intentionally NOT entities — controller-suffixed
+    # pod names change on every restart and were accumulating dead vertices;
+    # the stable workload identity carries the topology.
+    _relate(tx, ("node", "name", inc.node), ("workload", "name", inc.workload_name),
+            "runs_on", "host", "guest")
+    _write_workload_topology(tx, inc)
 
     _write_run_projection(tx, inc)
+
+
+def _write_workload_topology(tx: Any, inc: OntologyIncident) -> None:
+    """Project the analysis's observed Service/PVC attachments under the STEM
+    workload identity (the collector's workload_topology artifact). Service and
+    PVC names survive pod restarts, so these edges stay browsable — "workloads
+    with this name expose these Services / use this PVC"."""
+    if not inc.workload_name:
+        return
+    topology = next(
+        (
+            item.get("result")
+            for item in inc.artifacts or []
+            if isinstance(item, dict)
+            and str(item.get("type") or "") == "workload_topology"
+            and isinstance(item.get("result"), dict)
+        ),
+        None,
+    )
+    if not topology:
+        return
+    for name in topology.get("services") or []:
+        service = str(name).strip()
+        if not service:
+            continue
+        _ensure(tx, "service", "name", service)
+        if inc.namespace:
+            _replace_attr(tx, "service", "name", service, "namespace_name", inc.namespace)
+        _relate(tx, ("service", "name", service), ("workload", "name", inc.workload_name),
+                "exposes", "endpoint", "backend")
+    for name in topology.get("pvcs") or []:
+        claim = str(name).strip()
+        if not claim:
+            continue
+        _ensure(tx, "pvc", "name", claim)
+        if inc.namespace:
+            _replace_attr(tx, "pvc", "name", claim, "namespace_name", inc.namespace)
+        _relate(tx, ("workload", "name", inc.workload_name), ("pvc", "name", claim),
+                "uses_storage", "consumer", "storage")
 
 
 # --- knowledge promotion (--promote-knowledge) --------------------------------

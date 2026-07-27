@@ -188,6 +188,72 @@ def test_query_kg_escapes_typeql_literals() -> None:
     assert 'has incident_id "INC-1"; delete' not in joined
 
 
+def test_query_kg_surfaces_location_history_and_renders_it() -> None:
+    # The infra layer's "have we seen trouble HERE before": resolved incidents
+    # whose alerts fired at the same node/namespace, any alert name.
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "has node_name" in query:
+                    return [{"iid": "INC-node-1", "sum": "GPU fell off the bus."}]
+                if "has namespace_name" in query:
+                    return [
+                        {"iid": "INC-node-1", "sum": "duplicate — must dedupe"},
+                        {"iid": "INC-ns-2", "sum": "quota exhausted in namespace."},
+                    ]
+                return []
+
+            yield run
+
+    target = replace(_target(), namespace="runai-vision")
+    data = _query_kg(FakeClient(), target, [])  # type: ignore[arg-type]
+
+    history = data["location_history"]
+    assert [item["incident_id"] for item in history] == ["INC-node-1", "INC-ns-2"]
+    assert history[0]["where"] == "node gpu-1"
+    assert history[1]["where"] == "namespace runai-vision"
+
+    lines = _knowledge_base_lines(
+        {"enabled": True, "available": True, "location_history": history}, [], "", ""
+    )
+    joined = "\n".join(lines)
+    assert "2 past resolved incident(s)" in joined
+    assert "INC-node-1 (node gpu-1): GPU fell off the bus." in joined
+
+
+def test_query_kg_surfaces_workload_topology_and_storage_blast_radius() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "isa exposes" in query:
+                    return [{"sn": "runai-backend-workloads"}]
+                if "isa uses_storage" in query and 'isa pvc, has name "data-0"' in query:
+                    return [{"on": "runai-backend-workloads"}, {"on": "other-workload"}]
+                if "isa uses_storage" in query:
+                    return [{"pn": "data-0"}]
+                return []
+
+            yield run
+
+    target = replace(_target(), workload_name="runai-backend-workloads")
+    data = _query_kg(FakeClient(), target, [])  # type: ignore[arg-type]
+
+    topology = data["workload_topology"]
+    assert topology["services"] == ["runai-backend-workloads"]
+    assert topology["pvcs"] == ["data-0"]
+    # The workload itself is excluded from its own storage blast radius.
+    assert topology["shared_storage_workloads"] == ["other-workload"]
+
+    lines = _knowledge_base_lines(
+        {"enabled": True, "available": True, "workload_topology": topology}, [], "", ""
+    )
+    joined = "\n".join(lines)
+    assert "Workload topology" in joined
+    assert "PVC shared with 1 other workload(s): other-workload" in joined
+
+
 def test_query_kg_projects_typedb_symptom_metadata() -> None:
     class FakeClient:
         @contextmanager

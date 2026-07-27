@@ -1,14 +1,16 @@
-"""Load external NVIDIA support-case payloads into TypeDB as LABELLED priors.
+"""Load external NVIDIA support-case payloads into TypeDB as TRUSTED knowledge.
 
 Consumes each curated bundle's ``03_ingestion_payload.yaml`` (schema v2.0,
-``payload_kind: historical_incident_candidate``). These are external,
-curator-approved cases whose payloads self-declare
-``eligible_for_positive_promotion: false``. They are ingested ONLY as retrieval
-context — a ``case_snapshot`` + ``diagnosis`` + ``evidence`` + one case-local
-``symptom`` — never as knowledge-layer authority. This loader structurally never
-writes ``indicates``/``resolved_by`` edges, so ``_KNOWLEDGE_QUERY`` (which
-requires both) can never surface them; retrieval is via error-signature match on
-the case-local symptom keywords (see app/services/kg_enrichment.py).
+``payload_kind: historical_incident_candidate``). Owner decision 2026-07-27:
+these are vendor-support threads — trusted, so they enter the SAME
+family→symptom→action chain as curated knowledge (``indicates`` for the
+closed-catalog family, ``resolved_by`` for support-confirmed actions), which
+puts them on every knowledge surface: ``_KNOWLEDGE_QUERY`` → signature
+matching, the plan-time symptom lead, guidance and actions. Their
+diagnostic/preventive support-thread steps additionally become a per-case
+mini-runbook of ``diagnostic_step`` entities (never wired into the main
+executable walk — runbook-name scoping keeps walk_tree on the bundled tree).
+Error-signature retrieval on the ``ext:`` symptom keywords is unchanged.
 
     ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 \
         ./.venv/bin/python -m ontology.load_external_cases \
@@ -43,7 +45,14 @@ from app.config import load_settings
 from app.services.root_cause_ranking import novel_family_slug
 from ontology import ingest
 from ontology.incident import OntologyIncident
-from ontology.load_knowledge import _ensure_symptom
+from ontology.load_knowledge import (
+    FAMILIES,
+    _ensure_action,
+    _ensure_symptom,
+    _relate_indicates,
+    _relate_resolved_by,
+)
+from ontology.normalization import confidence_score
 
 PAYLOAD_NAME = "03_ingestion_payload.yaml"
 # Baked into the agent image (agent/Dockerfile COPYs knowledge/); the Helm
@@ -109,7 +118,7 @@ def _validate(payload: dict[str, Any]) -> str:
 def _confidence_bucket(value: Any) -> str:
     """low|medium|high. Pass valid strings through; bucket numeric confidences."""
     text = str(value or "").strip().lower()
-    if text in {"low", "medium", "high"}:
+    if confidence_score(text) is not None:
         return text
     try:
         num = float(value)
@@ -292,18 +301,216 @@ def _to_incident(
 
 
 def _write_case(tx: Any, inc: OntologyIncident, keywords: list[str]) -> None:
-    """Write one case's incident projection + case-local symptom + has_symptom
-    edge. NEVER calls _relate_indicates / _relate_resolved_by — that structural
-    omission is the knowledge-layer isolation guarantee (see module docstring)."""
+    """Write one case's incident projection + its ``ext:`` symptom, wired into
+    the SAME family→symptom→action chain as curated knowledge.
+
+    Owner decision 2026-07-27: vendor-support cases are TRUSTED knowledge — the
+    earlier case-local isolation (no indicates/resolved_by edges) kept them out
+    of _KNOWLEDGE_QUERY, so they never reached signature matching, the plan-time
+    symptom lead, guidance, or actions. The chain is still honest about what it
+    asserts: indicates only for a closed-catalog family, resolved_by only for
+    actions the support thread confirmed (resolving/mitigating outcomes —
+    diagnostic/preventive steps remain investigation hints on the case card).
+    The ``ext:`` symptom name keeps provenance visible in the graph and in any
+    report line citing it; ``reason`` carries the confirmed mechanism."""
     ingest._write_incident(tx, inc)
-    if keywords:
-        _ensure_symptom(tx, inc.incident_id, keywords)
-        ingest._relate(
-            tx,
-            ("incident", "incident_id", inc.incident_id),
-            ("symptom", "name", inc.incident_id),
-            "has_symptom", "incident", "symptom",
-        )
+    if not keywords:
+        return
+    # Trust guards (owner-approved 2026-07-27). The chain asserts causality, so
+    # it must respect the CURATOR's own judgement and only match on signatures
+    # specific enough to name this case:
+    #   1. A case whose support thread never CONFIRMED the mechanism
+    #      (mechanism_confirmed=false — observed-only), stays retrieval+playbook.
+    #      NOTE: the prohibited_uses "positive_promotion" label is deliberately
+    #      NOT a gate — every shipped payload carries it as a blanket
+    #      sanitizer-era declaration from the old isolation design, so honoring
+    #      it would zero the chain and silently revert the owner's 2026-07-27
+    #      trust decision. A per-case opt-out belongs in a dedicated field.
+    #   2. Only specific signatures may anchor the chain symptom: multi-word
+    #      phrases, long tokens, or code-ish identifiers. A single generic word
+    #      ("oomkilled") would substring-match every unrelated OOM incident.
+    #      When no keyword survives the gate, the case demotes to retrieval-only
+    #      with its full keyword set instead of entering the chain unanchored.
+    chain = (
+        inc.root_cause_family in FAMILIES
+        and bool(inc.case_card.get("mechanism_confirmed"))
+    )
+    chain_keywords = [kw for kw in keywords if _chain_specific(kw)] if chain else []
+    if chain and not chain_keywords:
+        chain = False
+    _ensure_symptom(
+        tx,
+        inc.incident_id,
+        chain_keywords if chain else keywords,
+        reason=inc.mechanism,
+    )
+    ingest._relate(
+        tx,
+        ("incident", "incident_id", inc.incident_id),
+        ("symptom", "name", inc.incident_id),
+        "has_symptom", "incident", "symptom",
+    )
+    if chain:
+        _relate_indicates(tx, inc.incident_id, inc.root_cause_family)
+        for action in inc.successful_actions:
+            statement = str(action.get("statement") or "").strip()
+            if not statement:
+                continue
+            _ensure_action(tx, statement)
+            _relate_resolved_by(tx, inc.incident_id, statement)
+    else:
+        # A case demoted AFTER previously entering the chain must lose its old
+        # causal edges (its keywords self-reconcile inside _ensure_symptom).
+        _delete_chain_edges(tx, inc.incident_id)
+    _write_diagnostic_playbook(tx, inc)
+
+
+def _delete_chain_edges(tx: Any, symptom_name: str) -> None:
+    from app.ontology.typedb_client import escape_typeql as esc
+
+    for relation, role in (("indicates", "symptom"), ("resolved_by", "symptom")):
+        tx.query(
+            f'match $s isa symptom, has name "{esc(symptom_name)}"; '
+            f"$x isa {relation}({role}: $s); delete $x;"
+        ).resolve()
+
+
+def _chain_specific(keyword: str) -> bool:
+    """Specific enough to anchor a causal match: a multi-word phrase, a long
+    token, or a code-ish identifier (runai_pod_gpu_info, error: column …)."""
+    keyword = keyword.strip()
+    return " " in keyword or len(keyword) >= 12 or any(c in keyword for c in "_:./")
+
+
+_PLAYBOOK_STEP_OUTCOMES = ("diagnostic", "preventive")
+
+
+def _delete_playbook(tx: Any, incident_id: str) -> None:
+    from app.ontology.typedb_client import escape_typeql as esc
+
+    name = esc(f"{incident_id}:playbook")
+    tx.query(
+        f'match $s isa diagnostic_step, has runbook_name "{name}"; '
+        f"$x isa diagnostic_transition(prior: $s); delete $x;"
+    ).resolve()
+    for relation in ("runbook_entry", "runbook_contains"):
+        tx.query(
+            f'match $r isa runbook, has name "{name}"; '
+            f"$x isa {relation}(runbook: $r); delete $x;"
+        ).resolve()
+    tx.query(f'match $x isa diagnostic_step, has runbook_name "{name}"; delete $x;').resolve()
+    tx.query(f'match $x isa runbook, has name "{name}"; delete $x;').resolve()
+
+
+def _delete_case_surfaces(tx: Any, incident_id: str) -> None:
+    """Remove a vanished case's ACTIVE surfaces: chain edges, symptom, playbook.
+
+    The historical incident/case_snapshot projection stays — it is archive, not
+    a matcher. Used by the sweep for cases no longer shipped in the repo, so a
+    bad case removed from git actually leaves the runtime knowledge."""
+    from app.ontology.typedb_client import escape_typeql as esc
+
+    _delete_chain_edges(tx, incident_id)
+    tx.query(
+        f'match $s isa symptom, has name "{esc(incident_id)}"; '
+        f"$x isa has_symptom(symptom: $s); delete $x;"
+    ).resolve()
+    tx.query(f'match $s isa symptom, has name "{esc(incident_id)}"; delete $s;').resolve()
+    _delete_playbook(tx, incident_id)
+
+
+def _sweep_missing_cases(settings: Any, keep_ids: set[str]) -> tuple[list[str], list[str]]:
+    """Best-effort removal of graph cases the repo no longer ships.
+
+    Reads every ``ext:`` symptom name, diffs against the loaded set, and deletes
+    the missing ones' surfaces case-by-case. Every step is non-fatal: a read or
+    per-case failure prints a warning and moves on — sweeping must never block
+    loading."""
+    from typedb.driver import TransactionType
+
+    from app.ontology.typedb_client import TypeDBClient, open_driver
+
+    try:
+        with TypeDBClient(settings).open_reader() as run:
+            names = {
+                str(row.get("n") or "")
+                for row in run('match $s isa symptom, has name $n; $n like "ext:.*"; select $n;')
+            }
+    except Exception as exc:  # noqa: BLE001 - sweep is advisory
+        print(f"  ! sweep skipped (read failed): {type(exc).__name__}: {exc}", file=sys.stderr)
+        return [], []
+    missing = sorted(name for name in names if name and name not in keep_ids)
+    removed: list[str] = []
+    failed: list[str] = []
+    if not missing:
+        return removed, failed
+    with open_driver(settings) as driver:
+        for incident_id in missing:
+            try:
+                with driver.transaction(settings.typedb_database, TransactionType.WRITE) as tx:
+                    _delete_case_surfaces(tx, incident_id)
+                    tx.commit()
+                removed.append(incident_id)
+            except Exception as exc:  # noqa: BLE001 - keep sweeping the rest
+                failed.append(incident_id)
+                print(f"  ! sweep {incident_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return removed, failed
+
+
+def _write_diagnostic_playbook(tx: Any, inc: OntologyIncident) -> None:
+    """Mirror the support thread's diagnostic/preventive steps one-by-one as a
+    per-case mini-runbook of ``diagnostic_step`` entities.
+
+    These are the commands/checks actually exchanged with vendor support —
+    valuable as an ordered sequence, not as resolved_by fixes. The runbook name
+    is case-scoped (``<case>:playbook``) so the executable walk, which loads
+    steps by the bundled runbook's name, never routes into them. Replace-in-full
+    per case: rerunning the loader must not duplicate steps."""
+    from app.ontology.typedb_client import escape_typeql as esc
+
+    leads = [
+        str(action.get("normalized_action") or "").strip()
+        for action in inc.case_card.get("historical_actions") or []
+        if str(action.get("outcome") or "").strip() in _PLAYBOOK_STEP_OUTCOMES
+        and str(action.get("normalized_action") or "").strip()
+    ]
+    runbook_name = f"{inc.incident_id}:playbook"
+    name = esc(runbook_name)
+    _delete_playbook(tx, inc.incident_id)
+    if not leads:
+        return
+    summary = f"Vendor-support diagnostic sequence for {inc.incident_id} ({len(leads)} steps)"
+    tx.query(
+        f'insert $x isa runbook, has name "{name}", has summary "{esc(summary)}";'
+    ).resolve()
+    previous = ""
+    for index, statement in enumerate(leads, start=1):
+        step_id = f"{inc.incident_id}:d{index:02d}"
+        tx.query(
+            f'insert $x isa diagnostic_step, has diagnostic_id "{esc(step_id)}", '
+            f'has runbook_name "{name}", has question "{esc(statement)}", '
+            f'has verification "", has interpretation "", has avoidance "", '
+            f'has match_expression "";'
+        ).resolve()
+        tx.query(
+            f'match $r isa runbook, has name "{name}"; '
+            f'$s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
+            f"insert (runbook: $r, step: $s) isa runbook_contains;"
+        ).resolve()
+        if index == 1:
+            tx.query(
+                f'match $r isa runbook, has name "{name}"; '
+                f'$s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
+                f"insert (runbook: $r, step: $s) isa runbook_entry;"
+            ).resolve()
+        if previous:
+            tx.query(
+                f'match $p isa diagnostic_step, has diagnostic_id "{esc(previous)}"; '
+                f'$n isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
+                f'insert $x isa diagnostic_transition(prior: $p, next: $n), '
+                f'has match_expression "", has transition_priority {index - 1};'
+            ).resolve()
+        previous = step_id
 
 
 def _write_external(cases: list[tuple[OntologyIncident, list[str]]]) -> tuple[int, int]:
@@ -417,6 +624,12 @@ def main() -> int:
         return 0
 
     written, failed = _write_external([(inc, kw) for inc, _payload, kw in prepared])
+    # keep set = every case the repo SHIPS (write success or not): a transient
+    # write failure must never let the sweep delete a real case's knowledge.
+    keep_ids = {inc.incident_id for inc, _payload, _kw in prepared}
+    swept, sweep_failed = _sweep_missing_cases(load_settings(), keep_ids)
+    if swept or sweep_failed:
+        print(f"swept vanished cases: {len(swept)} removed, {len(sweep_failed)} failed")
     print(f"done: {written} written, {failed} failed")
     return 1 if failed and not written else 0
 

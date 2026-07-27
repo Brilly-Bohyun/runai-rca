@@ -36,6 +36,7 @@ import {
   emptyIncidentTrash,
   fetchAnalysisRun,
   fetchIncident,
+  fetchFamilySuggestions,
   fetchRootCauseFamilies,
   rcaCorrection,
   rcaPin,
@@ -333,6 +334,9 @@ function App() {
     analysis: analysisPageIndex,
   }, incidentViewForMainView(activeView), incidentQueryFilters, alertQueryFilters);
   const [detail, setDetail] = useState<DetailState>(null);
+  // Failures of destructive incident actions (trash/permanent delete); the
+  // dashboard-load `error` above never carries these.
+  const [incidentActionError, setIncidentActionError] = useState('');
   const [chatDocked, setChatDocked] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [knowledgeRefreshKey, setKnowledgeRefreshKey] = useState(0);
@@ -594,7 +598,12 @@ function App() {
   }, [refreshCurrentView]);
 
   const handleDeleteIncident = useCallback(async (id: string, permanent = false) => {
-    await deleteIncident(id, permanent);
+    setIncidentActionError('');
+    try {
+      await deleteIncident(id, permanent);
+    } catch (err) {
+      setIncidentActionError(errorMessage(err, 'Failed to delete the incident. Check the backend logs.'));
+    }
     await refreshCurrentView();
   }, [refreshCurrentView]);
 
@@ -602,12 +611,36 @@ function App() {
     incidentIDs: string[],
     action: 'archive' | 'unarchive' | 'restore' | 'trash' | 'delete_permanently',
   ) => {
-    await bulkIncidentAction(incidentIDs, action);
+    setIncidentActionError('');
+    try {
+      // The backend applies bulk actions best-effort and reports per-row
+      // failures; swallowing them made a failed permanent delete look done.
+      const result = await bulkIncidentAction(incidentIDs, action);
+      const failed = result.failed_ids?.length ?? 0;
+      if (failed > 0) {
+        setIncidentActionError(
+          `${failed} incident${failed === 1 ? '' : 's'} could not be ${action === 'delete_permanently' ? 'permanently deleted' : 'updated'}. Check the backend logs.`,
+        );
+      }
+    } catch (err) {
+      setIncidentActionError(errorMessage(err, 'Bulk incident action failed.'));
+    }
     await refreshCurrentView();
   }, [refreshCurrentView]);
 
   const handleEmptyIncidentTrash = useCallback(async () => {
-    await emptyIncidentTrash();
+    setIncidentActionError('');
+    try {
+      const result = await emptyIncidentTrash();
+      const failed = result.failed_count ?? 0;
+      if (failed > 0) {
+        setIncidentActionError(
+          `${failed} incident${failed === 1 ? '' : 's'} in trash could not be permanently deleted. Check the backend logs.`,
+        );
+      }
+    } catch (err) {
+      setIncidentActionError(errorMessage(err, 'Emptying trash failed.'));
+    }
     await refreshCurrentView();
   }, [refreshCurrentView]);
 
@@ -749,6 +782,7 @@ function App() {
         )}
 
         {error && <div className="error-banner">{error}</div>}
+        {incidentActionError && <div className="error-banner">{incidentActionError}</div>}
 
         {(activeView === 'incidents' || activeView === 'archived' || activeView === 'trash') && (
           <IncidentsDashboard
@@ -860,6 +894,8 @@ function UnifiedWorkspace({
   const [justApproved, setJustApproved] = useState(false);
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [correctionFamily, setCorrectionFamily] = useState('');
+  const [correctionNewCause, setCorrectionNewCause] = useState('');
+  const [correctionSuggestions, setCorrectionSuggestions] = useState<{ catalog: string[]; novel: Array<{ family: string; mechanism: string }>; slug: string }>();
   const [correctionSummary, setCorrectionSummary] = useState('');
   const [correctionActions, setCorrectionActions] = useState('');
   const [correctionCatalogStatus, setCorrectionCatalogStatus] = useState<'loading' | 'ready' | 'failed'>('ready');
@@ -918,6 +954,13 @@ function UnifiedWorkspace({
     });
     return () => { cancelled = true; };
   }, [correctionOpen]);
+
+  useEffect(() => {
+    if (!correctionNewCause.trim()) { setCorrectionSuggestions(undefined); return undefined; }
+    let cancelled = false;
+    const handle = window.setTimeout(() => { void fetchFamilySuggestions(correctionNewCause).then((value) => { if (!cancelled) setCorrectionSuggestions(value); }).catch(() => { if (!cancelled) setCorrectionSuggestions(undefined); }); }, 300);
+    return () => { cancelled = true; window.clearTimeout(handle); };
+  }, [correctionNewCause]);
 
   useEffect(() => {
     if (!correctionOpen) return undefined;
@@ -1018,18 +1061,19 @@ function UnifiedWorkspace({
     document.getElementById('operator-feedback')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
   const saveCorrection = async () => {
-    if (!incident || busyAction || correctionCatalogStatus !== 'ready' || !correctionFamily || !correctionSummary.trim()) return;
+    if (!incident || busyAction || correctionCatalogStatus !== 'ready' || (!correctionFamily && !correctionNewCause.trim()) || !correctionSummary.trim()) return;
     setBusyAction('rca-correction');
     setCorrectionError('');
     try {
       await rcaCorrection(incident.incident_id, {
-        root_cause_family: correctionFamily,
+        ...(correctionNewCause.trim() ? { new_cause: correctionNewCause.trim() } : { root_cause_family: correctionFamily }),
         summary: correctionSummary.trim(),
         actions: parseCorrectionActions(correctionActions),
       });
       await onRefresh();
       setCorrectionOpen(false);
       setCorrectionFamily('');
+      setCorrectionNewCause('');
       setCorrectionSummary('');
       setCorrectionActions('');
     } catch (err) {
@@ -1257,6 +1301,17 @@ function UnifiedWorkspace({
                 </select>
               </label>
               <label className="evaluation-field">
+                <span>New cause <small>Optional; leave blank to use the catalog family</small></span>
+                <input value={correctionNewCause} onChange={(event) => { setCorrectionNewCause(event.target.value); setCorrectionFamily(''); }} disabled={Boolean(busyAction)} maxLength={200} />
+                {correctionSuggestions && (
+                  <small>
+                    {correctionSuggestions.catalog.map((family) => <button key={family} type="button" className="link-button" onClick={() => { setCorrectionFamily(family); setCorrectionNewCause(''); }}>{family}</button>)}
+                    {correctionSuggestions.novel.map((item) => <button key={item.family} type="button" className="link-button" onClick={() => { setCorrectionFamily(item.family); setCorrectionNewCause(''); }}>{item.mechanism || item.family}</button>)}
+                    {correctionNewCause.trim() && <> New slug: <code>{correctionSuggestions.slug}</code></>}
+                  </small>
+                )}
+              </label>
+              <label className="evaluation-field">
                 <span>RCA summary</span>
                 <textarea
                   value={correctionSummary}
@@ -1284,7 +1339,7 @@ function UnifiedWorkspace({
                 </button>
                 <button
                   className={`primary-button evaluation-save ${busyAction === 'rca-correction' ? 'is-busy' : ''}`}
-                  disabled={Boolean(busyAction) || correctionCatalogStatus !== 'ready' || !correctionFamily || !correctionSummary.trim()}
+                  disabled={Boolean(busyAction) || correctionCatalogStatus !== 'ready' || (!correctionFamily && !correctionNewCause.trim()) || !correctionSummary.trim()}
                   type="submit"
                 >
                   {busyAction === 'rca-correction' ? 'Saving...' : 'Save'}

@@ -32,9 +32,15 @@ attribute workload_type, value string;
 attribute workload_id, value string;
 attribute gpu_allocated, value double;
 attribute gpu_requested, value double;
+attribute cluster_name, value string;
+attribute namespace_name, value string;
+attribute project_name, value string;
+attribute queue_name, value string;
+attribute node_name, value string;
 attribute source, value string;
 attribute summary, value string;
 attribute confidence, value string;
+attribute confidence_score, value double;
 attribute blast_radius, value string;
 attribute subtype, value string;
 attribute statement, value string;
@@ -63,6 +69,7 @@ attribute analysis_hash, value string;
 attribute diagnosis_state, value string;
 attribute harness_status, value string;
 attribute harness_score, value integer;
+# ISO-8601 UTC timestamp string (for example 2026-07-27T00:00:00Z).
 attribute approved_at, value string;
 attribute outcome, value string;
 attribute case_id, value string;
@@ -105,63 +112,63 @@ attribute predicate, value string;
 attribute observed_value, value string;
 attribute polarity, value string;
 attribute coverage, value string;
+# ISO-8601 UTC timestamp strings (for example 2026-07-27T00:00:00Z).
 attribute observed_window_start, value string;
 attribute observed_window_end, value string;
 attribute quality, value string;
+# ISO-8601 UTC timestamp string (for example 2026-07-27T00:00:00Z).
 attribute executed_at, value string;
 attribute trace_stop_reason, value string;
 attribute rejection_reason, value string;
 attribute package_id, value string;
 attribute package_status, value string;
+# ISO-8601 UTC timestamp strings (for example 2026-07-27T00:00:00Z).
 attribute package_published_at, value string;
 attribute package_retired_at, value string;
 attribute package_template_binding_id, value string;
 attribute template_active, value boolean;
 
 # --- entities ---------------------------------------------------------------
-entity cluster,
-    owns name @key,
-    plays scopes:scope;
-
+# Infra layer, deliberately small (2026-07-27 simplification): node and
+# workload are the only topology ENTITIES. Cluster/namespace/project/queue are
+# plain attributes on the workload — they were entities with 4 write-only
+# relations nobody queried, and every reader can filter on an attribute.
+# Pods are NOT modelled at all: controller-suffixed pod names mint a new
+# "thing" on every restart, so the workload (stable identity) is the guest of
+# runs_on and pod names stay inside incident/alert payloads.
 entity node,
     owns name @key,
+    owns cluster_name,
     owns condition_type,
     owns gpu_allocated,
-    plays runs_on:host,
-    plays scopes:member;
-
-entity namespace,
-    owns name @key,
-    plays contains:space;
-
-entity project,
-    owns name @key,
-    owns gpu_allocated,
-    owns gpu_requested,
-    plays in_project:project,
-    plays scopes:member;
-
-entity queue,
-    owns name @key,
-    owns gpu_allocated,
-    owns gpu_requested,
-    plays submitted_to:queue;
+    plays runs_on:host;
 
 entity workload,
     owns name,
     owns workload_type,
     owns workload_id,
-    plays belongs_to:owner,
-    plays in_project:member,
-    plays submitted_to:job,
-    plays contains:occupant;
-
-entity pod,
-    owns name,
-    owns status,
+    owns namespace_name,
+    owns project_name,
+    owns queue_name,
     plays runs_on:guest,
-    plays belongs_to:member,
-    plays contains:occupant;
+    plays exposes:backend,
+    plays uses_storage:consumer;
+
+# Stable-identity topology around a workload, observed from the target pod
+# during analysis (spec.volumes claims; Services whose selector matched the
+# pod's labels) and projected by ingest under the STEM workload identity.
+# Service and PVC names survive pod restarts, so unlike per-pod bindings these
+# stay browsable: "workloads with this name expose these Services / use this
+# PVC". Live bindings are still verified by collectors at analysis time.
+entity service,
+    owns name,
+    owns namespace_name,
+    plays exposes:endpoint;
+
+entity pvc,
+    owns name,
+    owns namespace_name,
+    plays uses_storage:storage;
 
 # Run:ai platform components (BOTH the cluster side and the runai-backend
 # control plane; `layer` disambiguates). Mirrored from
@@ -169,7 +176,7 @@ entity pod,
 # (description), failure effect, dependency edges, control-plane DB schema
 # ownership, and ready-to-run checks.
 entity control_plane_component,
-    owns name,
+    owns name @key,
     owns layer,
     owns k8s_namespace,
     owns description,
@@ -178,8 +185,6 @@ entity control_plane_component,
     # A component ships several ready-to-run checks; without the explicit card
     # the 3.x default @card(0..1) makes any 2-check component uncommittable.
     owns check_command @card(0..),
-    plays emits:emitter,
-    plays contains:occupant,
     plays depends_on:dependent,
     plays depends_on:dependency;
 
@@ -191,6 +196,10 @@ entity alert,
     owns status,
     owns occurrence_count,
     owns reason,
+    # Where the alert fired — attributes, not relations, so "past incidents on
+    # this node / in this namespace" is a one-line filter.
+    owns node_name,
+    owns namespace_name,
     plays grouped_into:member;
 
 entity incident,
@@ -213,13 +222,16 @@ entity analysis_run,
     owns source,
     owns status,
     owns confidence,
+    owns confidence_score,
     owns trace_stop_reason,
     plays analyzed_by:run,
     plays diagnosis:run,
     plays hypothesis_for:run;
 
-entity symptom,
-    owns name,
+entity signal @abstract;
+
+entity symptom sub signal,
+    owns name @key,
     owns reason,
     owns reason_ko @card(0..1),
     owns name_ko @card(0..1),
@@ -239,8 +251,7 @@ entity symptom,
     plays has_symptom:symptom,
     plays indicates:symptom,
     plays resolved_by:symptom,
-    plays supported_by:claim,
-    plays emits:signal;
+    plays supported_by:claim;
 
 entity root_cause,
     owns subtype,
@@ -303,7 +314,7 @@ entity platform_auth_error sub root_cause;     # login/permissions/SAML/OIDC/JWT
 entity platform_lifecycle_change sub root_cause;
 
 entity action,
-    owns statement,
+    owns statement @key,
     plays resolved_by:remedy,
     plays resolution:remedy,
     plays diagnostic_recommendation:remedy;
@@ -316,6 +327,7 @@ entity evidence,
     owns source,
     owns summary,
     owns confidence,
+    owns confidence_score,
     # Trace-v3 evidence metadata is populated only from explicit trace fields;
     # legacy artifacts intentionally remain unannotated rather than guessed.
     owns observed_entity,
@@ -328,10 +340,14 @@ entity evidence,
     owns observed_window_end,
     owns quality,
     plays supported_by:proof,
-    plays emits:signal,
     plays contradicted_by:proof,
     plays probe_execution_evidence:proof,
     plays rejected_evidence_link:proof;
+
+entity log_evidence sub evidence;
+entity event_evidence sub evidence;
+entity metric_evidence sub evidence;
+entity state_evidence sub evidence;
 
 # A hypothesis is a run-local, incident-derived candidate. It is never seeded
 # from historical/legacy data, and does not itself assert an RCA.
@@ -341,6 +357,7 @@ entity hypothesis,
     owns hypothesis_family,
     owns hypothesis_status,
     owns confidence,
+    owns confidence_score,
     owns mechanism,
     owns mechanism_fingerprint,
     owns trace_version,
@@ -417,12 +434,9 @@ entity probe_execution,
     plays probe_execution_evidence:execution;
 
 # --- relations --------------------------------------------------------------
-relation scopes, relates scope, relates member;           # cluster scopes node/project
-relation runs_on, relates host, relates guest;            # node runs_on pod
-relation belongs_to, relates owner, relates member;       # workload belongs_to pod
-relation in_project, relates project, relates member;     # project <- workload
-relation submitted_to, relates queue, relates job;        # workload submitted_to queue
-relation contains, relates space, relates occupant;       # namespace contains pod/workload/component
+relation runs_on, relates host, relates guest;            # node runs_on workload
+relation exposes, relates endpoint, relates backend;      # service exposes workload
+relation uses_storage, relates consumer, relates storage; # workload uses_storage pvc
 relation grouped_into, relates incident, relates member;  # incident <- alert
 relation has_symptom, relates incident, relates symptom;
 relation indicates, relates symptom, relates cause;       # symptom indicates root_cause
@@ -430,13 +444,13 @@ relation resolved_by, relates symptom, relates remedy;    # symptom resolved_by 
 relation supported_by, relates claim, relates proof;      # (symptom|root_cause) <- evidence
 relation contradicted_by, relates claim, relates proof;   # run-local diagnosis <- conflicting evidence
 relation analyzed_by, relates incident, relates run;
-relation emits, relates emitter, relates signal;          # component emits evidence/symptom
 relation depends_on, relates dependent, relates dependency;  # component needs component (check order)
 relation diagnosis,
     relates run,
     relates incident,
     relates cause,
     owns confidence,
+    owns confidence_score,
     owns diagnosis_state,
     owns analysis_hash,
     owns harness_status,
@@ -462,6 +476,7 @@ relation diagnostic_outcome,
     relates cause,
     owns summary,
     owns confidence,
+    owns confidence_score,
     owns disconfirm @card(0..);
 relation diagnostic_recommendation,
     relates step,
@@ -487,7 +502,7 @@ relation package_has_template, relates package, relates template, relates bindin
 # the gpu_hardware_error root_cause family, and is resolved_by action(s). We
 # reuse the existing `indicates`/`resolved_by`/`action` machinery so the
 # knowledge layer stays uniform — xid_error slots in wherever a symptom does.
-entity xid_error,
+entity xid_error sub signal,
     owns xid_code @key,
     owns xid_trigger @card(0..1),
     owns mnemonic,

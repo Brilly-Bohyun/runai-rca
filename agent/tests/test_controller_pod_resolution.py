@@ -327,3 +327,50 @@ async def test_workload_firing_warning_uses_resolved_pod_identity_anchor(
         assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
     else:
         assert observation["event_count"] == 0
+
+
+def test_pod_fallback_workload_identity_is_stemmed() -> None:
+    # No workload/controller label: the pod-name fallback must collapse to the
+    # stable workload stem, or every restart mints a new "workload" identity
+    # (the ontology had workload-exporter-8fbbcbf59-wzqzb-style vertices).
+    for pod, stem in [
+        ("workload-exporter-8fbbcbf59-wzqzb", "workload-exporter"),
+        ("runai-container-toolkit-x7k2p", "runai-container-toolkit"),
+        ("prometheus-prometheus-node-0", "prometheus-prometheus-node"),
+    ]:
+        target = resolve_target({"namespace": "runai", "pod": pod}, {})
+        assert target.workload_name == stem, pod
+        # The pod itself stays the concrete target for k8s reads.
+        assert target.pod == pod
+
+
+def test_workload_topology_extracts_pvcs_and_selector_matched_services() -> None:
+    pod = {
+        "metadata": {"labels": {"app": "workloads", "tier": "backend"}},
+        "spec": {
+            "volumes": [
+                {"persistentVolumeClaim": {"claimName": "data-workloads-0"}},
+                {"configMap": {"name": "not-a-pvc"}},
+                {"persistentVolumeClaim": {"claimName": "data-workloads-0"}},  # dedupe
+            ]
+        },
+    }
+    services = [
+        {"metadata": {"name": "runai-backend-workloads"}, "spec": {"selector": {"app": "workloads"}}},
+        {"metadata": {"name": "other-svc"}, "spec": {"selector": {"app": "no-match"}}},
+        {"metadata": {"name": "selectorless"}, "spec": {}},  # never matches
+    ]
+    topology = kubernetes._workload_topology(pod, services)
+    assert topology == {
+        "services": ["runai-backend-workloads"],
+        "pvcs": ["data-workloads-0"],
+    }
+    assert kubernetes._workload_topology(None, services) == {"services": [], "pvcs": []}
+
+
+def test_explicit_workload_label_is_never_stemmed() -> None:
+    # A Run:ai workload legitimately named with a trailing ordinal must keep it.
+    target = resolve_target(
+        {"namespace": "runai-vision", "workload": "train-3", "pod": "train-3-0-0"}, {}
+    )
+    assert target.workload_name == "train-3"

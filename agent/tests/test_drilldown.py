@@ -107,6 +107,48 @@ def test_promql_sanitizer_is_not_escape_hardened() -> None:
     assert drilldown._sanitize_metric_query(query, "promql_query") == (query, None)
 
 
+def test_logql_empty_selector_rejected_before_loki() -> None:
+    # On a label-less run the model reaches for {} — Loki 400s every time
+    # ("queries require at least one ... matcher"). Fail locally with guidance.
+    for query in (
+        '{} |~ "(?i)eviction"',
+        '{ } |~ "oom"',
+        '{namespace=~".*"} |~ "error"',
+        '{namespace=""} |= "x"',
+    ):
+        sanitized, error = drilldown._sanitize_metric_query(query, "logql_query")
+        assert sanitized == "" and error and "selector" in error, query
+
+
+def test_promql_range_on_expression_rejected_locally() -> None:
+    # Prometheus rejects a [range] on an expression with HTTP 400 ("ranges only
+    # allowed for vector selectors"); catch it before burning a drill-down step.
+    for query in (
+        'sum(rate(container_memory_usage_bytes[5m]))[10m]',
+        '(metric_a + metric_b)[5m]',
+    ):
+        sanitized, error = drilldown._sanitize_metric_query(query, "promql_query")
+        assert sanitized == "" and error and "vector selector" in error, query
+    for query in (
+        'rate(container_memory_usage_bytes{namespace="runai"}[5m])',
+        'sum(rate(x[5m]))',
+        'max_over_time(rate(x[5m])[10m:1m])',  # subquery: legal
+    ):
+        _, error = drilldown._sanitize_metric_query(query, "promql_query")
+        assert error is None, (query, error)
+
+
+def test_logql_anchored_selectors_pass() -> None:
+    for query in (
+        '{namespace="runai"} |= "error"',
+        '{namespace=~"runai.*"} |~ "quota"',
+        '{namespace!=""} |~ "pressure"',  # Loki accepts != "" — it anchors
+        'sum(rate({job="loki"}[5m]))',  # no leading selector: let Loki judge
+    ):
+        _, error = drilldown._sanitize_metric_query(query, "logql_query")
+        assert error is None, (query, error)
+
+
 def test_kubernetes_prompt_refuses_configuration_as_observed_preemption() -> None:
     prompt = drilldown._system_prompt("kubernetes", {})
 

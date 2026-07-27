@@ -32,10 +32,56 @@ _log = logging.getLogger(__name__)
 _BLAST_QUERY = """
 match
   $n isa node, has name "{node}";
-  (host: $n, guest: $p) isa runs_on;
-  (owner: $w, member: $p) isa belongs_to;
+  (host: $n, guest: $w) isa runs_on;
   $w isa workload, has name $wn;
 select $wn;
+"""
+
+# Location history: past RESOLVED incidents whose alerts fired at the same
+# place, regardless of alert name. Alerts carry node_name/namespace_name as
+# plain attributes (2026-07-27 infra simplification), so this is a one-hop
+# filter; the resolved-only gate keeps the live incident itself out.
+_NODE_HISTORY_QUERY = """
+match
+  $a isa alert, has node_name "{node}";
+  (incident: $i, member: $a) isa grouped_into;
+  $i isa incident, has incident_id $iid, has analysis_summary $sum, has status "resolved";
+select $iid, $sum;
+"""
+
+_NAMESPACE_HISTORY_QUERY = """
+match
+  $a isa alert, has namespace_name "{namespace}";
+  (incident: $i, member: $a) isa grouped_into;
+  $i isa incident, has incident_id $iid, has analysis_summary $sum, has status "resolved";
+select $iid, $sum;
+"""
+
+# Stable-identity topology around the target workload (stem identity):
+# Services exposing it, PVCs it uses, and the other workloads sharing a PVC —
+# the storage blast radius.
+_WORKLOAD_SERVICES_QUERY = """
+match
+  $w isa workload, has name "{workload}";
+  (endpoint: $s, backend: $w) isa exposes;
+  $s isa service, has name $sn;
+select $sn;
+"""
+
+_WORKLOAD_PVCS_QUERY = """
+match
+  $w isa workload, has name "{workload}";
+  (consumer: $w, storage: $p) isa uses_storage;
+  $p isa pvc, has name $pn;
+select $pn;
+"""
+
+_SHARED_PVC_QUERY = """
+match
+  $p isa pvc, has name "{pvc}";
+  (consumer: $o, storage: $p) isa uses_storage;
+  $o isa workload, has name $on;
+select $on;
 """
 
 _PRIOR_QUERY = """
@@ -182,6 +228,10 @@ class KGContext:
     blast_radius_workloads: int = 0
     blast_radius_workload_names: list[str] = field(default_factory=list)
     prior_incidents: list[dict[str, str]] = field(default_factory=list)
+    # Resolved incidents that fired at the same node/namespace, any alert name.
+    location_history: list[dict[str, str]] = field(default_factory=list)
+    # Stable-identity Service/PVC attachments of the target workload.
+    workload_topology: dict[str, Any] = field(default_factory=dict)
     case_cards: list[dict[str, Any]] = field(default_factory=list)
     # family -> [{symptom, keywords[], actions[]}]  (curated knowledge layer)
     knowledge: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -198,6 +248,8 @@ class KGContext:
             "blast_radius_workloads": self.blast_radius_workloads,
             "blast_radius_workload_names": self.blast_radius_workload_names,
             "prior_incidents": self.prior_incidents,
+            "location_history": self.location_history,
+            "workload_topology": self.workload_topology,
             "case_cards": self.case_cards,
             "knowledge": self.knowledge,
             "reasoning": self.reasoning,
@@ -259,6 +311,8 @@ async def enrich(
         blast_radius_workloads=data["blast_radius_workloads"],
         blast_radius_workload_names=data["blast_radius_workload_names"],
         prior_incidents=data["prior_incidents"],
+        location_history=data.get("location_history") or [],
+        workload_topology=data.get("workload_topology") or {},
         case_cards=data["case_cards"],
         knowledge=data["knowledge"],
         reasoning=data["reasoning"],
@@ -713,6 +767,72 @@ def _query_kg(
             rows = run(_BLAST_QUERY.format(node=escape_typeql(target.node)))
             workloads = sorted({str(r.get("wn")) for r in rows if r.get("wn")})
 
+        # Past resolved incidents at the same location (any alert name) — the
+        # infra layer's "have we seen trouble HERE before" signal.
+        location_history: list[dict[str, str]] = []
+        seen_locations: set[str] = set()
+        for where, query in (
+            ("node " + target.node, _NODE_HISTORY_QUERY.format(node=escape_typeql(target.node)))
+            if target.node
+            else (None, None),
+            (
+                "namespace " + target.namespace,
+                _NAMESPACE_HISTORY_QUERY.format(namespace=escape_typeql(target.namespace)),
+            )
+            if target.namespace
+            else (None, None),
+        ):
+            if not query:
+                continue
+            for r in run(query):
+                iid = str(r.get("iid") or "")
+                if not iid or iid in seen_locations:
+                    continue
+                seen_locations.add(iid)
+                location_history.append(
+                    {
+                        "incident_id": iid,
+                        "where": where,
+                        "analysis_summary": str(r.get("sum") or ""),
+                    }
+                )
+                if len(location_history) >= 6:
+                    break
+            if len(location_history) >= 6:
+                break
+
+        # Topology around the stem workload identity: exposing Services, used
+        # PVCs, and the storage blast radius (other workloads on the same PVC).
+        workload_topology: dict[str, Any] = {}
+        if target.workload_name:
+            workload = escape_typeql(target.workload_name)
+            services = sorted(
+                {
+                    str(r.get("sn"))
+                    for r in run(_WORKLOAD_SERVICES_QUERY.format(workload=workload))
+                    if r.get("sn")
+                }
+            )
+            pvcs = sorted(
+                {
+                    str(r.get("pn"))
+                    for r in run(_WORKLOAD_PVCS_QUERY.format(workload=workload))
+                    if r.get("pn")
+                }
+            )
+            shared: list[str] = []
+            for pvc in pvcs[:3]:
+                for r in run(_SHARED_PVC_QUERY.format(pvc=escape_typeql(pvc))):
+                    other = str(r.get("on") or "")
+                    if other and other != target.workload_name and other not in shared:
+                        shared.append(other)
+            if services or pvcs:
+                workload_topology = {
+                    "services": services[:10],
+                    "pvcs": pvcs[:10],
+                    "shared_storage_workloads": shared[:10],
+                }
+
         prior: list[dict[str, Any]] = []
         if target.alert_name:
             rows = run(_PRIOR_QUERY.format(alert=escape_typeql(target.alert_name)))
@@ -861,6 +981,8 @@ def _query_kg(
         "blast_radius_workloads": len(workloads),
         "blast_radius_workload_names": workloads[:20],
         "prior_incidents": prior[:5],
+        "location_history": location_history,
+        "workload_topology": workload_topology,
         "case_cards": case_cards,
         "knowledge": knowledge,
         "reasoning": reasoning,

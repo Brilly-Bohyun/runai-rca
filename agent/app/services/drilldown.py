@@ -120,6 +120,41 @@ _PROMQL_UNSUPPORTED_SYNTAX_RE = re.compile(
 _QUERY_STRING_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
 # Go string unescaping rejects regex escapes such as ``\d`` and ``\-``.
 _LOGQL_INVALID_STRING_ESCAPE_RE = re.compile(r"\\([^abfnrtv\\'\"0-7xuU])")
+_LOGQL_LEADING_SELECTOR_RE = re.compile(r"^\s*\{([^}]*)\}")
+# A [range] directly after a closing paren, with no ":" (which would make it a
+# valid subquery). `rate(x[5m])` and `x{...}[5m]` stay legal.
+_PROMQL_RANGE_ON_EXPRESSION_RE = re.compile(r"\)\s*\[[^\]:]+\]")
+_LOGQL_MATCHER_RE = re.compile(
+    r'[a-zA-Z_][a-zA-Z0-9_]*\s*(=~|!~|!=|=)\s*("(?:\\.|[^"\\])*"|`[^`]*`)'
+)
+
+
+def _logql_selector_error(query: str) -> str | None:
+    """Reject stream selectors Loki itself rejects with HTTP 400.
+
+    On a label-less run the drill-down model reaches for ``{} |~ "..."`` —
+    Loki requires at least one matcher that cannot match the empty string, so
+    every such query burns a step on a guaranteed 400. Fail it locally with a
+    message the model can act on. Only the provably-rejected shapes are caught
+    ({} and pure ="")/=~""/=~".*" selectors); anything else goes to Loki.
+    """
+    selector = _LOGQL_LEADING_SELECTOR_RE.match(query)
+    if not selector:
+        return None
+    for matcher in _LOGQL_MATCHER_RE.finditer(selector.group(1)):
+        operator, raw = matcher.group(1), matcher.group(2)[1:-1]
+        if operator == "=" and raw:
+            return None
+        if operator == "=~" and raw not in ("", ".*"):
+            return None
+        # != and !~ (even against "") require the label to exist -> anchoring.
+        if operator in ("!=", "!~"):
+            return None
+    return (
+        "invalid LogQL query: the stream selector matches empty streams (Loki "
+        'rejects it with 400). Add at least one concrete matcher, e.g. '
+        '{namespace="runai"}, {namespace=~"runai.*"} or {namespace!=""}.'
+    )
 
 
 async def run_drilldowns(
@@ -1062,6 +1097,20 @@ def _sanitize_metric_query(query: str, tool: str) -> tuple[str, str | None]:
         return "", f"invalid {language} query: unsupported sort/limit or SQL syntax"
     if tool == "logql_query":
         normalized = _QUERY_STRING_LITERAL_RE.sub(_harden_logql_string_literal, normalized)
+        if selector_error := _logql_selector_error(normalized):
+            return "", selector_error
+    if tool == "promql_query" and _PROMQL_RANGE_ON_EXPRESSION_RE.search(
+        _QUERY_STRING_LITERAL_RE.sub('""', normalized)
+    ):
+        # Prometheus 400s with "ranges only allowed for vector selectors" when a
+        # [window] follows an expression instead of a selector. Fail locally
+        # with guidance the model can act on (live case: a drill-down query
+        # burned its step on this exact parse error).
+        return "", (
+            "invalid PromQL query: a [range] may only follow a vector selector. "
+            "Put the range on the selector (rate(metric{...}[5m])) or use a "
+            "subquery with a step (expr[10m:1m])."
+        )
     return normalized, None
 
 

@@ -34,6 +34,7 @@ from app.knowledge import (
     component_check_lines,
     dependency_path,
     family_label,
+    is_matcher_only_family,
     load_architecture,
     load_failure_modes,
     load_family_catalog,
@@ -1418,6 +1419,14 @@ def _public_v3_fact(
         "polarity": str(getattr(fact, "polarity", "unknown") or "unknown"),
         "coverage": str(getattr(fact, "coverage", "unknown") or "unknown"),
         "quality": str(getattr(fact, "quality", "") or ""),
+        # The OBSERVED failure tokens (salient markers / matched alert signals).
+        # `predicate` is a machine category name ("kubernetes_target_container_
+        # lifecycle"); learned-knowledge keyword compilation needs what was
+        # actually seen ("CreateContainerConfigError"), or a promoted symptom
+        # ends up matching on fragments like "container" and "error".
+        "observed_terms": [
+            str(term)[:80] for term in tuple(getattr(fact, "highlights", ()) or ())[:6]
+        ],
     }
 
 
@@ -2533,9 +2542,13 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "investigation": state.investigation_context,
             "reasoning_trace_v2": state.investigation_context.get("reasoning_trace_v2", {}),
             "reasoning_trace_v3": state.investigation_context.get("reasoning_trace_v3", {}),
-            "open_world_candidates": [
-                candidate.as_dict() for candidate in state.open_world_candidates
-            ],
+            **({"open_world_candidates": [{
+                "family": candidate.family, "mechanism": candidate.mechanism,
+                "mechanism_fingerprint": candidate.mechanism_fingerprint,
+                "confidence": candidate.confidence, "hypothesis_id": candidate.hypothesis_id,
+                "support_evidence_ids": candidate.support_evidence_ids,
+                "independent_source_groups": candidate.independent_source_groups,
+            } for candidate in state.open_world_candidates]} if state.open_world_candidates else {}),
             **({"timeline": state.timeline} if state.timeline else {}),
             **(
                 {"troubleshooting_path": state.troubleshooting_path}
@@ -2644,6 +2657,13 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             language=language,
             next_check=state.self_check_next,
         )
+        if not carried_guidance:
+            # A gated run that HAD eligible evidence never emitted a guide —
+            # its report carried cause-specific sections instead, and abstain
+            # just replaced all of them with the stub. Build the guide now:
+            # the bare stub leaves the operator with less help than a
+            # zero-evidence run (live case: INC-1785128597…, a 318-char report).
+            carried_guidance = _abstain_guidance_block(state, language)
         if carried_guidance:
             response.analysis_detail = _append_general_guidance(
                 response.analysis_detail, carried_guidance
@@ -4191,7 +4211,7 @@ def _actionable_failure_mode_matches(
         for family, symptom in match_failure_mode_symptoms(
             failure_modes, observed_text, top_family, fuzzy_query=fuzzy_query
         )
-        if not filter_to_top or family == top_family
+        if not filter_to_top or family == top_family or is_matcher_only_family(family)
     ]
     exclusive = next(
         ((family, symptom) for family, symptom in matches if symptom.get("exclusive_actions")),
@@ -4492,6 +4512,30 @@ def _append_general_guidance(detail: str, block: str) -> str:
     return f"{detail.rstrip()}\n\n{block}"
 
 
+def _abstain_guidance_block(state: "PipelineState", language: str) -> str:
+    """The guide built fresh at abstain time when the pre-abstain report had
+    none: a run with eligible evidence carried cause-specific sections instead,
+    and abstain() replaced the whole document with the stub."""
+    plan = state.plan
+    return "\n".join(
+        [
+            _general_guidance_heading(language),
+            "",
+            *general_guidance_lines(
+                _alert_text(state.request),
+                state.failure_modes,
+                state.known_issues,
+                language=language,
+                masker=state.masker,
+                component=getattr(plan, "component", "") if plan else "",
+                components=load_architecture(state.settings.architecture_file),
+                matched_alert=getattr(plan, "matched_alert", None) if plan else None,
+                families=_plan_families(plan),
+            ),
+        ]
+    )
+
+
 def _general_guidance_block(detail: str, language: str) -> str:
     """The guide section of a report, heading included, or "" when absent.
 
@@ -4774,7 +4818,7 @@ def _promote_signature_cause(
         )
         return [lead] + [c for c in candidates if c.family != family]
     for family, symptom in symptom_matches:
-        if not family:
+        if not family or is_matcher_only_family(family):
             continue
         support = (symptom_support or {}).get(
             f"{family}\0{str(symptom.get('symptom') or '')}", {}
@@ -6368,6 +6412,39 @@ def _knowledge_base_lines(
             f"- Blast radius: {blast} workload(s) share the alerting node, so the impact "
             "is node-wide rather than a single workload."
         )
+    history = kg_context.get("location_history") or []
+    if history:
+        body.append(
+            f"- {len(history)} past resolved incident(s) at this alert's location "
+            "(different alerts, same node/namespace):"
+        )
+        for item in history[:4]:
+            where = active_masker.mask_text(str(item.get("where") or "location"))
+            incident_id = _short_sentence(
+                active_masker.mask_text(str(item.get("incident_id") or "(unknown)")), limit=80
+            )
+            summary = _short_sentence(
+                active_masker.mask_text(
+                    str(item.get("analysis_summary") or "(no stored RCA summary)")
+                ),
+                limit=240,
+            )
+            body.append(f"  - {incident_id} ({where}): {summary}")
+    topology = kg_context.get("workload_topology") or {}
+    if topology.get("services") or topology.get("pvcs"):
+        parts = []
+        if topology.get("services"):
+            parts.append("Service(s) " + ", ".join(topology["services"][:5]))
+        if topology.get("pvcs"):
+            parts.append("PVC(s) " + ", ".join(topology["pvcs"][:5]))
+        line = "- Workload topology (stable identity): " + "; ".join(parts)
+        shared = topology.get("shared_storage_workloads") or []
+        if shared:
+            line += (
+                f" — PVC shared with {len(shared)} other workload(s): "
+                + ", ".join(shared[:5])
+            )
+        body.append(active_masker.mask_text(line))
     prior = kg_context.get("prior_incidents") or []
     if prior:
         body.append(f"- This alert recurred in {len(prior)} prior incident(s):")
@@ -6418,14 +6495,14 @@ def _kb_remediation_lines(
     for family, symptom in match_failure_mode_symptoms(
         knowledge, observed_text, top_family, fuzzy_query=fuzzy_query
     ):
-        if filter_to_top and family != top_family:
+        if filter_to_top and family != top_family and not is_matcher_only_family(family):
             continue
         actions = symptom.get("actions", [])
         if actions:
             symptom_name = _safe_line(symptom.get("symptom"), limit=160, masker=active_masker)
-            header = (
-                f"- Matched symptom **{symptom_name}** "
-                f"({_family_label(family)}); known fixes from the knowledge base:"
+            learned = is_matcher_only_family(family)
+            header = ("- Learned from a previous incident (not a catalog family): " if learned else "") + (
+                f"Matched symptom **{symptom_name}** ({_family_label(family)}); known fixes from the knowledge base:"
             )
             return [
                 header,
@@ -6497,7 +6574,8 @@ def _playbook_lines(
             limit=180,
             masker=active_masker,
         )
-        lines.append(f"- **{symptom_name}** ({_family_label(family)})")
+        learned = is_matcher_only_family(family)
+        lines.append(("- 이전 인시던트에서 학습된 지식(카탈로그 계열 아님): " if learned and language == "ko" else "- Learned from a previous incident (not a catalog family): " if learned else "- ") + f"**{symptom_name}** ({_family_label(family)})")
         lines.extend(
             f"  - {_safe_line(action, limit=360, masker=active_masker)}"
             for action in _localized_failure_mode_actions(symptom, language)[:5]
