@@ -107,7 +107,7 @@ _NEGATED_SUFFIX_RE = re.compile(
     r"count\s+(?:is\s+)?zero)\b"
     r"|^\s*(?:\S+\s+){0,4}(?:false|0)\b"
     r"|^\s*(?:[\w\"'-]+\s+){0,4}(?:은|는|이|가|도)?\s*"
-    r"(?:아님|아니다|없음|없다|관찰되지\s*않음|발생하지\s*않음|"
+    r"(?:아님|아닙니다|아니다|없음|없습니다|없다|관찰되지\s*않음|발생하지\s*않음|"
     r"감지되지\s*않음|확인되지\s*않음|정상|성공|해결됨|복구됨|정상화)"
     # Korean attributive/connective negation. A condition name commonly
     # appears before a parenthetical qualifier, e.g. ``MemoryPressure 등이
@@ -117,7 +117,7 @@ _NEGATED_SUFFIX_RE = re.compile(
     r"(?:아닌|아니라|아니며|아니고|아니지만|아니었|아니었던)\b"
     r"|^\s*(?:\S+\s+){0,4}(?:은|는|이|가|도)?\s*"
     r"(?:감지되지|발생하지|확인되지|관찰되지)\s*"
-    r"(?:않(?:음|다|았|았음|았습니다|은|으며|고)|못(?:함|했다|했습니다))"
+    r"(?:않(?:음|다|았|았음|았습니다|습니다|은|으며|고)|못(?:함|했다|했습니다))"
     r"|^\s*(?:[\w\"'-]+\s+){0,6}"
     r"(?:no\s+evidence|needs?\s+evidence|possible|examples?|during\s+triage|"
     r"before\s+blaming)\b"
@@ -689,6 +689,38 @@ def component_for_target(
                 best = entry
                 best_len = len(name)
     return best
+
+
+def localized_failure_mode_actions(symptom: dict[str, Any], language: str) -> list[str]:
+    """A symptom's actions, preferring the curated translation when present."""
+    localized = symptom.get("actions_ko") if language == "ko" else None
+    actions = localized or symptom.get("actions") or []
+    return [str(action) for action in actions if str(action).strip()]
+
+
+def family_label(family: str) -> str:
+    """Readable name for a root-cause family, for operator-facing text."""
+    labels = {
+        "node_kubelet_pressure": "node kubelet pressure",
+        "runai_scheduling_quota": "Run:ai scheduling / GPU quota (preempt/reclaim/gang)",
+        "k8s_scheduling_error": "Kubernetes scheduling error (taint/affinity/topology/quota)",
+        "runai_control_plane_error": "Run:ai control-plane error (scheduler/backend/cluster-sync)",
+        "k8s_control_plane_error": "Kubernetes control-plane error (apiserver/etcd/scheduler)",
+        "workload_startup_error": "workload startup/config/crash",
+        "image_pull_error": "image pull / registry failure",
+        "gpu_hardware_error": "GPU hardware error",
+        "platform_version_bug": "Run:ai version bug",
+        "observability_accuracy": "metrics/observability accuracy",
+        "expected_known_behavior": "expected/known behavior",
+        "network_fabric_error": "GPU interconnect/fabric error (NCCL/IB/NVLink)",
+        "cluster_network_error": "cluster networking error (CNI/DNS)",
+        "k8s_storage_error": "Kubernetes storage error (CSI/PVC/StorageClass)",
+        "storage_backend_error": "backend storage error (NFS/Ceph/read-only fs)",
+        "workload_runtime_error": "workload runtime error (application fault)",
+        "platform_auth_error": "authentication/SSO error (login/permissions/SAML/OIDC)",
+        "insufficient_evidence": "insufficient evidence",
+    }
+    return labels.get(family, family.replace("_", " "))
 
 
 def component_action_lines(components: dict[str, dict[str, Any]], name: str) -> list[str]:

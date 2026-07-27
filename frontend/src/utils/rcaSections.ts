@@ -5,8 +5,12 @@ export type RcaSection = { heading: string; body: string; pinned: boolean; defau
 // Pinned = the core RCA an operator reads at a glance (Problem/Root Cause/Actions,
 // EN and KO both start "1."/"2."/"3."). Rendered always-open, no toggle.
 const PINNED = /^[1-3]\./;
-// Of the collapsible rest, only the operator questions open by default.
-const OPEN_BY_DEFAULT = /^(Questions for the Operator|추가 확인 요청)/;
+// Of the collapsible rest, the operator questions and the general guide open by
+// default — on an evidence-free report they carry everything actionable, and the
+// backend only emits the guide when the RCA could not support an action.
+const OPEN_BY_DEFAULT = /^(Questions for the Operator|추가 확인 요청|일반 점검 가이드|General Troubleshooting Guidance)/;
+const OPERATOR_QUESTIONS = /^(Questions for the Operator|추가 확인 요청)/;
+const GENERAL_GUIDANCE = /^(일반 점검 가이드|General Troubleshooting Guidance)/;
 
 const APPENDIX_HEADING = /^(?:\d+\.\s*)?(?:appendix|부록(?:\s*\(appendix\))?)$/i;
 const EVIDENCE_HEADING = /^(?:evidence|증거(?:\s*\(evidence\))?)$/i;
@@ -56,13 +60,34 @@ export function splitRcaReport(markdown: string): { preamble: string; sections: 
   }
   return {
     preamble: preamble.join('\n'),
-    sections: sections.map(({ heading, lines, pinned, defaultOpen }) => ({
-      heading,
-      body: lines.join('\n'),
-      pinned,
-      defaultOpen,
-    })),
+    sections: hoistGeneralGuidance(
+      sections.map(({ heading, lines, pinned, defaultOpen }) => ({
+        heading,
+        body: lines.join('\n'),
+        pinned,
+        defaultOpen,
+      })),
+    ),
   };
+}
+
+// The report keeps the guide after the appendix so it can never read as part of
+// the RCA conclusion. On screen that buries the only useful content an
+// evidence-free report has, so move it up next to the operator questions —
+// still its own clearly-labelled section, just not below the reference material.
+function hoistGeneralGuidance(sections: RcaSection[]): RcaSection[] {
+  const guideAt = sections.findIndex((section) => GENERAL_GUIDANCE.test(section.heading));
+  if (guideAt < 0) return sections;
+  const rest = sections.filter((_, index) => index !== guideAt);
+  const questionsAt = rest.findIndex((section) => OPERATOR_QUESTIONS.test(section.heading));
+  const lastPinned = rest.map((section) => section.pinned).lastIndexOf(true);
+  let insertAt = (questionsAt >= 0 ? questionsAt : lastPinned) + 1;
+  // The appendix is reference material and is the hard upper bound: a report
+  // whose questions were appended after it (the legacy/LLM-shaped fallback in
+  // _insert_before_appendix) must not drag the guide back down there.
+  const appendixAt = rest.findIndex((section) => APPENDIX_HEADING.test(section.heading));
+  if (appendixAt >= 0) insertAt = Math.min(insertAt, appendixAt);
+  return [...rest.slice(0, insertAt), sections[guideAt], ...rest.slice(insertAt)];
 }
 
 // Evidence bullets are machine-generated as "- **agent**: finding via <query>"

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -90,7 +92,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			// alert). Create an ad-hoc incident from the request so the pipeline
 			// has a real target and the work shows up in the incident list; the
 			// chat message travels as the operator guidance steering the analysis.
-			fp := fmt.Sprintf("chat-adhoc-%d", time.Now().UnixNano())
+			fp := adHocFingerprint(req.ConversationID, req.Message)
 			_, record := s.store.UpsertAlert(AlertmanagerWebhook{GroupKey: fp}, Alert{
 				Status: "firing",
 				Labels: map[string]string{
@@ -365,6 +367,18 @@ func runSummary(run AnalysisRun) map[string]any {
 		"created_at":       run.CreatedAt,
 		"updated_at":       run.UpdatedAt,
 	}
+}
+
+// adHocFingerprint is the alert identity for a chat-requested analysis that no
+// Alertmanager rule covers. It must be CONTENT-derived, not time-derived: a
+// double-submitted question (a Korean IME emits an extra Enter keydown, and any
+// client can retry) would otherwise mint a second alert and a second incident,
+// bypassing the fingerprint dedup every other alert path relies on. Scoping to
+// the conversation keeps two operators asking the same question in their own
+// threads apart.
+func adHocFingerprint(conversationID, message string) string {
+	digest := sha256.Sum256([]byte(conversationID + "\x00" + strings.TrimSpace(message)))
+	return "chat-adhoc-" + hex.EncodeToString(digest[:8])
 }
 
 func wantsAnalysisRun(message string) bool {

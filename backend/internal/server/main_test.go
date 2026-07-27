@@ -3249,3 +3249,122 @@ func TestRecurrenceStatsCacheExpiresAndInvalidates(t *testing.T) {
 		t.Fatalf("expected recurrence cache to expire, got %+v", stats)
 	}
 }
+
+func TestChatAdHocAnalysisDedupesRepeatedSubmission(t *testing.T) {
+	// A Korean IME ends composition with its own Enter keydown, so the same
+	// question reaches the server twice. The ad-hoc fingerprint is derived from
+	// the content precisely so the second one lands on the SAME alert/incident
+	// instead of minting a twin.
+	server := NewServer()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		time.Sleep(50 * time.Millisecond) // keep the first run in "analyzing"
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Ad-hoc RCA completed.",
+			AnalysisDetail:  "## Root Cause\n\nAd-hoc analysis.",
+			AnalysisQuality: "medium",
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	send := func(message, conversationID string) ChatResponse {
+		payload, _ := json.Marshal(ChatRequest{Message: message, ConversationID: conversationID})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
+		rec := httptest.NewRecorder()
+		server.routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("expected chat 202, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var response ChatResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode chat response: %v", err)
+		}
+		return response
+	}
+
+	const question = "runai 스케줄링 오류가 나면 어떻게 해? 분석해줘"
+	first := send(question, "conv-1")
+	second := send(question, "conv-1")
+
+	if first.AnalysisRun == nil || second.AnalysisRun == nil {
+		t.Fatalf("expected both responses to carry a run: %+v / %+v", first, second)
+	}
+	if first.AnalysisRun.TargetID != second.AnalysisRun.TargetID {
+		t.Fatalf("duplicate submission created a second alert: %q vs %q",
+			first.AnalysisRun.TargetID, second.AnalysisRun.TargetID)
+	}
+	if first.AnalysisRun.RunID != second.AnalysisRun.RunID {
+		t.Fatalf("duplicate submission started a second run: %q vs %q",
+			first.AnalysisRun.RunID, second.AnalysisRun.RunID)
+	}
+	if _, total := server.store.ListIncidentsPageFiltered(50, 0, "", IncidentListFilter{}); total != 1 {
+		t.Fatalf("expected exactly 1 incident after a duplicate submission, got %d", total)
+	}
+
+	// A different question is a different problem and keeps its own incident.
+	other := send("이미지 풀 오류가 나면 어떻게 해? 분석해줘", "conv-1")
+	if other.AnalysisRun.TargetID == first.AnalysisRun.TargetID {
+		t.Fatalf("a different question must not reuse the ad-hoc alert")
+	}
+	// The same question in another conversation is another operator's thread.
+	elsewhere := send(question, "conv-2")
+	if elsewhere.AnalysisRun.TargetID == first.AnalysisRun.TargetID {
+		t.Fatalf("the same question in another conversation must not merge threads")
+	}
+}
+
+func TestAdHocFingerprintIsContentDerived(t *testing.T) {
+	same := adHocFingerprint("conv", "  분석해줘  ")
+	if adHocFingerprint("conv", "분석해줘") != same {
+		t.Fatalf("surrounding whitespace must not change the ad-hoc identity")
+	}
+	if adHocFingerprint("other", "분석해줘") == same {
+		t.Fatalf("a different conversation must get a different identity")
+	}
+	if adHocFingerprint("conv", "다른 질문") == same {
+		t.Fatalf("a different question must get a different identity")
+	}
+	if !strings.HasPrefix(same, "chat-adhoc-") {
+		t.Fatalf("ad-hoc fingerprints must stay recognisable, got %q", same)
+	}
+}
+
+func TestIncidentListPutsAnalyzingFirst(t *testing.T) {
+	// A running analysis is the row the operator is waiting on, so it leads even
+	// when a newer incident fired after it.
+	store := NewStore()
+	mk := func(fingerprint string, ago time.Duration) *AlertRecord {
+		_, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: fingerprint}, Alert{
+			Status:      "firing",
+			Labels:      map[string]string{"alertname": fingerprint},
+			Fingerprint: fingerprint,
+			StartsAt:    time.Now().UTC().Add(-ago).Format(time.RFC3339),
+		})
+		return record
+	}
+	old := mk("older", 2*time.Hour)
+	mk("newer", 1*time.Minute)
+
+	items, _ := store.ListIncidentsPageFiltered(50, 0, "", IncidentListFilter{})
+	if len(items) != 2 || items[0].IncidentID != old.IncidentID {
+		// Sanity: without an analysis running, newest activity leads.
+		if items[0].IncidentID == old.IncidentID {
+			t.Fatalf("expected the newer incident first before any analysis, got %+v", items)
+		}
+	}
+
+	store.BeginAnalyzing(old.IncidentID, old.AlertID)
+	items, _ = store.ListIncidentsPageFiltered(50, 0, "", IncidentListFilter{})
+	if len(items) != 2 {
+		t.Fatalf("expected 2 incidents, got %d", len(items))
+	}
+	if items[0].IncidentID != old.IncidentID {
+		t.Fatalf("analyzing incident must lead the list, got %q first", items[0].IncidentID)
+	}
+	if !items[0].IsAnalyzing || items[1].IsAnalyzing {
+		t.Fatalf("unexpected analyzing flags: %+v", items)
+	}
+}

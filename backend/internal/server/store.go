@@ -651,7 +651,14 @@ func (s *Store) ListIncidentsPageFilteredWithCounts(limit, offset int, view stri
 		}
 		ordered = append(ordered, incident)
 	}
-	sort.Slice(ordered, func(i, j int) bool { return incidentActivityAt(ordered[i]).After(incidentActivityAt(ordered[j])) })
+	// A running analysis is the one row an operator is waiting on, so it leads
+	// regardless of when it fired; everything else stays newest-activity-first.
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].IsAnalyzing != ordered[j].IsAnalyzing {
+			return ordered[i].IsAnalyzing
+		}
+		return incidentActivityAt(ordered[i]).After(incidentActivityAt(ordered[j]))
+	})
 	counts := IncidentListCounts{}
 	for _, incident := range ordered {
 		if incident.Status == "resolved" {

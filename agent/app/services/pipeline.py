@@ -33,11 +33,13 @@ from app.knowledge import (
     component_action_lines,
     component_check_lines,
     dependency_path,
+    family_label,
     load_architecture,
     load_failure_modes,
     load_family_catalog,
     load_runai_known_issues,
     load_troubleshooting_cases,
+    localized_failure_mode_actions,
     match_failure_mode_symptoms,
     match_runai_known_issues,
     merge_runtime_failure_modes,
@@ -2391,6 +2393,10 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                         state.known_issues,
                         language=getattr(settings, "language", "en"),
                         masker=state.masker,
+                        component=getattr(plan, "component", "") if plan else "",
+                        components=load_architecture(settings.architecture_file),
+                        matched_alert=getattr(plan, "matched_alert", None) if plan else None,
+                        families=_plan_families(plan),
                     ),
                 ]
             )
@@ -2625,14 +2631,24 @@ async def harness_stage(state: PipelineState) -> PipelineState:
 
     status = "pass"
     if verdict.failed_gates:
+        # abstain() replaces the whole document, which would leave a gated run
+        # with LESS non-diagnostic help than a zero-evidence one. The guide is
+        # explicitly not a conclusion, so a failed gate is no reason to drop it.
+        language = getattr(state.settings, "language", "en")
+        carried_guidance = _general_guidance_block(response.analysis_detail, language)
         abstain(
             response,
             state.root_cause_candidates,
             verdict,
             historical_reanalysis=_is_resolved_reanalysis(state.request),
-            language=getattr(state.settings, "language", "en"),
+            language=language,
             next_check=state.self_check_next,
         )
+        if carried_guidance:
+            response.analysis_detail = _append_general_guidance(
+                response.analysis_detail, carried_guidance
+            )
+            response.analysis = response.analysis_detail
         verdict = evaluate(
             response,
             state.results,
@@ -4129,10 +4145,7 @@ def _localized_failure_mode_name(symptom: dict, language: str) -> str:
     return str(symptom.get("symptom") or "")
 
 
-def _localized_failure_mode_actions(symptom: dict, language: str) -> list[str]:
-    localized = symptom.get("actions_ko") if language == "ko" else None
-    actions = localized or symptom.get("actions") or []
-    return [str(action) for action in actions if str(action).strip()]
+_localized_failure_mode_actions = localized_failure_mode_actions
 
 
 def _runtime_knowledge_hint_lines(
@@ -4419,10 +4432,30 @@ def _detail_from(
                     known_issues or [],
                     language=language,
                     masker=masker,
+                    component=getattr(plan, "component", "") if plan else "",
+                    components=components,
+                    matched_alert=getattr(plan, "matched_alert", None) if plan else None,
+                    families=_plan_families(plan),
                 ),
             ]
         )
     return "\n".join(lines)
+
+
+def _plan_families(plan: InvestigationPlan | None) -> list[str]:
+    """Hypothesis families, but only when the LLM actually read the request.
+
+    The deterministic router orders families from the alert NAME, so for a
+    free-form request ("OperatorRequestedAnalysis") it leads with a default —
+    node_kubelet_pressure for anything label-less. Presenting that as what the
+    request is about would be a fabricated interpretation.
+    """
+    if not getattr(plan, "llm_refined", False):
+        return []
+    families = [
+        str(h.get("family") or "") for h in (getattr(plan, "hypotheses", None) or []) if h
+    ]
+    return list(dict.fromkeys(f for f in families if f))
 
 
 def _needs_general_guidance(
@@ -4457,6 +4490,21 @@ def _insert_before_appendix(detail: str, block: str) -> str:
 def _append_general_guidance(detail: str, block: str) -> str:
     """Keep non-diagnostic guidance outside the RCA conclusion and action sections."""
     return f"{detail.rstrip()}\n\n{block}"
+
+
+def _general_guidance_block(detail: str, language: str) -> str:
+    """The guide section of a report, heading included, or "" when absent.
+
+    ``_append_general_guidance`` always puts it last, so the heading to the end
+    of the document is the whole section. Both language headings are checked: a
+    stored report may have been written under a different language setting.
+    """
+    for heading in (_general_guidance_heading(language), _general_guidance_heading("en"),
+                    _general_guidance_heading("ko")):
+        index = (detail or "").find(heading)
+        if index >= 0:
+            return detail[index:].rstrip()
+    return ""
 
 
 def _supporting_evidence(
@@ -6540,28 +6588,7 @@ def _family_supplemental_playbook_lines(
     return [heading, *rendered]
 
 
-def _family_label(family: str) -> str:
-    labels = {
-        "node_kubelet_pressure": "node kubelet pressure",
-        "runai_scheduling_quota": "Run:ai scheduling / GPU quota (preempt/reclaim/gang)",
-        "k8s_scheduling_error": "Kubernetes scheduling error (taint/affinity/topology/quota)",
-        "runai_control_plane_error": "Run:ai control-plane error (scheduler/backend/cluster-sync)",
-        "k8s_control_plane_error": "Kubernetes control-plane error (apiserver/etcd/scheduler)",
-        "workload_startup_error": "workload startup/config/crash",
-        "image_pull_error": "image pull / registry failure",
-        "gpu_hardware_error": "GPU hardware error",
-        "platform_version_bug": "Run:ai version bug",
-        "observability_accuracy": "metrics/observability accuracy",
-        "expected_known_behavior": "expected/known behavior",
-        "network_fabric_error": "GPU interconnect/fabric error (NCCL/IB/NVLink)",
-        "cluster_network_error": "cluster networking error (CNI/DNS)",
-        "k8s_storage_error": "Kubernetes storage error (CSI/PVC/StorageClass)",
-        "storage_backend_error": "backend storage error (NFS/Ceph/read-only fs)",
-        "workload_runtime_error": "workload runtime error (application fault)",
-        "platform_auth_error": "authentication/SSO error (login/permissions/SAML/OIDC)",
-        "insufficient_evidence": "insufficient evidence",
-    }
-    return labels.get(family, family.replace("_", " "))
+_family_label = family_label
 
 
 def _short_sentence(value: str, *, limit: int) -> str:

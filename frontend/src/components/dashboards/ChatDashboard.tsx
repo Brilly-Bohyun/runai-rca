@@ -35,6 +35,10 @@ export function ChatDashboard({
   }, [activeMessages, chat.sending]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    // A Korean/Japanese IME ends composition with its own Enter keydown. Without
+    // this guard that keydown both sends a half-typed message and lands a second
+    // send in the same event burst.
+    if (event.nativeEvent.isComposing) return;
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
       void chat.send();

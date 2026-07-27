@@ -32,6 +32,12 @@ class InvestigationPlan:
     # True only when a similar incident / ontology fact cleared the 0.8 bar.
     used_similarity: bool = False
     used_ontology: bool = False
+    # True when the planner LLM re-ordered the hypotheses. The deterministic
+    # router ranks on the alert NAME alone, so on a free-form request (an
+    # operator question, any language) its leading family is a default, not a
+    # reading of the request. Only an LLM-refined order may be presented as an
+    # interpretation of what was asked.
+    llm_refined: bool = False
     # Operator-facing narrative of the plan / how to approach when nothing matched.
     narrative: str = ""
     # The matched Run:ai built-in alert definition (name/severity/trigger/actions),
