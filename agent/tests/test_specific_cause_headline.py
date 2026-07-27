@@ -230,3 +230,258 @@ def test_unschedulable_condition_supplies_specific_cause() -> None:
         language="ko",
     )
     assert "nodeSelector/affinity 불일치" in headline
+
+
+def _signature_result(family: str, *markers: str) -> CollectorResult:
+    """An alert_signature card exactly as _alert_signature_evidence_result builds it."""
+    item = artifact(
+        agent="alert",
+        source="alertmanager",
+        type="alert_signature",
+        status="ok",
+        confidence="high",
+        summary="Alert payload explicitly reported " + ", ".join(markers) + ".",
+        result={
+            "matched_signals": list(markers),
+            "observation": {
+                "predicate": f"alert_signature:{family}",
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "alert", "name": "fp-1"},
+            },
+        },
+    )
+    result = CollectorResult(
+        agent="alert", status="ok", summary="alert signature", artifacts=[item]
+    )
+    assign_evidence_ids([result])
+    return result
+
+
+def _ranked(family: str, mechanism: str) -> RankedCause:
+    return RankedCause(family, "high", 9.0, mechanism=mechanism)
+
+
+def test_warning_event_ranking_still_names_the_missing_object():
+    # Ranking settled on the family through a Warning event, so there is no
+    # "typed container state ..." mechanism — the headline must still be concrete.
+    result = _result(
+        "CreateContainerConfigError", 'secret "app-secret" not found', event=True
+    )
+    eligible = {result.artifacts[0].evidence_id}
+    headline = pipeline._ranked_root_cause_statement(
+        [_ranked("workload_startup_error", "warning event CreateContainerConfigError")],
+        _request(),
+        results=[result],
+        eligible_evidence_ids=eligible,
+        language="ko",
+    )
+    assert "Secret 'app-secret'" in headline
+    assert headline.index("Secret 'app-secret'") < headline.index("분류:")
+
+
+def test_alert_signature_ranking_names_the_missing_object():
+    # The alert payload itself asserted the reason; the object name lives in the
+    # annotation text the signature was asserted from.
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubeContainerWaiting"},
+            annotations={
+                "description": 'CreateContainerConfigError: secret "app-secret" not found'
+            },
+            fingerprint="fp-1",
+        )
+    )
+    result = _signature_result("workload_startup_error", "CreateContainerConfigError")
+    eligible = {result.artifacts[0].evidence_id}
+    headline = pipeline._ranked_root_cause_statement(
+        [_ranked("workload_startup_error", "alert signature CreateContainerConfigError")],
+        request,
+        results=[result],
+        eligible_evidence_ids=eligible,
+        language="ko",
+    )
+    assert "Secret 'app-secret'" in headline
+
+
+def test_alert_signature_outside_eligible_evidence_is_not_used():
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubeContainerWaiting"},
+            annotations={
+                "description": 'CreateContainerConfigError: secret "app-secret" not found'
+            },
+            fingerprint="fp-1",
+        )
+    )
+    result = _signature_result("workload_startup_error", "CreateContainerConfigError")
+    assert (
+        pipeline._specific_cause_statement(
+            _ranked("workload_startup_error", "alert signature"),
+            [result],
+            set(),
+            language="ko",
+            request=request,
+        )
+        == ""
+    )
+
+
+def test_runbook_text_never_supplies_the_headline():
+    # Probe/runbook wording is hypothesis guidance, never incident evidence.
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubeContainerWaiting"},
+            annotations={
+                "runbook_url": 'https://wiki/secret "app-secret" not found',
+                "summary": "container waiting",
+            },
+            fingerprint="fp-1",
+        )
+    )
+    result = _signature_result("workload_startup_error", "CreateContainerConfigError")
+    eligible = {result.artifacts[0].evidence_id}
+    detail = pipeline._specific_cause_statement(
+        _ranked("workload_startup_error", "alert signature"),
+        [result],
+        eligible,
+        language="ko",
+        request=request,
+    )
+    assert "app-secret" not in detail
+
+
+def test_specific_cause_leads_and_family_becomes_the_classification():
+    result = _result("CreateContainerConfigError", 'secret "app-secret" not found')
+    eligible = {result.artifacts[0].evidence_id}
+    headline = pipeline._ranked_root_cause_statement(
+        [_candidate("CreateContainerConfigError", "workload_startup_error")],
+        _request(),
+        results=[result],
+        eligible_evidence_ids=eligible,
+        language="ko",
+    )
+    assert "가장 가능성 높은 원인은" not in headline
+    assert "(분류:" in headline
+
+
+def _failed_event_result(message: str) -> CollectorResult:
+    """A kubelet Warning event exactly as the cluster emits it for a config error:
+    the Event reason is the generic "Failed", not the container state reason."""
+    item = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Warning events",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "target_identity_verified": True,
+            },
+            "events": [
+                {
+                    "type": "Warning",
+                    "reason": "Failed",
+                    "count": 1,
+                    "target_identity_verified": True,
+                    "message": message,
+                }
+            ],
+        },
+    )
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="events", artifacts=[item]
+    )
+    assign_evidence_ids([result])
+    return result
+
+
+def test_kubelet_failed_event_names_the_object_the_self_check_found():
+    # INC shape: the alert payload asserted CreateContainerConfigError and a
+    # single kubelet Event carried the object name. The self-check quoted the
+    # Secret while the headline stayed family-level — the Event reason is
+    # "Failed", so a reason-token match alone never reached the message.
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubeContainerWaiting", "namespace": "default"},
+            annotations={"description": "CreateContainerConfigError"},
+            fingerprint="fp-1",
+        )
+    )
+    signature = _signature_result("workload_startup_error", "CreateContainerConfigError")
+    events = _failed_event_result('Error: secret "nonexistent-secret" not found')
+    results = [signature, events]
+    assign_evidence_ids(results)
+    eligible = {
+        signature.artifacts[0].evidence_id,
+        events.artifacts[0].evidence_id,
+    }
+    headline = pipeline._ranked_root_cause_statement(
+        [_ranked("workload_startup_error", "alert signature CreateContainerConfigError")],
+        request,
+        results=results,
+        eligible_evidence_ids=eligible,
+        language="ko",
+    )
+    assert "Secret 'nonexistent-secret'" in headline
+    assert "가장 가능성 높은 원인은" not in headline
+
+
+def test_failed_event_outside_eligible_evidence_cannot_name_the_object():
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubeContainerWaiting"},
+            annotations={"description": "CreateContainerConfigError"},
+            fingerprint="fp-1",
+        )
+    )
+    signature = _signature_result("workload_startup_error", "CreateContainerConfigError")
+    events = _failed_event_result('Error: secret "nonexistent-secret" not found')
+    assign_evidence_ids([signature, events])
+    detail = pipeline._specific_cause_statement(
+        _ranked("workload_startup_error", "alert signature"),
+        [signature, events],
+        {signature.artifacts[0].evidence_id},  # the event is NOT eligible
+        language="ko",
+        request=request,
+    )
+    assert "nonexistent-secret" not in detail
+
+
+def test_unverified_failed_event_cannot_name_the_object():
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubeContainerWaiting"},
+            annotations={"description": "CreateContainerConfigError"},
+            fingerprint="fp-1",
+        )
+    )
+    signature = _signature_result("workload_startup_error", "CreateContainerConfigError")
+    events = _failed_event_result('Error: secret "someone-elses-secret" not found')
+    assign_evidence_ids([signature, events])
+    events.artifacts[0].result["events"][0]["target_identity_verified"] = False
+    detail = pipeline._specific_cause_statement(
+        _ranked("workload_startup_error", "alert signature"),
+        [signature, events],
+        {signature.artifacts[0].evidence_id, events.artifacts[0].evidence_id},
+        language="ko",
+        request=request,
+    )
+    assert "someone-elses-secret" not in detail
+
+
+def test_every_ranked_family_has_a_korean_explanation():
+    # The ko headline falls back to the raw family label when a family is missing
+    # from the map, which is how English leaks into a Korean conclusion.
+    from app.services.root_cause_ranking import FAMILIES
+
+    assert set(FAMILIES) <= set(pipeline._FAMILY_EXPLANATION_KO)
