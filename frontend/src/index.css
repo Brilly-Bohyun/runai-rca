@@ -846,6 +846,37 @@ tbody tr:active td {
   font-size: 0.77rem;
 }
 
+.knowledge-ingestion-preview {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0 0 1rem;
+  border: 1px solid #cfd9ea;
+  border-radius: 0.5rem;
+  background: #f8fafd;
+  padding: 0.65rem 0.75rem;
+}
+
+.knowledge-ingestion-preview > strong {
+  color: #2c4168;
+  font-size: 0.8rem;
+}
+
+.knowledge-ingestion-symptom {
+  display: grid;
+  gap: 0.2rem;
+  font-size: 0.77rem;
+  color: #40506a;
+}
+
+.knowledge-ingestion-symptom ul {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.knowledge-ingestion-warning {
+  color: #8a6116;
+}
+
 .knowledge-probe-ids {
   display: grid;
   gap: 0.15rem;

@@ -287,9 +287,20 @@ export type KnowledgeEvidenceSummary = {
   quality?: string;
 };
 
+// The exact structure activation writes into the runtime ontology: evidence
+// predicates (keywords) -> mechanism (symptom name) -> family, with the
+// operator-confirmed remediation attached to that mechanism.
+export type CompiledKnowledge = {
+  failure_modes?: Array<{
+    family?: string;
+    symptoms?: Array<{ name?: string; keywords?: string[]; actions?: string[] }>;
+  }>;
+};
+
 export type KnowledgeCandidate = {
   candidate_id: string;
   status: string;
+  payload?: { mechanism?: string; compiled?: CompiledKnowledge };
   title?: string;
   summary?: string;
   root_cause_family?: string;

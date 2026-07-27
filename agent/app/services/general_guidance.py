@@ -9,7 +9,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.knowledge import match_failure_mode_symptoms, match_runai_known_issues
+from app.knowledge import (
+    component_action_lines,
+    family_label,
+    localized_failure_mode_actions,
+    match_failure_mode_symptoms,
+    match_runai_known_issues,
+)
 from app.masking import Masker, build_masker
 
 _BASE_LINES = {
@@ -38,6 +44,10 @@ def general_guidance_lines(
     *,
     language: str = "en",
     masker: Masker | None = None,
+    component: str = "",
+    components: dict[str, dict[str, Any]] | None = None,
+    matched_alert: dict[str, Any] | None = None,
+    families: list[str] | None = None,
 ) -> list[str]:
     """Return optional next checks for a question without live evidence.
 
@@ -45,10 +55,57 @@ def general_guidance_lines(
     always worded as conditional checks. Fuzzy matching is intentionally excluded:
     a context-free request should not gain a specific recommendation from loose
     text similarity.
+
+    ``component`` and ``matched_alert`` come from the investigation plan and are
+    the two retrieval paths that need no evidence at all: the component is the
+    alert target's own identity (pod name -> architecture component) and the
+    matched alert is a catalog entry resolved from the alert name. Without them
+    an evidence-free run silently drops ontology the same run already retrieved.
+
+    ``families`` are the planner's hypothesis families. The curated keywords are
+    written to match EVIDENCE text (event and log strings such as "preempted by
+    higher priority"), so a human question misses them in every language --
+    "runai scheduling error" matches nothing at all. The planner LLM already read
+    the operator's question, in whatever language it was asked, and named a
+    family from the closed catalog; that name is the language-independent bridge
+    into the ontology, and it costs no extra call. Unknown names simply find no
+    symptoms, so a hallucinated family cannot invent guidance.
     """
     active_masker = masker or build_masker(())
     lines = list(_BASE_LINES.get(language, _BASE_LINES["en"]))
     text = active_masker.mask_text(query or "")
+
+    # Precision order mirrors the playbook: identity beats any keyword match.
+    # The component is a fact about the target, so its checks are stated plainly
+    # -- naming what to inspect is not a claim about what went wrong.
+    if component:
+        checks = component_action_lines(components or {}, component)
+        if checks:
+            name = _safe(component, active_masker, 120)
+            lines.append(
+                f"- 알림 대상이 **{name}** 컴포넌트입니다. "
+                "원인 확정 전이라도 다음을 확인할 수 있습니다:"
+                if language == "ko"
+                else f"- The alert target is the **{name}** component. Even before a cause "
+                "is confirmed, these can be checked:"
+            )
+            lines.extend(f"  - {_safe(check, active_masker, 360)}" for check in checks[:4])
+
+    alert_actions = [str(a) for a in (matched_alert or {}).get("actions", [])][:3]
+    if alert_actions:
+        alert_name = _safe(
+            (matched_alert or {}).get("alert") or (matched_alert or {}).get("name"),
+            active_masker,
+            160,
+        )
+        lines.append(
+            f"- 이 알림(**{alert_name}**)에 대한 문서화된 대응 절차입니다. "
+            "현재 원인으로 확인된 내용은 아닙니다:"
+            if language == "ko"
+            else f"- Documented response steps for this alert (**{alert_name}**) — "
+            "not a confirmed cause for the current run:"
+        )
+        lines.extend(f"  - {_safe(action, active_masker, 360)}" for action in alert_actions)
 
     for issue in match_runai_known_issues(known_issues, text)[:2]:
         name = _safe(issue.get("issue"), active_masker, 180)
@@ -62,9 +119,10 @@ def general_guidance_lines(
             f"  - {_safe(action, active_masker, 360)}" for action in issue.get("actions", [])[:3]
         )
 
-    for _family, symptom in match_failure_mode_symptoms(failure_modes, text)[:2]:
+    symptom_matches = match_failure_mode_symptoms(failure_modes, text)[:2]
+    for _family, symptom in symptom_matches:
         name = _safe(symptom.get("symptom"), active_masker, 180)
-        actions = symptom.get("actions") or []
+        actions = localized_failure_mode_actions(symptom, language)
         if not actions:
             continue
         lines.append(
@@ -74,6 +132,49 @@ def general_guidance_lines(
         )
         lines.extend(f"  - {_safe(action, active_masker, 360)}" for action in actions[:3])
 
+    # Only as a fallback: an exact signature hit is a stronger reason to show a
+    # symptom than the planner's reading of the question.
+    if not symptom_matches:
+        lines.extend(
+            _family_candidate_lines(families or [], failure_modes, language, active_masker)
+        )
+
+    return lines
+
+
+def _family_candidate_lines(
+    families: list[str],
+    failure_modes: dict[str, list[dict[str, Any]]],
+    language: str,
+    masker: Masker,
+) -> list[str]:
+    """Representative symptoms of the families the planner nominated.
+
+    Presented as what to look for, never as what happened: no evidence was
+    collected, and the family came from reading the request, not the cluster.
+    """
+    lines: list[str] = []
+    for family in families[:2]:
+        symptoms = [
+            s
+            for s in (failure_modes.get(family) or [])
+            if localized_failure_mode_actions(s, language)
+        ]
+        if not symptoms:
+            continue
+        label = _safe(family_label(family), masker, 160)
+        lines.append(
+            f"- 이번 요청은 **{label}** 계열로 해석되었습니다. 확인된 원인이 아니라 "
+            "이 계열에서 흔한 증상이며, 각 항목을 실제로 관찰했는지 먼저 확인하세요:"
+            if language == "ko"
+            else f"- This request was interpreted as **{label}**. These are the common "
+            "symptoms of that family — not a confirmed cause; check whether any is "
+            "actually present:"
+        )
+        for symptom in symptoms[:3]:
+            name = _safe(symptom.get("symptom"), masker, 180)
+            action = _safe(localized_failure_mode_actions(symptom, language)[0], masker, 300)
+            lines.append(f"  - **{name}**: {action}")
     return lines
 
 

@@ -369,6 +369,25 @@ func sanitizeObservationWindow(window map[string]any) map[string]any {
 	return out
 }
 
+// operatorConfirmedActions is the resolved_by edge of a learned symptom: the
+// effective actions reviewers recorded on resolved/mitigated evaluations for
+// this case (case_snapshot.caseReviewProjectionLocked), minus anything any
+// reviewer marked ineffective. Without them a learned symptom activates as a
+// matcher with no remediation.
+func operatorConfirmedActions(card map[string]any) []string {
+	failed := map[string]bool{}
+	for _, action := range stringSlice(card["failed_actions"]) {
+		failed[action] = true
+	}
+	actions := []string{}
+	for _, action := range stringSlice(card["successful_actions"]) {
+		if action != "" && !failed[action] {
+			actions = append(actions, action)
+		}
+	}
+	return actions
+}
+
 // compiledKnowledgePayload is intentionally a narrow public representation.
 // It excludes analysis prose, artifacts, raw evidence, tool queries, and logs.
 func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, operatorConfirmed bool) (map[string]any, string) {
@@ -435,7 +454,13 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 			"failure_modes": []any{map[string]any{
 				"family": family,
 				"symptoms": []any{map[string]any{
-					"name": mechanism, "keywords": safeKnowledgeKeywords(append([]string{mechanism}, predicates...)), "actions": []any{},
+					// The learned symptom is the full chain: the evidence
+					// predicates that were OBSERVED (keywords), the mechanism
+					// they indicate (name), and what the operator confirmed
+					// fixed it (actions, from the evaluation's effective-action
+					// field on this case). Actions attach to this mechanism,
+					// never to the family as a whole.
+					"name": mechanism, "keywords": safeKnowledgeKeywords(append([]string{mechanism}, predicates...)), "actions": operatorConfirmedActions(card),
 				}},
 			}},
 			"probe_template_ids": map[string]any{family: probeTemplateIDs},

@@ -24,6 +24,61 @@ describe('splitRcaReport', () => {
     expect(sections).toEqual([]);
     expect(preamble).toBe('just a blob\nof text');
   });
+
+  it('hoists the general guide next to the operator questions and opens it', () => {
+    // The report keeps the guide last so it can never read as the conclusion;
+    // on screen that buried the only content an evidence-free report has.
+    const md = [
+      '## 1. Problem', '', 'text',
+      '## 3. 권장 조치', '', 'none yet',
+      '## 추가 확인 요청', '', 'q1',
+      '## 부록', '', 'reference',
+      '## 일반 점검 가이드 (현재 RCA 결론 아님)', '', '- check this',
+    ].join('\n');
+    const { sections } = splitRcaReport(md);
+    expect(sections.map((s) => s.heading)).toEqual([
+      '1. Problem', '3. 권장 조치', '추가 확인 요청',
+      '일반 점검 가이드 (현재 RCA 결론 아님)', '부록',
+    ]);
+    const guide = sections.find((s) => s.heading.startsWith('일반 점검'));
+    expect(guide?.defaultOpen).toBe(true);
+    expect(guide?.body).toContain('- check this');
+  });
+
+  it('keeps the guide above the appendix even when the questions land below it', () => {
+    // _insert_before_appendix falls back to appending when a report has an
+    // unexpected shape; the guide must still not sink into the reference block.
+    const md = [
+      '## 1. Problem', '', 'text',
+      '## 부록', '', 'reference',
+      '## 추가 확인 요청', '', 'q1',
+      '## 일반 점검 가이드 (현재 RCA 결론 아님)', '', '- check this',
+    ].join('\n');
+    expect(splitRcaReport(md).sections.map((s) => s.heading)).toEqual([
+      '1. Problem', '일반 점검 가이드 (현재 RCA 결론 아님)', '부록', '추가 확인 요청',
+    ]);
+  });
+
+  it('lands the guide after the pinned sections when there are no operator questions', () => {
+    const md = [
+      '## 1. Problem', '', 'text',
+      '## 3. Recommended Actions', '', 'none',
+      '## Appendix', '', 'reference',
+      '## General Troubleshooting Guidance (Not a Current RCA Conclusion)', '', '- check',
+    ].join('\n');
+    const order = splitRcaReport(md).sections.map((s) => s.heading);
+    expect(order).toEqual([
+      '1. Problem',
+      '3. Recommended Actions',
+      'General Troubleshooting Guidance (Not a Current RCA Conclusion)',
+      'Appendix',
+    ]);
+  });
+
+  it('leaves a report without a guide section untouched', () => {
+    const md = '## 1. Problem\n\ntext\n## Appendix\n\nref';
+    expect(splitRcaReport(md).sections.map((s) => s.heading)).toEqual(['1. Problem', 'Appendix']);
+  });
 });
 
 describe('formatEvidenceQueries', () => {

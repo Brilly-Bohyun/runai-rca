@@ -1,6 +1,8 @@
 import { AlertRecord, AnalysisRun, Envelope, EvaluationReview, EvaluationReviewInput, EvaluationView, FeedbackSummary, Incident, IncidentDetail, KPIStats, KnowledgeCandidate, KnowledgePackage, KnowledgeRuntimeSnapshot, LLMSpendStats, PageInfo, ProbeMetricsSnapshot, RecurrenceStats, RootCauseFamilyCatalog } from './types';
 
-const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
+// globalThis: this module is also loaded by node-side component tests, where
+// bare `window` throws at import time.
+const runtimeApiBase = globalThis.window?.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
 const configuredApiBase = normalizeApiBase(runtimeApiBase) ?? normalizeApiBase(import.meta.env.VITE_API_BASE_URL);
 const API_BASE = configuredApiBase ?? fallbackApiBase;

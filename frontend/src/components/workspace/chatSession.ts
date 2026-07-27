@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   chat,
@@ -70,6 +70,10 @@ export function useRcaChat({
   const [contextChoice, setContextChoice] = useState<ChatContextChoice>('auto');
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  // `sending` drives the UI but is captured by the send callback's closure, so
+  // two sends dispatched in the same event burst both read the stale `false`.
+  // A ref is the one value they share.
+  const inFlight = useRef(false);
 
   const chatContext = useMemo(
     () => buildChatContext(detail, activeView, incidents, alerts),
@@ -120,7 +124,8 @@ export function useRcaChat({
 
   const send = useCallback(async (options?: { analyze?: boolean }) => {
     const message = input.trim();
-    if (!message || sending) return;
+    if (!message || sending || inFlight.current) return;
+    inFlight.current = true;
 
     const now = new Date().toISOString();
     const conversationID = activeConversation?.id || randomID('chat');
@@ -217,6 +222,7 @@ export function useRcaChat({
         });
       });
     } finally {
+      inFlight.current = false;
       setSending(false);
     }
   }, [

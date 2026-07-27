@@ -872,6 +872,7 @@ async def _llm_refine(
         strategy=strategy if strategy in ("targeted", "breadth_first") else plan.strategy,
         used_similarity=plan.used_similarity,
         used_ontology=plan.used_ontology,
+        llm_refined=True,
         narrative=_plan_text(masker, narrative, limit=800)
         if isinstance(narrative, str) and narrative.strip()
         else plan.narrative,

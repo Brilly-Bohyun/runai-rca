@@ -76,6 +76,10 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
   const visibleCandidates = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     return candidates.filter((candidate) => {
+      // Superseded exists so the queue "never shows a stale failed candidate
+      // next to its promoted successor" (supersedeStaleCaseCandidatesLocked) —
+      // honor that by default; the status filter still reaches them.
+      if (filter === 'all' && candidate.status === 'superseded') return false;
       if (filter !== 'all' && candidate.status !== filter) return false;
       if (familyFilter !== 'all' && candidate.root_cause_family !== familyFilter) return false;
       if (kindFilter !== 'all' && candidate.kind !== kindFilter) return false;
@@ -330,6 +334,8 @@ function CandidateDetail({
 
         {candidate.validation_error && <p className="knowledge-validation-error">Validation: {candidate.validation_error}</p>}
 
+        <IngestionPreview candidate={candidate} />
+
         {matchingPackage && <FamilyPackageComparison candidate={candidate} pkg={matchingPackage} />}
 
         <div className="knowledge-evidence-head"><FileSearch size={17} /> Evidence ({evidence.length})</div>
@@ -370,6 +376,43 @@ function CandidateDetail({
         </div>
       )}
     </>
+  );
+}
+
+// What activation actually writes into the runtime ontology. The rest of the
+// panel is provenance; this is the payload the reviewer is approving —
+// evidence keywords -> mechanism (symptom) -> family, plus the remediation the
+// operator confirmed in the evaluation review.
+export function IngestionPreview({ candidate }: { candidate: KnowledgeCandidate }) {
+  const modes = candidate.payload?.compiled?.failure_modes ?? [];
+  const symptoms = modes.flatMap((mode) =>
+    (mode.symptoms ?? []).map((symptom) => ({ family: mode.family, ...symptom })),
+  );
+  if (symptoms.length === 0) return null;
+  return (
+    <section className="knowledge-ingestion-preview">
+      <strong>Ingestion preview — what activation writes</strong>
+      {symptoms.map((symptom, index) => (
+        <div className="knowledge-ingestion-symptom" key={symptom.name || index}>
+          <span>
+            <code>{symptom.family || 'unclassified'}</code> ← symptom “{symptom.name || 'unnamed'}”
+          </span>
+          {(symptom.keywords?.length ?? 0) > 0 && (
+            <small>Matches on: {symptom.keywords?.join(' · ')}</small>
+          )}
+          {(symptom.actions?.length ?? 0) > 0 ? (
+            <ul>
+              {symptom.actions?.map((action) => <li key={action}>{action}</li>)}
+            </ul>
+          ) : (
+            <small className="knowledge-ingestion-warning">
+              No confirmed remediation — this activates as a matcher only. Record the
+              effective action in the evaluation review to teach the fix.
+            </small>
+          )}
+        </div>
+      ))}
+    </section>
   );
 }
 
