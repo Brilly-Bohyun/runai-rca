@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -387,6 +388,156 @@ func operatorConfirmedActions(card map[string]any) []string {
 	return actions
 }
 
+// singleCompiledSymptom returns the learned symptom map when the payload
+// compiles exactly one failure mode with one symptom — the only shape learned
+// candidates produce. Anything else is not an editable learned candidate.
+func singleCompiledSymptom(payload map[string]any) (map[string]any, bool) {
+	compiled, _ := payload["compiled"].(map[string]any)
+	modes, _ := compiled["failure_modes"].([]any)
+	var found map[string]any
+	count := 0
+	for _, rawMode := range modes {
+		mode, ok := rawMode.(map[string]any)
+		if !ok {
+			continue
+		}
+		symptoms, _ := mode["symptoms"].([]any)
+		for _, rawSymptom := range symptoms {
+			symptom, ok := rawSymptom.(map[string]any)
+			if !ok {
+				continue
+			}
+			count++
+			found = symptom
+		}
+	}
+	if count != 1 {
+		return nil, false
+	}
+	return found, true
+}
+
+func compiledCandidateActions(payload map[string]any) ([]string, bool) {
+	symptom, ok := singleCompiledSymptom(payload)
+	if !ok {
+		return nil, false
+	}
+	return sanitizeStringSlice(symptom["actions"]), true
+}
+
+// EditKnowledgeCandidateActions lets a reviewer curate the remediation wording
+// of a ready candidate before activation. Evidence, keywords, mechanism, and
+// identity (fingerprint/content hash) stay immutable — the content hash keeps
+// identifying the snapshot-derived compilation, so approval's revalidation
+// still passes and the curated wording ships in the published package.
+func (s *Store) EditKnowledgeCandidateActions(id string, actions []string, actor string) (KnowledgeCandidate, error) {
+	trimmed := make([]string, 0, len(actions))
+	for _, action := range actions {
+		action = strings.TrimSpace(action)
+		if action == "" {
+			continue
+		}
+		if len(action) > 2000 {
+			return KnowledgeCandidate{}, errors.New("action text is too long")
+		}
+		trimmed = append(trimmed, action)
+	}
+	if len(trimmed) == 0 || len(trimmed) > 10 {
+		return KnowledgeCandidate{}, errors.New("between 1 and 10 non-empty actions are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := s.knowledgeCandidates[id]
+	if candidate == nil {
+		return KnowledgeCandidate{}, errors.New("knowledge candidate not found")
+	}
+	if candidate.Status != knowledgeCandidateReady {
+		return KnowledgeCandidate{}, errors.New("only a ready-for-review candidate can be edited")
+	}
+	if !s.applyKnowledgeCandidateActionsLocked(candidate, trimmed, knowledgeActor(actor), "candidate_actions_edited", "reviewer curated remediation actions") {
+		return KnowledgeCandidate{}, errors.New("could not persist candidate action edit")
+	}
+	return cloneKnowledgeCandidate(candidate), nil
+}
+
+// RefineKnowledgeCandidateActions applies the LLM's instance-free rewrite, but
+// only while the candidate still carries exactly the actions the refiner saw —
+// a concurrent human edit always wins. Applying an unchanged list still stamps
+// the curation marker so the refiner is never re-invoked for this candidate.
+func (s *Store) RefineKnowledgeCandidateActions(id string, expected, refined []string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := s.knowledgeCandidates[id]
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		return false
+	}
+	current, ok := compiledCandidateActions(candidate.Payload)
+	if !ok || !slices.Equal(current, expected) {
+		return false
+	}
+	return s.applyKnowledgeCandidateActionsLocked(candidate, refined, "llm-refiner", "candidate_actions_refined", "instance identifiers generalized for reuse")
+}
+
+// KnowledgeCandidatesPendingActionRefinement lists ready candidates whose
+// actions have not been curated yet (neither LLM-refined nor human-edited).
+func (s *Store) KnowledgeCandidatesPendingActionRefinement() []KnowledgeCandidate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []KnowledgeCandidate{}
+	for _, candidate := range s.knowledgeCandidates {
+		if candidate == nil || candidate.Status != knowledgeCandidateReady {
+			continue
+		}
+		if provenance, ok := candidate.Payload["provenance"].(map[string]any); ok {
+			if _, curated := provenance["actions_curated_by"]; curated {
+				continue
+			}
+		}
+		if actions, ok := compiledCandidateActions(candidate.Payload); !ok || len(actions) == 0 {
+			continue
+		}
+		out = append(out, cloneKnowledgeCandidate(candidate))
+	}
+	return out
+}
+
+func (s *Store) applyKnowledgeCandidateActionsLocked(candidate *KnowledgeCandidate, actions []string, actor, eventType, note string) bool {
+	updated := cloneKnowledgeCandidate(candidate)
+	symptom, ok := singleCompiledSymptom(updated.Payload)
+	if !ok {
+		return false
+	}
+	previous := sanitizeStringSlice(symptom["actions"])
+	actionValues := make([]any, 0, len(actions))
+	for _, action := range actions {
+		actionValues = append(actionValues, action)
+	}
+	symptom["actions"] = actionValues
+	provenance, _ := updated.Payload["provenance"].(map[string]any)
+	if provenance == nil {
+		provenance = map[string]any{}
+		updated.Payload["provenance"] = provenance
+	}
+	if _, ok := provenance["raw_actions"]; !ok {
+		rawValues := make([]any, 0, len(previous))
+		for _, action := range previous {
+			rawValues = append(rawValues, action)
+		}
+		provenance["raw_actions"] = rawValues
+	}
+	provenance["actions_curated_by"] = actor
+	now := time.Now().UTC()
+	updated.UpdatedAt = now
+	hydrateKnowledgeCandidate(&updated)
+	event := s.newKnowledgeEventLocked(updated.CandidateID, "", eventType, actor, note, now)
+	if !s.persistKnowledgeCandidateActionsLocked(&updated, event) {
+		return false
+	}
+	*candidate = updated
+	s.knowledgeEvents[event.EventID] = event
+	return true
+}
+
 // compiledKnowledgePayload is intentionally a narrow public representation.
 // It excludes analysis prose, artifacts, raw evidence, tool queries, and logs.
 func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, operatorConfirmed bool) (map[string]any, string) {
@@ -431,14 +582,19 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 		return nil, errorText
 	}
 	hypothesisID := stringValue(hypothesis["hypothesis_id"])
+	family, mechanism := stringValue(hypothesis["family"]), stringValue(hypothesis["mechanism"])
 	probeTemplateIDs := traceV3LinkedProbeTemplateIDs(trace, hypothesisID, support)
+	if evidenceSource != "" {
+		// A harness claim has its own synthetic hypothesis ID, but can still
+		// safely retain a probe the trace linked to the same family and support.
+		probeTemplateIDs = traceV3FamilyLinkedProbeTemplateIDs(trace, family, support)
+	}
 	if evidenceSource == "" && len(probeTemplateIDs) == 0 {
 		return nil, "missing probe execution linked to hypothesis evidence"
 	}
 	if strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_summary"])) == "" || strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_detail"])) == "" {
 		return nil, "missing analysis result"
 	}
-	family, mechanism := stringValue(hypothesis["family"]), stringValue(hypothesis["mechanism"])
 	confidence, _ := numberToFloat(hypothesis["confidence"])
 	evidenceSummaries, observedTerms := traceEvidenceSummaries(trace, support)
 	payload := map[string]any{
@@ -926,6 +1082,43 @@ func traceV3LinkedProbeTemplateIDs(trace map[string]any, hypothesisID string, ev
 	sort.Strings(ids)
 	return ids
 }
+
+// traceV3FamilyLinkedProbeTemplateIDs is the harness-claim equivalent of the
+// exact hypothesis linker: fallback claims use a synthetic ID, so preserve only
+// probes that the trace tied to a hypothesis in the claim's family and to the
+// claim's supporting evidence.
+func traceV3FamilyLinkedProbeTemplateIDs(trace map[string]any, family string, evidence map[string]bool) []string {
+	hypothesisFamilies := map[string]string{}
+	for _, raw := range trace["hypotheses"].([]any) {
+		if hypothesis, ok := raw.(map[string]any); ok {
+			hypothesisFamilies[stringValue(hypothesis["hypothesis_id"])] = stringValue(hypothesis["family"])
+		}
+	}
+	probes, _ := trace["probe_executions"].([]any)
+	seen, ids := map[string]bool{}, []string{}
+	for _, raw := range probes {
+		probe, ok := raw.(map[string]any)
+		if !ok || stringValue(probe["execution_id"]) == "" || stringValue(probe["verdict"]) == "" || stringValue(probe["template_id"]) == "" {
+			continue
+		}
+		hasFamily, hasEvidence := false, false
+		for _, id := range sanitizeStringSlice(probe["hypothesis_ids"]) {
+			hasFamily = hasFamily || hypothesisFamilies[id] == family
+		}
+		for _, id := range sanitizeStringSlice(probe["evidence_ids"]) {
+			hasEvidence = hasEvidence || evidence[id]
+		}
+		if hasFamily && hasEvidence {
+			id := stringValue(probe["template_id"])
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
 func numberToFloat(raw any) (float64, bool) {
 	switch value := raw.(type) {
 	case float64:
@@ -956,6 +1149,30 @@ func stringValue(value any) string { text, _ := value.(string); return text }
 func knowledgeContentHash(trace, payload map[string]any) string {
 	digest := sha256.Sum256(mustJSON(map[string]any{"trace": trace, "compiled": payload["compiled"], "family": payload["family"], "mechanism": payload["mechanism"]}))
 	return hex.EncodeToString(digest[:])
+}
+
+// knowledgeContentHashWithoutProbeTemplateIDs recognizes the one safe legacy
+// upgrade: probe IDs are derived from the immutable trace, unlike symptoms or
+// actions, and older candidates may have compiled them as an empty list.
+func knowledgeContentHashWithoutProbeTemplateIDs(trace, payload map[string]any) string {
+	compiled, _ := payload["compiled"].(map[string]any)
+	compiled = cloneCaseSnapshotPayload(compiled)
+	delete(compiled, "probe_template_ids")
+	digest := sha256.Sum256(mustJSON(map[string]any{"trace": trace, "compiled": compiled, "family": payload["family"], "mechanism": payload["mechanism"]}))
+	return hex.EncodeToString(digest[:])
+}
+
+func promotionPayload(candidate, validated *KnowledgeCandidate) (map[string]any, bool) {
+	if candidate == nil || validated == nil {
+		return nil, false
+	}
+	if candidate.ContentHash == validated.ContentHash {
+		return cloneCaseSnapshotPayload(candidate.Payload), true
+	}
+	if knowledgeContentHashWithoutProbeTemplateIDs(validated.Trace, candidate.Payload) != knowledgeContentHashWithoutProbeTemplateIDs(validated.Trace, validated.Payload) {
+		return nil, false
+	}
+	return cloneCaseSnapshotPayload(validated.Payload), true
 }
 
 func knowledgeFingerprint(payload map[string]any) string {
@@ -1141,7 +1358,8 @@ func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRe
 	}
 	snapshot := s.caseSnapshots[candidate.CaseID]
 	validated := s.knowledgeCandidateForSnapshotLocked(snapshot)
-	if validated == nil || validated.Status != knowledgeCandidateReady || validated.ContentHash != candidate.ContentHash {
+	payload, ok := promotionPayload(candidate, validated)
+	if validated == nil || validated.Status != knowledgeCandidateReady || !ok {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
 	}
 	now := time.Now().UTC()
@@ -1157,13 +1375,14 @@ func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRe
 			break
 		}
 	}
-	pkgPayload := cloneCaseSnapshotPayload(candidate.Payload)
+	pkgPayload := cloneCaseSnapshotPayload(payload)
 	pkgPayload["runtime_status"] = knowledgePackageActive
 	pkgPayload["mirror_status"] = "pending"
 	pkg := &KnowledgePackage{PackageID: "KPK-" + candidate.CaseID, CandidateID: candidate.CandidateID, CaseID: candidate.CaseID, Status: knowledgePackageActive, Payload: pkgPayload, PublishedAt: now, MirrorStatus: "pending", MirrorUpdatedAt: &now}
 	hydrateKnowledgePackage(pkg)
 	event := s.newKnowledgeEventLocked(candidate.CandidateID, pkg.PackageID, "candidate_approved", actor, note, now)
 	updated := cloneKnowledgeCandidate(candidate)
+	updated.Payload, updated.ContentHash = payload, validated.ContentHash
 	updated.Payload["runtime_status"] = knowledgePackageActive
 	updated.Status, updated.PackageID, updated.DecidedAt, updated.DecidedBy, updated.DecisionNote, updated.UpdatedAt = knowledgeCandidateActive, pkg.PackageID, &now, actor, note, now
 	hydrateKnowledgeCandidate(&updated)
@@ -1197,16 +1416,18 @@ func (s *Store) ShadowKnowledgeCandidate(id string, request KnowledgeDecisionReq
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate is not ready for review")
 	}
 	validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[candidate.CaseID])
-	if validated == nil || validated.Status != knowledgeCandidateReady || validated.ContentHash != candidate.ContentHash {
+	payload, ok := promotionPayload(candidate, validated)
+	if validated == nil || validated.Status != knowledgeCandidateReady || !ok {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
 	}
 	now := time.Now().UTC()
 	actor, note := knowledgeActor(request.Actor), strings.TrimSpace(request.Note)
-	payload := cloneCaseSnapshotPayload(candidate.Payload)
+	payload = cloneCaseSnapshotPayload(payload)
 	payload["runtime_status"], payload["mirror_status"] = knowledgePackageShadow, "pending"
 	pkg := &KnowledgePackage{PackageID: "KPK-" + candidate.CaseID, CandidateID: candidate.CandidateID, CaseID: candidate.CaseID, Status: knowledgePackageShadow, Payload: payload, PublishedAt: now, MirrorStatus: "pending", MirrorUpdatedAt: &now}
 	hydrateKnowledgePackage(pkg)
 	updated := cloneKnowledgeCandidate(candidate)
+	updated.Payload, updated.ContentHash = payload, validated.ContentHash
 	updated.Payload["runtime_status"] = knowledgePackageShadow
 	updated.Status, updated.PackageID, updated.DecidedAt, updated.DecidedBy, updated.DecisionNote, updated.UpdatedAt = knowledgeCandidateShadow, pkg.PackageID, &now, actor, note, now
 	hydrateKnowledgeCandidate(&updated)

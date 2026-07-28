@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
 import type { KnowledgeCandidate } from '../../types';
-import { CandidateDetail, IngestionPreview } from './LearnedKnowledgeDashboard';
+import { CandidateDetail, decisionConfirmLabel, IngestionPreview } from './LearnedKnowledgeDashboard';
 
 function candidate(overrides: Partial<KnowledgeCandidate> = {}): KnowledgeCandidate {
   return {
@@ -63,27 +63,68 @@ describe('CandidateDetail', () => {
     <CandidateDetail candidate={item} busy={false} onDecide={async () => {}} />,
   );
 
-  it('leads with the family → symptom → action chain and hides backend identity', () => {
+  it('leads with the symptoms → cause → action chain and hides backend identity', () => {
     const markup = render(candidate({
       root_cause_family: 'workload_startup_error',
       analysis_hash: '550d4ff6deadbeef',
       incident_id: 'INC-1',
+      analysis_run_id: 'ANL-1785117859577803398-000001',
       provenance: { source: 'approved_case_snapshot', case_id: 'ANL-1:550d4ff6deadbeef', promotion_path: 'harness_claim' },
     }));
-    expect(markup).toContain('Family');
-    expect(markup).toContain('Symptom (mechanism)');
+    expect(markup).toContain('Root cause family');
+    expect(markup).toContain('Cause (mechanism)');
     expect(markup).toContain('configmap missing at container start');
+    expect(markup).toContain('Observed symptoms');
+    expect(markup).toContain('createcontainerconfigerror');
     expect(markup).toContain('Confirmed actions');
     expect(markup).toContain('Recreate the missing ConfigMap');
     // Reviewer-irrelevant plumbing stays out of the grid.
     expect(markup).not.toContain('Analysis hash');
     expect(markup).not.toContain('550d4ff6deadbeef');
     expect(markup).not.toContain('Case Id');
+    expect(markup).not.toContain('Supporting cases');
+    expect(markup).not.toContain('ANL-1785117859577803398-000001');
+    expect(markup).not.toContain('harness_claim');
+  });
+
+  it('renders linked diagnostic probes with their tool and verdict', () => {
+    const markup = render(candidate({
+      probe_template_ids: ['k8s_troubleshooting:incident_scope:p01'],
+      trace: { probe_executions: [{ template_id: 'k8s_troubleshooting:incident_scope:p01', tool: 'k8s_read', verdict: 'supports' }] },
+    }));
+    expect(markup).toContain('Diagnostic steps');
+    expect(markup).toContain('incident scope · k8s_read · supports');
+  });
+
+  it('explains an empty probe list as a harness-claim promotion', () => {
+    expect(render(candidate())).toContain('promoted on the harness root-cause claim');
   });
 
   it('tells the reviewer how to record a missing action', () => {
     const noActions = candidate();
     noActions.payload!.compiled!.failure_modes![0].symptoms![0].actions = [];
     expect(render(noActions)).toContain('add the effective action in the evaluation review');
+  });
+
+  it('offers action editing during review and shows the operator original after curation', () => {
+    const curated = candidate({
+      provenance: { raw_actions: ['kubectl get secret nonexistent-secret -n default'], actions_curated_by: 'llm-refiner' },
+    });
+    const markup = renderToStaticMarkup(
+      <CandidateDetail candidate={curated} busy={false} onDecide={async () => {}} onEditActions={async () => {}} />,
+    );
+    expect(markup).toContain('>Edit<');
+    expect(markup).toContain('kubectl get secret nonexistent-secret -n default');
+    // Without an edit handler the control stays hidden.
+    expect(render(curated)).not.toContain('>Edit<');
+  });
+});
+
+describe('decisionConfirmLabel', () => {
+  it('never confirms shadow or activate as a rejection', () => {
+    expect(decisionConfirmLabel('approve')).toBe('Activate');
+    expect(decisionConfirmLabel('shadow')).toBe('Shadow');
+    expect(decisionConfirmLabel('activate')).toBe('Activate');
+    expect(decisionConfirmLabel('reject')).toBe('Reject');
   });
 });

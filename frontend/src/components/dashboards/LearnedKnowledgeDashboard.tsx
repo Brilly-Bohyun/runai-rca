@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import {
   decideKnowledgeCandidate,
+  editKnowledgeCandidateActions,
   fetchKnowledgeCandidates,
   fetchKnowledgePackages,
   fetchProbeMetrics,
@@ -112,14 +113,27 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
     : undefined;
 
   const decide = async (candidate: KnowledgeCandidate, action: CandidateAction) => {
-    const label = action === 'approve' ? 'approve' : 'reject';
-    if (!window.confirm(`${label[0].toUpperCase()}${label.slice(1)} this incident-derived knowledge candidate?`)) return;
+    const label = decisionConfirmLabel(action);
+    if (!window.confirm(`${label} this incident-derived knowledge candidate?`)) return;
     setBusyID(candidate.candidate_id);
     try {
       await decideKnowledgeCandidate(candidate.candidate_id, action);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : `Could not ${label} candidate.`);
+      setError(err instanceof Error ? err.message : `Could not ${label.toLowerCase()} candidate.`);
+    } finally {
+      setBusyID('');
+    }
+  };
+
+  const editActions = async (candidate: KnowledgeCandidate, actions: string[]) => {
+    setBusyID(candidate.candidate_id);
+    try {
+      await editKnowledgeCandidateActions(candidate.candidate_id, actions);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save candidate actions.');
+      throw err;
     } finally {
       setBusyID('');
     }
@@ -227,7 +241,7 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
 
         <section className="knowledge-panel candidate-detail-panel">
           {selected ? (
-            <CandidateDetail candidate={selected} matchingPackage={matchingPackage} busy={busyID === selected.candidate_id} onDecide={decide} />
+            <CandidateDetail key={selected.candidate_id} candidate={selected} matchingPackage={matchingPackage} busy={busyID === selected.candidate_id} onDecide={decide} onEditActions={editActions} />
           ) : (
             <EmptyState text="Select a candidate to inspect its evidence and provenance." />
           )}
@@ -292,28 +306,53 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
   );
 }
 
+// Confirm-dialog verb per decision. 'approve' publishes an active package, so
+// it confirms as Activate — and shadow/activate must never read as Reject.
+export function decisionConfirmLabel(action: CandidateAction): string {
+  return { approve: 'Activate', shadow: 'Shadow', activate: 'Activate', reject: 'Reject' }[action];
+}
+
 export function CandidateDetail({
   candidate,
   matchingPackage,
   busy,
   onDecide,
+  onEditActions,
 }: {
   candidate: KnowledgeCandidate;
   matchingPackage?: KnowledgePackage;
   busy: boolean;
   onDecide: (candidate: KnowledgeCandidate, action: CandidateAction) => Promise<void>;
+  onEditActions?: (candidate: KnowledgeCandidate, actions: string[]) => Promise<void>;
 }) {
   const evidence = candidate.evidence_summaries ?? [];
   const canReview = candidate.status === 'ready_for_review';
   const canActivate = candidate.status === 'shadow';
-  // Reviewers judge the knowledge CHAIN (family ← symptom → action), so those
-  // lead the grid. Analysis hash and case id are backend identity plumbing —
-  // they stay in the payload but never on screen.
+  const [editingActions, setEditingActions] = useState(false);
+  const [draftActions, setDraftActions] = useState('');
+  // Reviewers judge the knowledge CHAIN (symptoms → cause → family, plus the
+  // confirmed action and the diagnostic probes that backed it), so those lead
+  // the grid. Analysis hash, case/run ids, and the promotion path are backend
+  // identity plumbing — they stay in the payload but never on screen.
   const provenance = safeProvenanceEntries(candidate.provenance)
-    .filter(([key]) => key !== 'case_id' && key !== 'incident_id');
+    .filter(([key]) => key !== 'case_id' && key !== 'incident_id' && key !== 'promotion_path');
   const symptoms = (candidate.payload?.compiled?.failure_modes ?? []).flatMap((mode) => mode.symptoms ?? []);
   const mechanism = candidate.payload?.mechanism || symptoms[0]?.name || '';
   const confirmedActions = symptoms.flatMap((symptom) => symptom.actions ?? []);
+  const observedKeywords = Array.from(new Set(symptoms.flatMap((symptom) => symptom.keywords ?? [])));
+  const rawActions = Array.isArray(candidate.provenance?.raw_actions)
+    ? (candidate.provenance?.raw_actions as unknown[]).map((value) => String(value)).filter(Boolean)
+    : [];
+  const diagnosticSteps = (candidate.probe_template_ids ?? []).map((templateId) => {
+    const execution = candidate.trace?.probe_executions?.find((probe) => probe.template_id === templateId);
+    const parts = templateId.split(':');
+    return {
+      templateId,
+      label: parts.length === 3 ? parts[1].replace(/_/g, ' ') : templateId,
+      tool: execution?.tool,
+      verdict: execution?.verdict,
+    };
+  });
   const matcherOnly = candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world';
   return (
     <>
@@ -329,17 +368,70 @@ export function CandidateDetail({
       <div className="knowledge-detail-content">
         <p className="knowledge-summary">{candidate.summary || 'No candidate summary was reported.'}</p>
         <dl className="knowledge-provenance">
-          <div><dt>Family</dt><dd><code>{candidate.root_cause_family || 'unclassified'}</code></dd></div>
-          <div><dt>Symptom (mechanism)</dt><dd>{mechanism || 'not reported'}</dd></div>
+          <div><dt>Root cause family</dt><dd><code>{candidate.root_cause_family || 'unclassified'}</code></dd></div>
+          <div><dt>Cause (mechanism)</dt><dd>{mechanism || 'not reported'}</dd></div>
+          <div>
+            <dt>Observed symptoms</dt>
+            <dd>{observedKeywords.length > 0 ? observedKeywords.join(' · ') : 'not reported'}</dd>
+          </div>
           <div>
             <dt>Confirmed actions</dt>
-            <dd>{confirmedActions.length > 0
-              ? confirmedActions.join(' · ')
-              : 'none recorded — add the effective action in the evaluation review'}</dd>
+            <dd>
+              {editingActions ? (
+                <span className="knowledge-action-editor">
+                  <textarea
+                    aria-label="Confirmed actions, one per line"
+                    rows={3}
+                    value={draftActions}
+                    onChange={(event) => setDraftActions(event.target.value)}
+                  />
+                  <span className="knowledge-action-editor-buttons">
+                    <button
+                      className="primary-button"
+                      disabled={busy}
+                      type="button"
+                      onClick={() => {
+                        const next = draftActions.split('\n').map((line) => line.trim()).filter(Boolean);
+                        if (next.length === 0 || !onEditActions) return;
+                        void onEditActions(candidate, next).then(() => setEditingActions(false)).catch(() => undefined);
+                      }}
+                    >
+                      {busy ? 'Saving…' : 'Save actions'}
+                    </button>
+                    <button className="ghost-button" type="button" onClick={() => setEditingActions(false)}>Cancel</button>
+                  </span>
+                </span>
+              ) : (
+                <>
+                  {confirmedActions.length > 0
+                    ? confirmedActions.join(' · ')
+                    : 'none recorded — add the effective action in the evaluation review'}
+                  {canReview && onEditActions && (
+                    <button
+                      className="ghost-button knowledge-action-edit"
+                      type="button"
+                      onClick={() => {
+                        setDraftActions(confirmedActions.join('\n'));
+                        setEditingActions(true);
+                      }}
+                    >
+                      Edit
+                    </button>
+                  )}
+                </>
+              )}
+              {rawActions.length > 0 && rawActions.join('\u0000') !== confirmedActions.join('\u0000') && (
+                <small className="knowledge-raw-actions">Operator&apos;s original: {rawActions.join(' · ')}</small>
+              )}
+            </dd>
           </div>
-          <div><dt>Supporting cases</dt><dd>{supportingCaseLabel(candidate)}</dd></div>
+          <div>
+            <dt>Diagnostic steps</dt>
+            <dd>{diagnosticSteps.length > 0
+              ? diagnosticSteps.map((step) => [step.label, step.tool, step.verdict].filter(Boolean).join(' · ')).join(', ')
+              : 'none linked — promoted on the harness root-cause claim without a probe run'}</dd>
+          </div>
           <div><dt>Incident</dt><dd>{candidate.incident_id || 'not reported'}</dd></div>
-          <div><dt>Analysis run</dt><dd>{candidate.analysis_run_id || 'not reported'}</dd></div>
           <div><dt>Observed</dt><dd>{candidate.created_at ? formatTime(candidate.created_at) : 'not reported'}</dd></div>
           {candidate.decided_at && <div><dt>Decided</dt><dd>{formatTime(candidate.decided_at)}</dd></div>}
           {candidate.decided_by && <div><dt>Decided by</dt><dd>{candidate.decided_by}</dd></div>}
@@ -364,12 +456,6 @@ export function CandidateDetail({
           ))}
           {evidence.length === 0 && <EmptyState text="No evidence summary was reported for this candidate." />}
         </div>
-        {candidate.probe_template_ids && candidate.probe_template_ids.length > 0 && (
-          <div className="knowledge-probe-ids">
-            <strong>Linked probe templates</strong>
-            <span>{candidate.probe_template_ids.join(' · ')}</span>
-          </div>
-        )}
       </div>
       {canReview && (
         <div className="knowledge-review-actions">

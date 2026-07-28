@@ -578,6 +578,55 @@ func TestHarnessClaimEvidenceFallbackCompilesKnowledge(t *testing.T) {
 	}
 }
 
+func TestHarnessClaimFallbackRetainsOnlyFamilyLinkedProbe(t *testing.T) {
+	snapshot := eligibleKnowledgeSnapshot()
+	harness := snapshot.Snapshot["metadata"].(map[string]any)["harness"].(map[string]any)
+	harness["diagnosis_state"] = "supported"
+	harness["claims"] = []any{map[string]any{
+		"family": snapshot.RootCauseFamily, "kind": "root_cause", "claim_id": "C01",
+		"confidence": "medium", "supporting_evidence": []any{"E-1"}, "contradicting_evidence": []any{},
+	}}
+	trace := knowledgeTraceForTest(snapshot)
+	trace["hypotheses"].([]any)[0].(map[string]any)["evidence_for"] = []any{}
+	trace["hypotheses"] = append(trace["hypotheses"].([]any), map[string]any{
+		"hypothesis_id": "H-other", "family": "gpu_hardware_error",
+	})
+	trace["probe_executions"] = append(trace["probe_executions"].([]any), map[string]any{
+		"execution_id": "P-other", "template_id": "gpu:xid:p01", "verdict": "supports",
+		"hypothesis_ids": []any{"H-other"}, "evidence_ids": []any{"E-1"},
+	})
+
+	candidate := knowledgeCandidateForSnapshot(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("harness fallback should remain ready: %+v", candidate)
+	}
+	if got := candidate.ProbeTemplateIDs; len(got) != 1 || got[0] != "k8s_troubleshooting:scheduling_capacity:p01" {
+		t.Fatalf("fallback retained an unlinked or wrong-family probe: %+v", got)
+	}
+}
+
+func TestKnowledgeApprovalUpgradesLegacyCandidateWithMissingProbeIDs(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	candidate := knowledgeCandidateForSnapshot(snapshot)
+	if candidate == nil || len(candidate.ProbeTemplateIDs) != 1 {
+		t.Fatalf("fixture must include a linked probe: %+v", candidate)
+	}
+	legacyPayload := cloneCaseSnapshotPayload(candidate.Payload)
+	legacyPayload["compiled"].(map[string]any)["probe_template_ids"] = map[string]any{snapshot.RootCauseFamily: []string{}}
+	candidate.Payload = legacyPayload
+	candidate.ContentHash = knowledgeContentHash(candidate.Trace, candidate.Payload)
+	hydrateKnowledgeCandidate(candidate)
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+	confirmKnowledgeSnapshot(store, snapshot)
+
+	updated, pkg, err := store.ApproveKnowledgeCandidate(candidate.CandidateID, KnowledgeDecisionRequest{Actor: "operator"})
+	if err != nil || len(updated.ProbeTemplateIDs) != 1 || len(pkg.ProbeTemplateIDs) != 1 || pkg.ProbeTemplateIDs[0] != "k8s_troubleshooting:scheduling_capacity:p01" {
+		t.Fatalf("legacy candidate did not receive its trace-derived probe on approval: candidate=%+v package=%+v err=%v", updated, pkg, err)
+	}
+}
+
 func TestHarnessClaimEvidenceFallbackFailsClosedWithoutCleanSupport(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1117,5 +1166,103 @@ func TestOperatorEffectiveActionBecomesTheLearnedSymptomRemediation(t *testing.T
 	bareSymptom := bareCompiled["failure_modes"].([]any)[0].(map[string]any)["symptoms"].([]any)[0].(map[string]any)
 	if got := bareSymptom["actions"].([]string); len(got) != 0 {
 		t.Fatalf("expected no fabricated actions, got %v", got)
+	}
+}
+
+func readyCandidateWithRawAction(t *testing.T, store *Store) *KnowledgeCandidate {
+	t.Helper()
+	snapshot := eligibleKnowledgeSnapshot()
+	card := snapshot.Snapshot["case_card"].(map[string]any)
+	card["successful_actions"] = []any{"kubectl get secret nonexistent-secret -n default 를 실행하여 확인하라"}
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	confirmKnowledgeSnapshot(store, snapshot)
+	candidate := store.knowledgeCandidateForSnapshotLocked(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("expected ready candidate, got %+v", candidate)
+	}
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+	return candidate
+}
+
+func TestEditKnowledgeCandidateActionsCuratesAndSurvivesActivation(t *testing.T) {
+	store := NewStore()
+	candidate := readyCandidateWithRawAction(t, store)
+
+	curated := "누락된 <secret-name> Secret을 생성하거나 참조를 수정하라"
+	edited, err := store.EditKnowledgeCandidateActions(candidate.CandidateID, []string{" " + curated + " ", ""}, "reviewer")
+	if err != nil {
+		t.Fatalf("edit failed: %v", err)
+	}
+	actions, ok := compiledCandidateActions(edited.Payload)
+	if !ok || len(actions) != 1 || actions[0] != curated {
+		t.Fatalf("edited actions not applied: %v", actions)
+	}
+	provenance, _ := edited.Payload["provenance"].(map[string]any)
+	raw := sanitizeStringSlice(provenance["raw_actions"])
+	if len(raw) != 1 || raw[0] != "kubectl get secret nonexistent-secret -n default 를 실행하여 확인하라" {
+		t.Fatalf("original operator wording must be preserved: %v", provenance["raw_actions"])
+	}
+	if stringValue(provenance["actions_curated_by"]) != "reviewer" {
+		t.Fatalf("curation actor missing: %v", provenance["actions_curated_by"])
+	}
+
+	// The curated wording must survive content-hash revalidation and ship in
+	// the published package: identity hashes the snapshot-derived compilation,
+	// not the curated overlay.
+	_, pkg, err := store.ApproveKnowledgeCandidate(candidate.CandidateID, KnowledgeDecisionRequest{Actor: "operator"})
+	if err != nil {
+		t.Fatalf("approval after edit failed: %v", err)
+	}
+	pkgActions, ok := compiledCandidateActions(pkg.Payload)
+	if !ok || len(pkgActions) != 1 || pkgActions[0] != curated {
+		t.Fatalf("package must carry curated actions: %v", pkgActions)
+	}
+}
+
+func TestRefineKnowledgeCandidateActionsNeverClobbersHumanEdit(t *testing.T) {
+	store := NewStore()
+	candidate := readyCandidateWithRawAction(t, store)
+	original, _ := compiledCandidateActions(candidate.Payload)
+
+	if pending := store.KnowledgeCandidatesPendingActionRefinement(); len(pending) != 1 {
+		t.Fatalf("fresh candidate must be pending refinement, got %d", len(pending))
+	}
+
+	if _, err := store.EditKnowledgeCandidateActions(candidate.CandidateID, []string{"curated by human"}, "reviewer"); err != nil {
+		t.Fatalf("edit failed: %v", err)
+	}
+	// A stale LLM result computed from the pre-edit text must be discarded.
+	if store.RefineKnowledgeCandidateActions(candidate.CandidateID, original, []string{"llm version"}) {
+		t.Fatal("stale refinement must not apply over a human edit")
+	}
+	actions, _ := compiledCandidateActions(store.knowledgeCandidates[candidate.CandidateID].Payload)
+	if len(actions) != 1 || actions[0] != "curated by human" {
+		t.Fatalf("human edit must win: %v", actions)
+	}
+	// Curated candidates never re-enter the refinement queue.
+	if pending := store.KnowledgeCandidatesPendingActionRefinement(); len(pending) != 0 {
+		t.Fatalf("curated candidate must not be pending refinement: %d", len(pending))
+	}
+}
+
+func TestRefineKnowledgeCandidateActionsAppliesAndStampsMarker(t *testing.T) {
+	store := NewStore()
+	candidate := readyCandidateWithRawAction(t, store)
+	original, _ := compiledCandidateActions(candidate.Payload)
+
+	if !store.RefineKnowledgeCandidateActions(candidate.CandidateID, original, []string{"generalized action"}) {
+		t.Fatal("refinement should apply to an uncurated candidate")
+	}
+	updated := store.knowledgeCandidates[candidate.CandidateID]
+	actions, _ := compiledCandidateActions(updated.Payload)
+	if len(actions) != 1 || actions[0] != "generalized action" {
+		t.Fatalf("refined actions not applied: %v", actions)
+	}
+	provenance, _ := updated.Payload["provenance"].(map[string]any)
+	if got := sanitizeStringSlice(provenance["raw_actions"]); len(got) != 1 || got[0] != original[0] {
+		t.Fatalf("raw actions must be preserved: %v", provenance["raw_actions"])
+	}
+	if pending := store.KnowledgeCandidatesPendingActionRefinement(); len(pending) != 0 {
+		t.Fatalf("refined candidate must leave the pending queue: %d", len(pending))
 	}
 }

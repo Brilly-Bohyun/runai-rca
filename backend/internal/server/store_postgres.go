@@ -1436,7 +1436,10 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 	return true
 }
 
-func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
+// persistMemory runs OFF the store mutex (goroutine from upsertMemoryLocked):
+// it performs a remote embedding HTTP call and a DB upsert, and reads only its
+// argument plus startup-immutable fields (db, dbReady, pgvectorReady, embed).
+func (s *Store) persistMemory(memory *IncidentMemory) {
 	if s.db == nil || !s.dbReady || memory == nil {
 		return
 	}
@@ -2018,6 +2021,51 @@ func (s *Store) persistKnowledgeCandidateValidationRefreshLocked(candidate *Know
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("Failed to commit knowledge candidate validation refresh: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+// persistKnowledgeCandidateActionsLocked stores a curated (LLM-refined or
+// reviewer-edited) action list. The status guard keeps the write from racing a
+// concurrent decision: once a candidate leaves review, curation is closed.
+func (s *Store) persistKnowledgeCandidateActionsLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if candidate == nil || event == nil {
+		return false
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge candidate action curation transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+		SET payload = $1, updated_at = $2
+		WHERE candidate_id = $3 AND status = $4`,
+		mustJSON(candidate.Payload), candidate.UpdatedAt, candidate.CandidateID, knowledgeCandidateReady)
+	if err != nil {
+		log.Printf("Failed to persist knowledge candidate action curation %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return false
+	}
+	if !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge candidate action curation: %v", err)
 		return false
 	}
 	committed = true
