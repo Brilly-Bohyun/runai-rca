@@ -552,7 +552,17 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	}
 	quality, source := harnessQualityScore(metadata)
 	if quality < 80 {
-		return nil, "quality score must be at least 80"
+		// The operator-confirm path exists precisely for runs the automated
+		// assessment underrates (inconclusive probes deduct harness points).
+		// operatorConfirmed is only true after the reviewer's evaluation passed
+		// its own >=80% quality gate with a written confirmation note, so the
+		// operator's assessment supersedes the harness floor; the payload keeps
+		// the honest harness number with an explicit source. Hard gates and the
+		// supporting-evidence requirements below still veto as before.
+		if !operatorConfirmed {
+			return nil, "quality score must be at least 80"
+		}
+		source = "operator_confirmed_review"
 	}
 	if !harnessHardGatesPassed(harness) {
 		return nil, "all non-empty harness hard gates must pass"
@@ -1101,8 +1111,15 @@ func traceV3FamilyLinkedProbeTemplateIDs(trace map[string]any, family string, ev
 		if !ok || stringValue(probe["execution_id"]) == "" || stringValue(probe["verdict"]) == "" || stringValue(probe["template_id"]) == "" {
 			continue
 		}
-		hasFamily, hasEvidence := false, false
-		for _, id := range sanitizeStringSlice(probe["hypothesis_ids"]) {
+		// A signature-promoted family never had a ledger hypothesis, so its
+		// walk probes carry empty hypothesis_ids — requiring a family-bound
+		// hypothesis here made the harness-claim fallback structurally
+		// probe-less ("none linked" on runs with a supporting probe). An
+		// unbound probe links through the claim evidence it verified; a probe
+		// bound to another family's hypothesis stays excluded.
+		bound := sanitizeStringSlice(probe["hypothesis_ids"])
+		hasFamily, hasEvidence := len(bound) == 0, false
+		for _, id := range bound {
 			hasFamily = hasFamily || hypothesisFamilies[id] == family
 		}
 		for _, id := range sanitizeStringSlice(probe["evidence_ids"]) {
@@ -1173,6 +1190,21 @@ func promotionPayload(candidate, validated *KnowledgeCandidate) (map[string]any,
 		return nil, false
 	}
 	return cloneCaseSnapshotPayload(validated.Payload), true
+}
+
+// revalidationError names WHICH promotion-time recheck failed. The old blanket
+// "failed content-hash revalidation" hid the common case — the operator's
+// evaluation changed — behind hash jargon nobody could act on.
+func revalidationError(validated *KnowledgeCandidate, payloadOK bool) error {
+	switch {
+	case validated == nil:
+		return errors.New("no operator evaluation currently confirms this analysis; re-evaluate the incident")
+	case validated.Status != knowledgeCandidateReady:
+		return errors.New("analysis no longer compiles into promotable knowledge: " + validated.ValidationError)
+	case !payloadOK:
+		return errors.New("compiled knowledge changed since this candidate was generated; re-evaluate the incident to mint a fresh candidate")
+	}
+	return nil
 }
 
 func knowledgeFingerprint(payload map[string]any) string {
@@ -1359,8 +1391,8 @@ func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRe
 	snapshot := s.caseSnapshots[candidate.CaseID]
 	validated := s.knowledgeCandidateForSnapshotLocked(snapshot)
 	payload, ok := promotionPayload(candidate, validated)
-	if validated == nil || validated.Status != knowledgeCandidateReady || !ok {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
+	if err := revalidationError(validated, ok); err != nil {
+		return KnowledgeCandidate{}, KnowledgePackage{}, err
 	}
 	now := time.Now().UTC()
 	actor, note := knowledgeActor(request.Actor), strings.TrimSpace(request.Note)
@@ -1417,8 +1449,8 @@ func (s *Store) ShadowKnowledgeCandidate(id string, request KnowledgeDecisionReq
 	}
 	validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[candidate.CaseID])
 	payload, ok := promotionPayload(candidate, validated)
-	if validated == nil || validated.Status != knowledgeCandidateReady || !ok {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
+	if err := revalidationError(validated, ok); err != nil {
+		return KnowledgeCandidate{}, KnowledgePackage{}, err
 	}
 	now := time.Now().UTC()
 	actor, note := knowledgeActor(request.Actor), strings.TrimSpace(request.Note)
@@ -1458,8 +1490,8 @@ func (s *Store) ActivateShadowKnowledgeCandidate(id string, request KnowledgeDec
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge shadow package not found")
 	}
 	validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[candidate.CaseID])
-	if validated == nil || validated.Status != knowledgeCandidateReady || validated.ContentHash != candidate.ContentHash {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
+	if err := revalidationError(validated, validated != nil && validated.ContentHash == candidate.ContentHash); err != nil {
+		return KnowledgeCandidate{}, KnowledgePackage{}, err
 	}
 	now := time.Now().UTC()
 	actor, note := knowledgeActor(request.Actor), strings.TrimSpace(request.Note)

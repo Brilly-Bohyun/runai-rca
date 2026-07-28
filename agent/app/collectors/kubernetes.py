@@ -2076,6 +2076,16 @@ class KubernetesCollector:
                 )
             )
 
+        if used_mcp:
+            # The base gather is transport-exclusive: when MCP succeeded, EVERY
+            # read above went through the MCP server, but shared artifact
+            # builders label queries in kubectl shape. Without this prefix one
+            # report shows "MCP resources_get node" next to "kubectl get pod …"
+            # and reads as half-MCP half-direct-API.
+            for item in artifacts:
+                if item.query and item.query.startswith("kubectl"):
+                    item.query = f"MCP · {item.query}"
+
         return CollectorResult(
             agent=self.name,
             status=status,
@@ -5836,6 +5846,11 @@ def _node_cordon_artifact(
             "observed_entity": {"kind": "node", "name": node},
             "observation_window": time_range if causal else {},
             "snapshot_role": snapshot_role,
+            # kubelet's official reason for the cordon flip. The typed channel
+            # routes this to platform_lifecycle_change (administrative action)
+            # instead of letting the summary's "unschedulable" text feed
+            # k8s_scheduling_error.
+            "scheduling_reason": "NodeNotSchedulable",
         }
         artifacts.append(
             artifact(
@@ -6072,6 +6087,12 @@ def _runai_crd_health_artifacts(
             "coverage": coverage,
             "observed_entity": {"kind": kind, "name": name, "namespace": namespace},
             "observation_window": time_range if scoped else {},
+            # Typed phase for the ranker: a bare "Pending"/"Unschedulable" on a
+            # Run:ai CRD is the Run:ai scheduler's admission verdict, not
+            # kube-scheduler's — without this a message-less finding either
+            # supports nothing or drifts to k8s_scheduling_error via the
+            # "unschedulable" keyword.
+            "runai_phase": reason,
         }
         if scoped:
             observation["evidence_window"] = {"start": transitioned_at, "end": transitioned_at}

@@ -1266,3 +1266,119 @@ func TestRefineKnowledgeCandidateActionsAppliesAndStampsMarker(t *testing.T) {
 		t.Fatalf("refined candidate must leave the pending queue: %d", len(pending))
 	}
 }
+
+// A Ready candidate is a cached projection of the incident's live evaluation.
+// Withdrawing the operator confirmation must withdraw the candidate from the
+// review queue too; before this test the queue kept advertising Ready while
+// approval failed with a misleading "content-hash revalidation" error.
+func TestWithdrawnConfirmationWithdrawsReadyCandidate(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.ApprovalState = "active"
+	// Compile succeeds only through the operator-confirmed override: demote
+	// the trace hypothesis out of selected/supported status.
+	trace := snapshot.Snapshot["metadata"].(map[string]any)["reasoning_trace_v3"].(map[string]any)
+	trace["hypotheses"].([]any)[0].(map[string]any)["status"] = "rejected"
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+
+	review := &EvaluationReview{
+		ReviewID: "EVR-1", RunID: snapshot.RunID, AnalysisHash: snapshot.AnalysisHash,
+		Reviewer: "operator", CaseType: "known", ExpectedFamily: snapshot.RootCauseFamily,
+		Scores: qualifyingKnowledgeReviewScores(), ResolutionOutcome: "resolved",
+		OperatorConfirmed: true,
+	}
+	store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, review.Reviewer)] = review
+	candidate := store.knowledgeCandidateForSnapshotLocked(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("expected confirmed-override candidate to be ready, got %+v", candidate)
+	}
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+
+	// The operator re-saves the evaluation without the confirmation tick.
+	review.OperatorConfirmed = false
+	store.invalidateKnowledgeForReviewLocked(snapshot.RunID, snapshot.AnalysisHash, time.Now().UTC())
+	stored := store.knowledgeCandidates[candidate.CandidateID]
+	if stored.Status != knowledgeCandidateValidationFailed || stored.ValidationError != knowledgeReviewInvalidationError {
+		t.Fatalf("unconfirmed candidate must be withdrawn from review, got %s (%q)", stored.Status, stored.ValidationError)
+	}
+	if _, _, err := store.ApproveKnowledgeCandidate(candidate.CandidateID, KnowledgeDecisionRequest{Actor: "operator"}); err == nil {
+		t.Fatal("approving a withdrawn candidate must fail")
+	}
+
+	// Re-confirming restores the same candidate for review.
+	review.OperatorConfirmed = true
+	store.generateKnowledgeCandidateForReviewedRunLocked(snapshot.RunID, snapshot.AnalysisHash)
+	if restored := store.knowledgeCandidates[candidate.CandidateID]; restored.Status != knowledgeCandidateReady {
+		t.Fatalf("re-confirmation must restore the candidate, got %s", restored.Status)
+	}
+	if _, _, err := store.ApproveKnowledgeCandidate(candidate.CandidateID, KnowledgeDecisionRequest{Actor: "operator"}); err != nil {
+		t.Fatalf("approval after re-confirmation failed: %v", err)
+	}
+}
+
+// The operator-confirm path exists for runs the harness underrates: probes
+// came back inconclusive, the harness deducted points (e.g. 76), and the UI
+// promises "운영자가 확정" with a required confirmation note. The quality floor
+// must yield to that confirmation — the reviewer's own >=80% evaluation gate
+// already vetted it — while an unconfirmed low-quality run stays rejected.
+func TestOperatorConfirmationOverridesHarnessQualityFloor(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	metadata := snapshot.Snapshot["metadata"].(map[string]any)
+	metadata["harness"].(map[string]any)["overall_score"] = 76
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+
+	review := &EvaluationReview{
+		ReviewID: "EVR-1", RunID: snapshot.RunID, AnalysisHash: snapshot.AnalysisHash,
+		Reviewer: "operator", CaseType: "known", ExpectedFamily: snapshot.RootCauseFamily,
+		Scores: qualifyingKnowledgeReviewScores(), ResolutionOutcome: "resolved",
+	}
+	store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, review.Reviewer)] = review
+
+	unconfirmed := store.knowledgeCandidateForSnapshotLocked(snapshot)
+	if unconfirmed == nil || unconfirmed.Status != knowledgeCandidateValidationFailed {
+		t.Fatalf("sub-80 harness without confirmation must fail validation, got %+v", unconfirmed)
+	}
+	if unconfirmed.ValidationError != "quality score must be at least 80" {
+		t.Fatalf("unexpected validation error: %q", unconfirmed.ValidationError)
+	}
+
+	review.OperatorConfirmed = true
+	review.Notes = "의도적으로 재현한 OOM 테스트: describe로 OOMKilled/exit 137 확인"
+	confirmed := store.knowledgeCandidateForSnapshotLocked(snapshot)
+	if confirmed == nil || confirmed.Status != knowledgeCandidateReady {
+		t.Fatalf("operator confirmation must lift the harness quality floor, got %+v", confirmed)
+	}
+	if got := stringValue(confirmed.Payload["quality_source"]); got != "operator_confirmed_review" {
+		t.Fatalf("quality source must record the override, got %q", got)
+	}
+	if score, _ := numberToInt(confirmed.Payload["quality_score"]); score != 76 {
+		t.Fatalf("payload must keep the honest harness score, got %v", confirmed.Payload["quality_score"])
+	}
+}
+
+func TestHarnessClaimLinksUnboundProbesThroughClaimEvidence(t *testing.T) {
+	// Signature-promoted families have no ledger hypothesis, so walk probes
+	// execute with empty hypothesis_ids; the probe that verified the claim's
+	// own evidence must still link, while a probe bound to another family's
+	// hypothesis must not.
+	trace := map[string]any{
+		"hypotheses": []any{
+			map[string]any{"hypothesis_id": "H-other", "family": "node_kubelet_pressure"},
+		},
+		"probe_executions": []any{
+			map[string]any{
+				"execution_id": "P-1", "template_id": "k8s_troubleshooting:pod_crashing:p01",
+				"verdict": "supports", "hypothesis_ids": []any{}, "evidence_ids": []any{"E12"},
+			},
+			map[string]any{
+				"execution_id": "P-2", "template_id": "k8s_troubleshooting:node_pressure:p01",
+				"verdict": "supports", "hypothesis_ids": []any{"H-other"}, "evidence_ids": []any{"E12"},
+			},
+		},
+	}
+	ids := traceV3FamilyLinkedProbeTemplateIDs(trace, "workload_runtime_error", map[string]bool{"E12": true})
+	if len(ids) != 1 || ids[0] != "k8s_troubleshooting:pod_crashing:p01" {
+		t.Fatalf("unbound probe must link via claim evidence and foreign-bound probe must not, got %v", ids)
+	}
+}

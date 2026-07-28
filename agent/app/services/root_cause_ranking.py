@@ -48,6 +48,20 @@ _K8S_CONTAINER_REASON_FAMILY: dict[str, str] = {
     "oomkilled": "workload_runtime_error",
     "unschedulable": "k8s_scheduling_error",
     "schedulinggated": "k8s_scheduling_error",
+    # kubelet's official reason when spec.unschedulable flips: a cordon is an
+    # administrative lifecycle action, not a scheduler fault. Typing it here
+    # also stops the cordon snapshot from feeding k8s_scheduling_error through
+    # its "unschedulable" summary text.
+    "nodenotschedulable": "platform_lifecycle_change",
+}
+
+# A Run:ai CRD phase is the Run:ai scheduler's own verdict. Only the phases
+# that name a scheduling outcome are typed; failed/error stay message-driven
+# (the CRD message carries the real signal, and a bare "Failed" honestly
+# supports nothing specific).
+_RUNAI_CRD_PHASE_FAMILY: dict[str, str] = {
+    "pending": "runai_scheduling_quota",
+    "unschedulable": "runai_scheduling_quota",
 }
 
 _FLOOR = 2.0          # min top score below which we fall back to insufficient_evidence
@@ -1366,6 +1380,14 @@ def _artifact_is_relevant_to_family(family: str, art: object) -> bool:
     if reason:
         return _K8S_CONTAINER_REASON_FAMILY.get(reason) == family
 
+    crd_phase = str(observation.get("runai_phase") or "").strip().casefold()
+    if crd_phase and _RUNAI_CRD_PHASE_FAMILY.get(crd_phase):
+        # A typed scheduling phase claims exactly its family — in particular a
+        # Run:ai "Unschedulable" must not read as kube-scheduler evidence.
+        # Unmapped phases (failed/error) fall through to the keyword path where
+        # the CRD message text decides.
+        return _RUNAI_CRD_PHASE_FAMILY[crd_phase] == family
+
     _canonical, allowed_agents, keywords = rule
     if agent not in {str(item).casefold() for item in allowed_agents}:
         return False
@@ -1414,6 +1436,13 @@ def artifact_supports_family(family: str, art: object) -> bool:
         return bool(_keyword_hits(semantic_text, list(rule[2]))[0])
 
     if observation.get("container_reason") or observation.get("scheduling_reason"):
+        return True
+    if (
+        _RUNAI_CRD_PHASE_FAMILY.get(
+            str(observation.get("runai_phase") or "").strip().casefold()
+        )
+        == family
+    ):
         return True
 
     _canonical, allowed_agents, keywords = rule

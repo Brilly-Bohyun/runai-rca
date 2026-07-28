@@ -239,3 +239,104 @@ async def test_final_collector_gather_attaches_typed_support(monkeypatch):
 
     assert results[0].artifacts
     assert context["hypothesis_ledger"][0]["evidence_for"]
+
+
+def _cordon_artifact():
+    # RunaiNodeUnschedulableOrNotReady on a manually cordoned node: alert text
+    # satisfies the causal gate, node object reports spec.unschedulable=true.
+    target = replace(
+        make_target(),
+        namespace="",
+        pod="",
+        workload_name="",
+        node="k8s-lb-01",
+        alert_name="RunaiNodeUnschedulableOrNotReady",
+        fired_at="2026-07-28T05:05:00Z",
+        resolved_at="",
+    )
+    from app.collectors.kubernetes import _node_cordon_artifact
+
+    artifacts = _node_cordon_artifact(
+        "kubernetes",
+        target,
+        [{"name": "node", "data": {"name": "k8s-lb-01", "unschedulable": True}}],
+        time_range={"start": "2026-07-28T05:05:00Z", "end": "2026-07-28T05:15:00Z"},
+    )
+    assert len(artifacts) == 1
+    return artifacts[0]
+
+
+def test_cordon_is_lifecycle_change_not_scheduler_fault() -> None:
+    # INC-1785215448065944607-000001: a manual cordon fired
+    # RunaiNodeUnschedulableOrNotReady and the cordon evidence (present) had no
+    # family to support — every hypothesis drifted at 0 evidence and the run
+    # ended insufficient_evidence. The typed reason routes it to the
+    # administrative-change family and keeps it OUT of k8s_scheduling_error
+    # (whose "unschedulable" keyword its summary text would otherwise feed).
+    cordon = _cordon_artifact()
+    observation = cordon.result["observation"]
+    assert observation["polarity"] == "present"
+    assert observation["scheduling_reason"] == "NodeNotSchedulable"
+    assert artifact_supports_family("platform_lifecycle_change", cordon)
+    assert not artifact_supports_family("k8s_scheduling_error", cordon)
+
+
+def test_cordon_symptom_reaches_the_lifecycle_playbook() -> None:
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    fm = load_failure_modes("knowledge/failure_modes.yaml")
+    matches = match_failure_mode_symptoms(
+        fm,
+        "node/k8s-lb-01 is cordoned (SchedulingDisabled — spec.unschedulable=true)",
+    )
+    assert any(family == "platform_lifecycle_change" for family, _ in matches)
+    symptom = next(s for f, s in matches if f == "platform_lifecycle_change")
+    assert "uncordon" in " ".join(symptom.get("actions") or [])
+
+
+def _crd_artifact(reason: str, message: str = ""):
+    from app.collectors.kubernetes import _runai_crd_health_artifacts
+    from tests.test_orchestrator import make_settings
+
+    artifacts = _runai_crd_health_artifacts(
+        "kubernetes",
+        make_settings(),
+        [
+            {
+                "kind": "TrainingWorkload",
+                "name": "train-42",
+                "namespace": "runai-vision",
+                "reason": reason,
+                "message": message,
+                "lastTransitionTime": "2026-07-28T05:10:00Z",
+            }
+        ],
+        time_range={"start": "2026-07-28T05:05:00Z", "end": "2026-07-28T05:15:00Z"},
+    )
+    assert len(artifacts) == 1
+    return artifacts[0]
+
+
+def test_bare_runai_crd_phase_is_runai_scheduling_evidence() -> None:
+    # Delivery-line audit 2026-07-28: a message-less Run:ai CRD finding either
+    # supported NOTHING (Pending) or drifted to kube-scheduler's family via the
+    # "unschedulable" keyword (Unschedulable). The phase is the Run:ai
+    # scheduler's own verdict, so the typed channel must claim exactly
+    # runai_scheduling_quota.
+    for phase in ("Pending", "Unschedulable"):
+        art = _crd_artifact(phase)
+        assert art.result["observation"]["polarity"] == "present"
+        assert artifact_supports_family("runai_scheduling_quota", art), phase
+        assert not artifact_supports_family("k8s_scheduling_error", art), phase
+
+    # A bare Failed proves the workload failed but not why: honestly ambiguous,
+    # so it must stay context-only instead of guessing a family.
+    bare_failed = _crd_artifact("Failed")
+    from app.knowledge import load_family_catalog
+
+    families = load_family_catalog("knowledge/families.yaml").families
+    assert not any(artifact_supports_family(f, bare_failed) for f in families)
+
+    # A real message keeps the keyword path: the text decides the family.
+    rich = _crd_artifact("Failed", "failed to reconcile project quota")
+    assert artifact_supports_family("runai_control_plane_error", rich)
