@@ -1,12 +1,20 @@
 package server
 
 import (
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/brilly-bohyun/runai-rca/backend/internal/server/testsupport"
 )
+
+type embeddingRoundTripper func(*http.Request) (*http.Response, error)
+
+func (fn embeddingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
 
 func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 	state := testsupport.NewPostgresState(false)
@@ -74,6 +82,57 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 	assertLoadedPostgresMemory(t, store)
 	if got := state.RecordedPGVectorSearchLimit(); got != 15 {
 		t.Fatalf("expected pgvector search to overfetch before dedupe, got limit %d", got)
+	}
+	for _, fragment := range []string{
+		"JOIN incidents AS i ON i.incident_id = e.incident_id",
+		"i.user_approved_at IS NOT NULL",
+		"i.deleted_at IS NULL",
+	} {
+		if !state.Queried(fragment) {
+			t.Fatalf("expected pgvector search to filter incident state in SQL with %q", fragment)
+		}
+	}
+}
+
+func TestPGVectorSimilarIncidentsTagDenseLexicalWithoutEndpoint(t *testing.T) {
+	state := testsupport.NewPostgresState(false)
+	store := NewStore()
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	store.embedder = &embedder{dim: embeddingDim}
+
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "GPU quota blocked scheduling"},
+	}
+	similar := store.SimilarIncidentsForAlert(alert, "INC-current", 1)
+	if len(similar) != 1 || similar[0].RetrievalKind != "dense-lexical" {
+		t.Fatalf("expected hash-basis pgvector result to be dense-lexical, got %+v", similar)
+	}
+}
+
+func TestPGVectorQueryHashFallbackUsesSparseSimilarities(t *testing.T) {
+	state := testsupport.NewPostgresState(false)
+	store := NewStore()
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	store.embedder = &embedder{
+		endpoint: "http://embedding.test",
+		dim:      embeddingDim,
+		client: &http.Client{Transport: embeddingRoundTripper(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("endpoint unavailable")
+		})},
+	}
+
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "GPU quota blocked scheduling"},
+	}
+	similar := store.SimilarIncidentsForAlert(alert, "INC-current", 1)
+	if len(similar) != 1 || similar[0].RetrievalKind != "sparse-identity" {
+		t.Fatalf("expected query hash fallback to use sparse similarities, got %+v", similar)
 	}
 }
 

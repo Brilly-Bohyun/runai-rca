@@ -12,7 +12,7 @@ into the action sections, no match through a negated statement.
 
 from __future__ import annotations
 
-from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+from app.knowledge import load_architecture, load_failure_modes, match_failure_mode_symptoms
 from app.plan import InvestigationPlan
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
@@ -125,6 +125,26 @@ def test_component_identity_reaches_the_guide() -> None:
     )
     assert "COMPONENT-EFFECT" in text
     assert "COMPONENT-CHECK" in text
+
+
+def test_llm_component_is_worded_as_an_interpretation() -> None:
+    text = guidance(
+        "무슨 일인지 모르겠어요",
+        language="ko",
+        component="runai-scheduler-default",
+        component_source="llm",
+        components=COMPONENTS,
+    )
+    assert "이 요청은 **runai-scheduler-default** 컴포넌트에 대한 것으로 해석되었습니다" in text
+    assert "알림 대상이" not in text
+
+
+def test_component_alias_from_question_reaches_the_guide() -> None:
+    text = guidance(
+        "Thanos Receive 가 OOMKilled 반복되어서 메모리를 올렸는데도 자꾸 죽는데",
+        components=load_architecture("knowledge/runai_architecture.yaml"),
+    )
+    assert "runai-backend-thanos-receive" in text
 
 
 def test_matched_alert_catalog_reaches_the_guide() -> None:
@@ -366,6 +386,76 @@ def test_general_guidance_block_finds_the_other_language() -> None:
     # A stored report may have been written under a different language setting.
     korean = "## 일반 점검 가이드 (현재 RCA 결론 아님)\n\n- 한 줄"
     assert pipeline._general_guidance_block(korean, "en").startswith("## 일반 점검 가이드")
+
+
+# --- duplicated symptom via a stale cross-family edge renders ONCE ---------------
+
+
+def test_same_symptom_under_two_families_matches_once() -> None:
+    # A stale indicates edge (family move in the YAML) presents the identical
+    # symptom under two families; the guide must not repeat the block.
+    entry = {
+        "symptom": "OOMKilled",
+        "keywords": ["oomkilled"],
+        "actions": ["OOM-ACTION check lastState.terminated.reason"],
+    }
+    modes = {
+        "workload_runtime_error": [dict(entry)],
+        "workload_startup_error": [dict(entry)],
+    }
+    matches = match_failure_mode_symptoms(modes, "container was oomkilled")
+    assert len(matches) == 1
+    text = "\n".join(general_guidance_lines("container was oomkilled", modes, []))
+    assert text.count("OOM-ACTION") == 1
+
+
+# --- external support cases reach the evidence-free guide ------------------------
+
+THANOS_CASE_CARD = {
+    "kind": "external",
+    "historical_prior": True,
+    "case_id": "enterprise_support:e38f69ff583a",
+    "context_class": "mitigated_context",
+    "analysis_summary": (
+        "EXTERNAL-SUMMARY Thanos Receive repeatedly exceeded a 64 GB memory limit; "
+        "increasing CPU while leaving memory unchanged was followed by stability."
+    ),
+    "successful_actions": [
+        {
+            "statement": "EXTERNAL-ACTION Increase CPU request/limit from 2/8 to 4/16 "
+            "while leaving memory limit at 64 GB.",
+            "outcome": "mitigated",
+        }
+    ],
+}
+
+
+def test_external_case_reaches_the_guide() -> None:
+    text = guidance(
+        "Thanos Receive 가 OOMKilled 반복되어서 메모리를 올렸는데도 자꾸 죽는데",
+        language="ko",
+        case_cards=[THANOS_CASE_CARD],
+    )
+    assert "EXTERNAL-SUMMARY" in text
+    assert "EXTERNAL-ACTION" in text
+    assert "과거 기록입니다" in text  # labelled history, never a confirmed cause
+
+
+def test_internal_priors_stay_out_of_the_guide() -> None:
+    # analog/counterexample cards from approved internal incidents have their
+    # own surface (similar incidents); only kind=external renders here.
+    internal = {**THANOS_CASE_CARD, "kind": "analog"}
+    assert "EXTERNAL-SUMMARY" not in guidance("무슨 일이죠", case_cards=[internal])
+
+
+def test_external_case_reaches_the_rendered_report() -> None:
+    detail = _evidence_free_detail(
+        plan=InvestigationPlan(component="runai-backend-thanos-receive"),
+        kg_context={"case_cards": [THANOS_CASE_CARD]},
+    )
+    assert "EXTERNAL-SUMMARY" in detail
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
+    assert "EXTERNAL-SUMMARY" not in actions
 
 
 # --- the shipped ontology really carries the scheduling knowledge ----------------

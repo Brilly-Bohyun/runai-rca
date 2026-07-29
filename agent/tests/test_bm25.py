@@ -17,6 +17,19 @@ def test_tokenize_drops_stopwords_and_noise() -> None:
     assert tokenize("") == []
 
 
+def test_korean_tokens_can_match_a_korean_document() -> None:
+    assert tokenize("스케줄러 장애") == ["스케줄러", "장애"]
+    index = BM25Index(
+        [
+            ("scheduler", "스케줄러 장애 감지"),
+            ("quota", "GPU quota exceeded"),
+            ("network", "network timeout"),
+            ("storage", "volume mount error"),
+        ]
+    )
+    assert [key for key, _ in index.search("스케줄러 장애")] == ["scheduler"]
+
+
 def test_single_generic_shared_token_is_never_a_match() -> None:
     # "workload" appears in both docs (df/N too high for the signature rule and
     # only one query token hits) — one common word must not produce a match.
@@ -46,6 +59,58 @@ def test_synonyms_bridge_vocabulary() -> None:
     assert [key for key, _ in hits] == ["preempt"]
 
 
+def test_korean_stem_bridges_to_english_synonym_terms() -> None:
+    index = BM25Index(
+        [
+            ("preempt", "preempted by higher priority"),
+            ("quota", "over quota contention"),
+            ("image", "imagepullbackoff registry manifest"),
+            ("nfs", "nfs server unresponsive"),
+        ]
+    )
+
+    assert [key for key, _ in index.search("작업이 선점됐어요")] == ["preempt"]
+
+
+def test_non_curated_korean_token_does_not_bridge() -> None:
+    index = BM25Index(
+        [
+            ("preempt", "preempted by higher priority"),
+            ("quota", "over quota contention"),
+            ("image", "imagepullbackoff registry manifest"),
+            ("nfs", "nfs server unresponsive"),
+        ]
+    )
+
+    assert index.search("작업이") == []
+
+
+def test_korean_stem_bridge_requires_token_prefix() -> None:
+    index = BM25Index(
+        [
+            ("preempt", "preempted by higher priority"),
+            ("quota", "over quota contention"),
+            ("image", "imagepullbackoff registry manifest"),
+            ("nfs", "nfs server unresponsive"),
+        ]
+    )
+
+    assert index.search("미선점됨") == []
+
+
+def test_korean_stem_bridge_keeps_single_source_signature_gate() -> None:
+    index = BM25Index(
+        [
+            ("one", "permission check"),
+            ("two", "permission check"),
+            ("three", "permission check"),
+            ("four", "permission check"),
+        ]
+    )
+
+    assert index.search("권한없음") == []
+
+
 def test_empty_index_and_empty_query() -> None:
     assert BM25Index([]).search("anything") == []
     assert BM25Index([("a", "text")]).search("") == []
@@ -63,6 +128,48 @@ def test_failure_mode_fuzzy_fallback_recovers_paraphrase() -> None:
     families = {family for family, _ in matches}
     assert "runai_scheduling_quota" in families
     assert all(sym.get("matched_via") == "bm25" for _, sym in matches)
+
+
+def test_failure_mode_fuzzy_fallback_bridges_korean_preemption() -> None:
+    fm = load_failure_modes(FAILURE_MODES)
+    text = "작업이 선점됐어요"
+    matches = match_failure_mode_symptoms(fm, text, "", fuzzy_query=text)
+
+    assert any(sym["symptom"] == "Preempted By Higher Priority" for _, sym in matches)
+    assert all(sym.get("matched_via") == "bm25" for _, sym in matches)
+
+
+def test_failure_mode_fuzzy_fixture_bridges_korean_preemption() -> None:
+    failure_modes = {
+        "runai_scheduling_quota": [
+            {
+                "symptom": "Preempted By Higher Priority",
+                "keywords": ["preempted by higher priority"],
+                "actions": ["check the higher-priority workload"],
+            }
+        ],
+        "other": [
+            {"symptom": "Quota", "keywords": ["over quota"], "actions": ["check quota"]},
+            {"symptom": "Image", "keywords": ["image pull failed"], "actions": ["check image"]},
+            {"symptom": "Mount", "keywords": ["mount failed"], "actions": ["check mount"]},
+        ],
+    }
+    text = "작업이 선점됐어요"
+
+    matches = match_failure_mode_symptoms(failure_modes, text, "", fuzzy_query=text)
+
+    assert matches == [
+        (
+            "runai_scheduling_quota",
+            {
+                "symptom": "Preempted By Higher Priority",
+                "keywords": ["preempted by higher priority"],
+                "actions": ["check the higher-priority workload"],
+                "matched_via": "bm25",
+                "matched_keywords": [],
+            },
+        )
+    ]
 
 
 def test_failure_mode_fuzzy_does_not_promote_generic_workload_words() -> None:

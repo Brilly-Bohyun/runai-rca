@@ -652,6 +652,9 @@ def load_architecture(path: str) -> dict[str, dict[str, Any]]:
             continue
         out[name] = {
             "component": name,
+            "aliases": [
+                str(alias).strip() for alias in (entry.get("aliases") or []) if str(alias).strip()
+            ],
             "layer": str(entry.get("layer") or ""),
             "namespace": str(entry.get("namespace") or ""),
             "kind": str(entry.get("kind") or ""),
@@ -706,18 +709,23 @@ def component_for_text(
     pod/namespace label for component_for_target to match. Normalize separators
     on both sides and match a component's full name or a tail of at least two
     words ("thanos receive" for runai-backend-thanos-receive) at word
-    boundaries; single words stay out — they over-match ordinary prose. The
-    longest matched phrase wins."""
-    haystack = " ".join(_COMPONENT_TEXT_NORM.sub(" ", str(text or "").lower()).split())
+    boundaries. Curated aliases are explicit opt-ins and may be single words.
+    The longest matched phrase wins."""
+    haystack = " ".join(_COMPONENT_TEXT_NORM.sub(" ", str(text or "").casefold()).split())
     if not haystack:
         return None
     haystack = f" {haystack} "
     best: dict[str, Any] | None = None
     best_len = 0
     for name, entry in components.items():
-        words = _COMPONENT_TEXT_NORM.sub(" ", name.lower()).split()
+        words = _COMPONENT_TEXT_NORM.sub(" ", name.casefold()).split()
         for start in range(len(words) - 1):
             phrase = " ".join(words[start:])
+            if f" {phrase} " in haystack and len(phrase) > best_len:
+                best = entry
+                best_len = len(phrase)
+        for alias in entry.get("aliases") or []:
+            phrase = " ".join(_COMPONENT_TEXT_NORM.sub(" ", str(alias).casefold()).split())
             if f" {phrase} " in haystack and len(phrase) > best_len:
                 best = entry
                 best_len = len(phrase)
@@ -1610,7 +1618,7 @@ def match_failure_mode_symptoms(
             )
         ]
         matched.sort(key=lambda fs: fs[0] != top_family)
-        return matched
+        return _dedupe_symptom_names(matched)
     # A generic state marker (ImagePullBackOff, CrashLoopBackOff, FailedMount)
     # names the retry/lifecycle state, not its mechanism. Any concrete error
     # signature must lead it even when the alert name contributes two generic
@@ -1638,6 +1646,27 @@ def match_failure_mode_symptoms(
             continue
         kept.append((family, {**symptom, "matched_keywords": hits}))
         kept_hits.append(hits)
+    return _dedupe_symptom_names(kept)
+
+
+def _dedupe_symptom_names(
+    matches: list[tuple[str, dict[str, Any]]]
+) -> list[tuple[str, dict[str, Any]]]:
+    """Keep the first (best-ranked) entry per symptom NAME across families.
+
+    A symptom name is a global identity (one TypeDB entity, one YAML entry), so
+    the same name under two families is the same knowledge reached twice — a
+    stale ``indicates`` edge left behind by a family move in failure_modes.yaml
+    (live case: OOMKilled under both workload_startup_error and
+    workload_runtime_error rendered the identical guidance block twice)."""
+    seen: set[str] = set()
+    kept: list[tuple[str, dict[str, Any]]] = []
+    for family, symptom in matches:
+        name = str(symptom.get("symptom") or "")
+        if name and name in seen:
+            continue
+        seen.add(name)
+        kept.append((family, symptom))
     return kept
 
 

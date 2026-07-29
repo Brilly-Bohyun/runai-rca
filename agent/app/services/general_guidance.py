@@ -11,6 +11,7 @@ from typing import Any
 
 from app.knowledge import (
     component_action_lines,
+    component_for_text,
     family_label,
     localized_failure_mode_actions,
     match_failure_mode_symptoms,
@@ -45,9 +46,11 @@ def general_guidance_lines(
     language: str = "en",
     masker: Masker | None = None,
     component: str = "",
+    component_source: str = "",
     components: dict[str, dict[str, Any]] | None = None,
     matched_alert: dict[str, Any] | None = None,
     families: list[str] | None = None,
+    case_cards: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """Return optional next checks for a question without live evidence.
 
@@ -70,10 +73,20 @@ def general_guidance_lines(
     family from the closed catalog; that name is the language-independent bridge
     into the ontology, and it costs no extra call. Unknown names simply find no
     symptoms, so a hallucinated family cannot invent guidance.
+
+    ``case_cards`` are this run's retrieval-matched historical priors; only the
+    ``kind == "external"`` ones (vendor-support cases) render here, as clearly
+    labelled history. Without them, the one prior that answers "I already raised
+    memory and it still dies" (Thanos Receive OOMKilled, stabilized by a CPU
+    increase with memory unchanged) stayed invisible to the operator: it went
+    only to LLM prompt surfaces, never the deterministic report.
     """
     active_masker = masker or build_masker(())
     lines = list(_BASE_LINES.get(language, _BASE_LINES["en"]))
     text = active_masker.mask_text(query or "")
+    if not component:
+        entry = component_for_text(components or {}, query)
+        component = entry["component"] if entry else ""
 
     # Precision order mirrors the playbook: identity beats any keyword match.
     # The component is a fact about the target, so its checks are stated plainly
@@ -83,11 +96,21 @@ def general_guidance_lines(
         if checks:
             name = _safe(component, active_masker, 120)
             lines.append(
-                f"- 알림 대상이 **{name}** 컴포넌트입니다. "
-                "원인 확정 전이라도 다음을 확인할 수 있습니다:"
-                if language == "ko"
-                else f"- The alert target is the **{name}** component. Even before a cause "
-                "is confirmed, these can be checked:"
+                (
+                    f"- 이 요청은 **{name}** 컴포넌트에 대한 것으로 해석되었습니다. "
+                    "확인된 대상이 아니라 해석이며, 원인 확정 전 다음을 확인할 수 있습니다:"
+                    if language == "ko"
+                    else f"- This request was interpreted as being about the **{name}** component — "
+                    "an interpretation, not a confirmed target. These can be checked:"
+                )
+                if component_source == "llm"
+                else (
+                    f"- 알림 대상이 **{name}** 컴포넌트입니다. "
+                    "원인 확정 전이라도 다음을 확인할 수 있습니다:"
+                    if language == "ko"
+                    else f"- The alert target is the **{name}** component. Even before a cause "
+                    "is confirmed, these can be checked:"
+                )
             )
             lines.extend(f"  - {_safe(check, active_masker, 360)}" for check in checks[:4])
 
@@ -106,6 +129,8 @@ def general_guidance_lines(
             "not a confirmed cause for the current run:"
         )
         lines.extend(f"  - {_safe(action, active_masker, 360)}" for action in alert_actions)
+
+    lines.extend(_external_case_lines(case_cards or [], language, active_masker))
 
     for issue in match_runai_known_issues(known_issues, text)[:2]:
         name = _safe(issue.get("issue"), active_masker, 180)
@@ -139,6 +164,49 @@ def general_guidance_lines(
             _family_candidate_lines(families or [], failure_modes, language, active_masker)
         )
 
+    return lines
+
+
+def _external_case_lines(
+    case_cards: list[dict[str, Any]], language: str, masker: Masker
+) -> list[str]:
+    """Signature-matched vendor-support cases, as labelled history only.
+
+    External cards are retrieval-matched against this run's own observed text
+    and component identity, so they are target-specific — but their allowed use
+    is historical context (``prohibited_uses: current_root_cause_proof``), so
+    every line states outcome as what happened THEN, never as this run's cause.
+    What was tried and did NOT work is included on purpose: it is exactly what
+    stops an operator from repeating an already-failed fix.
+    """
+    lines: list[str] = []
+    external = [c for c in case_cards if c.get("kind") == "external"]
+    for card in external[:2]:
+        summary = _safe(card.get("analysis_summary"), masker, 400)
+        if not summary:
+            continue
+        ref = _safe(card.get("case_id") or card.get("incident_id"), masker, 100)
+        status = _safe(card.get("context_class"), masker, 40)
+        suffix = f", {status}" if status else ""
+        lines.append(
+            f"- 이 대상과 시그니처가 일치하는 외부 지원 사례가 있습니다 "
+            f"(**{ref}**{suffix}). 현재 원인으로 확인된 것이 아닌 과거 기록입니다:"
+            if language == "ko"
+            else f"- An external support case matches this target's signature "
+            f"(**{ref}**{suffix}). Historical record — not a confirmed cause for this run:"
+        )
+        lines.append(f"  - {'당시 경과' if language == 'ko' else 'What happened'}: {summary}")
+        for action in list(card.get("successful_actions") or [])[:2]:
+            statement = _safe(action.get("statement"), masker, 300)
+            outcome = _safe(action.get("outcome"), masker, 20)
+            if statement:
+                label = "당시 효과 있었던 조치" if language == "ko" else "Action that helped then"
+                lines.append(f"  - {label} ({outcome}): {statement}")
+        for action in list(card.get("failed_actions") or [])[:2]:
+            statement = _safe(action.get("statement"), masker, 300)
+            if statement:
+                label = "당시 효과 없었던 조치" if language == "ko" else "Action that did NOT help then"
+                lines.append(f"  - {label}: {statement}")
     return lines
 
 
