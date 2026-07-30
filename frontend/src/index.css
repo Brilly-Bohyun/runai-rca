@@ -2017,15 +2017,28 @@ td span.occurrence-pill {
   gap: 0.5rem;
 }
 
+/* .compact-panel-title carries its own gutter and rule, which pushed the
+   heading out of line with the rows beneath it. The section already supplies
+   both. */
+.llm-hosted-estimate-head .compact-panel-title {
+  padding: 0;
+  border-bottom: 0;
+}
+
 /* The picker always has a vendor selected, so .column-filter's "a filter is
    applied" dot would be permanently lit and mean nothing. */
 .llm-hosted-estimate-head .column-filter.is-active::after {
   content: none;
 }
 
-/* Two columns here (model, cost) — the provider lives in the picker above. */
+/* model / "$x (₩y)" — the provider lives in the picker above, and the paired
+   cost needs a wider cell than a bare dollar figure. */
 .llm-hosted-estimate .llm-model-row {
-  grid-template-columns: minmax(0, 1fr) 4rem;
+  grid-template-columns: minmax(0, 1fr) 9rem;
+}
+
+.llm-hosted-estimate .llm-model-row em {
+  text-align: right;
 }
 
 .llm-model-row {

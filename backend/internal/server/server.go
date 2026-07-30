@@ -255,6 +255,7 @@ type LLMSpendStats struct {
 	// HostedEstimates prices the SAME token volume against hosted vendors. The
 	// local LLM really is $0; this answers "what would this have cost".
 	HostedEstimates []HostedCostEstimate `json:"hosted_estimates"`
+	FX              FXRate               `json:"fx"`
 }
 
 // HostedCostEstimate is one vendor model's price for the measured token volume.
@@ -353,6 +354,9 @@ type Server struct {
 	backfillRetryCooldown time.Duration
 	trashRetention        time.Duration
 	slack                 *SlackNotifier
+	fxRateURL             string
+	fxMu                  sync.RWMutex
+	fx                    FXRate
 }
 
 const (
@@ -447,6 +451,7 @@ func Run() {
 	go server.runTrashPurge(ctx)
 	go server.runSlackDeliveryRetry(ctx)
 	go server.runSlackSocketMode(ctx)
+	go server.runFXRefresh(ctx)
 
 	go func() {
 		log.Printf("Run:AI RCA backend listening on :%s", port)
@@ -528,9 +533,27 @@ func NewServer() *Server {
 		backfillInterval:      time.Duration(getenvInt("ANALYSIS_BACKFILL_INTERVAL_SECONDS", 300)) * time.Second,
 		backfillBatch:         backfillBatch,
 		backfillRetryCooldown: time.Duration(getenvInt("ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS", 900)) * time.Second,
-		trashRetention:        time.Duration(trashRetentionDays) * 24 * time.Hour,
-		slack:                 NewSlackNotifierFromEnv(),
+		trashRetention: time.Duration(trashRetentionDays) * 24 * time.Hour,
+		slack:          NewSlackNotifierFromEnv(),
+		// ECB reference rates, no API key. The .dev/v1 host is where the older
+		// frankfurter.app URL redirects — naming it directly skips the hop. A
+		// cluster without egress keeps the configured fallback so the won
+		// figures still render, flagged as a fallback in the UI.
+		fxRateURL: getenv("FX_RATE_URL", "https://api.frankfurter.dev/v1/latest?from=USD&to=KRW"),
+		fx:        FXRate{USDKRW: fallbackUSDKRW(), Fallback: true},
 	}
+}
+
+// fallbackUSDKRW is the rate used until the first successful fetch, and for the
+// lifetime of a deployment that cannot reach the feed at all. The default is a
+// recent observed rate, not a floor — a blocked cluster should override it.
+func fallbackUSDKRW() float64 {
+	const recentObservedRate = 1452 // 2026-07-29, ECB reference
+	rate := getenvInt("FX_USD_KRW_FALLBACK", recentObservedRate)
+	if rate <= 0 {
+		rate = recentObservedRate
+	}
+	return float64(rate)
 }
 
 func (s *Server) routes() http.Handler {
@@ -699,7 +722,11 @@ func (s *Server) handleLLMSpendStats(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, envelope(s.store.LLMSpendStats(days, time.Now().UTC())))
+	stats := s.store.LLMSpendStats(days, time.Now().UTC())
+	// The rate travels once and the dashboard multiplies, so every dollar figure
+	// on the panel converts against the same number.
+	stats.FX = s.fxRate()
+	writeJSON(w, http.StatusOK, envelope(stats))
 }
 
 func (s *Server) handleKPIStats(w http.ResponseWriter, r *http.Request) {

@@ -237,11 +237,18 @@ export type HostedCostEstimate = {
   cost_usd: number;
 };
 
+export type FXRate = {
+  usd_krw: number;
+  usd_krw_at: string;
+  usd_krw_is_fallback: boolean;
+};
+
 export type LLMSpendStats = LLMSpendBucket & {
   days: number;
   by_model: Record<string, LLMSpendBucket>;
   daily: LLMSpendDay[];
   hosted_estimates: HostedCostEstimate[];
+  fx: FXRate;
 };
 
 export type KPIBucket = {

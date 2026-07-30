@@ -282,6 +282,12 @@ export function formatUSD(value: number) {
   return `$${value.toFixed(2)}`;
 }
 
+// Won is quoted whole — sub-won precision is noise at any spend worth reading.
+export function formatKRW(usd: number, rate: number) {
+  if (!Number.isFinite(usd) || !Number.isFinite(rate) || usd <= 0 || rate <= 0) return '₩0';
+  return `₩${Math.round(usd * rate).toLocaleString('ko-KR')}`;
+}
+
 export function dominantCapability(records: AnalysisRecord[], agent: string) {
   return latestCapabilitySignal(records, agent)?.status || 'pending';
 }
