@@ -171,16 +171,25 @@ func (s *Server) requestAnalysisRun(
 		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
 		return
 	}
-	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
-	s.notifySlackAnalysis(run, incidentID)
-	// A changed result releases the previous approval automatically (the
-	// operator approved text that no longer exists) so the UI never shows an
-	// approved incident whose approval refers to a superseded analysis.
+	// A changed result releases the previous approval automatically (the operator
+	// approved text that no longer exists) so the UI never shows an approved
+	// incident whose approval refers to a superseded analysis. This runs BEFORE
+	// the completion event: the dashboard refreshes on that event, so releasing
+	// afterwards left the first refresh showing the new analysis as still
+	// approved, and made the correction depend on a second event arriving. Slack
+	// (which reads the incident under the store lock) no longer sits in front of
+	// it either.
+	revoked := false
+	var status string
+	var resolvedAt *time.Time
 	if incidentID != "" {
-		if status, resolvedAt, revoked := s.store.AutoRevokeSupersededApproval(incidentID, currentAnalysisHash(&run)); revoked {
-			s.hub.Broadcast(incidentResolvedEvent(incidentID, status, resolvedAt, nil))
-		}
+		status, resolvedAt, revoked = s.store.AutoRevokeSupersededApproval(incidentID, currentAnalysisHash(&run))
 	}
+	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+	if revoked {
+		s.hub.Broadcast(incidentResolvedEvent(incidentID, status, resolvedAt, nil))
+	}
+	s.notifySlackAnalysis(run, incidentID)
 }
 
 func isTerminalAgentFailure(analysis AgentAnalysisResponse) bool {

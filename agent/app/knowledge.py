@@ -1354,8 +1354,11 @@ def _validate_runtime_failure_modes(
                 raise ValueError(f"package {package_id} has an invalid symptom")
             name = symptom.get("name", symptom.get("symptom"))
             keywords = symptom.get("keywords")
-            actions = symptom.get("actions", [])
-            actions_ko = symptom.get("actions_ko", [])
+            # `null` and "absent" both mean "no confirmed remediation" here: a
+            # matcher-only symptom is a legitimate package. Payloads already
+            # stored with an explicit null must stay promotable.
+            actions = symptom.get("actions") or []
+            actions_ko = symptom.get("actions_ko") or []
             if not isinstance(name, str) or not name.strip():
                 raise ValueError(f"package {package_id} symptom requires name")
             if not isinstance(keywords, list) or not keywords or not all(
@@ -1453,6 +1456,10 @@ def _validate_runtime_probe_template_ids(
     for family, raw_ids in value.items():
         if not isinstance(family, str) or not family.strip():
             raise ValueError(f"package {package_id} probe template family must be a string")
+        if raw_ids is None:
+            # Same reading as symptom actions: an explicit null is "no probes",
+            # not a malformed package.
+            continue
         if not isinstance(raw_ids, list) or not all(
             isinstance(template_id, str) and _PROBE_TEMPLATE_ID_RE.fullmatch(template_id)
             for template_id in raw_ids
