@@ -35,6 +35,7 @@ function incidentDetail(overrides: Record<string, unknown> = {}): DetailState {
       severity: 'warning',
       status: 'firing',
       fired_at: '2026-07-14T00:00:00Z',
+      last_activity_at: '2026-07-14T00:00:00Z',
       alert_count: 0,
       is_analyzing: false,
       analysis_run_id: 'ANL-selected',

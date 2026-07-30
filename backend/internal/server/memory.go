@@ -442,12 +442,17 @@ func (s *Store) MarkAnalyzing(incidentID string, analyzing bool) {
 }
 
 // BeginAnalyzing flags the incident and alert as analyzing so the dashboard can
-// render an in-progress state for the whole lifecycle.
+// render an in-progress state for the whole lifecycle, and records the start as
+// incident activity. Starting an analysis IS activity, so the ordinary
+// newest-activity-first order floats the row the operator is waiting on — the
+// incident list needs no separate analyzing-first sort branch.
 func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
+	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if incident := s.incidents[incidentID]; incident != nil {
 		incident.IsAnalyzing = true
+		incident.AnalysisActivityAt = now
 		s.persistIncidentLocked(incident)
 	}
 	if alert := s.alerts[alertID]; alert != nil {
@@ -456,19 +461,11 @@ func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
 	}
 }
 
-// BeginManualAnalysis marks a dashboard-triggered reanalysis in progress while
-// keeping the last good RCA visible until a fresh result replaces it.
+// BeginManualAnalysis marks a dashboard-triggered reanalysis in progress. The
+// last good RCA stays visible because CreateAnalysisRunIfAllowed keeps it on the
+// reused run, not because this does anything different from BeginAnalyzing.
 func (s *Store) BeginManualAnalysis(incidentID string, alertID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if incident := s.incidents[incidentID]; incident != nil {
-		incident.IsAnalyzing = true
-		s.persistIncidentLocked(incident)
-	}
-	if alert := s.alerts[alertID]; alert != nil {
-		alert.IsAnalyzing = true
-		s.persistAlertLocked(alert)
-	}
+	s.BeginAnalyzing(incidentID, alertID)
 }
 
 // ApplyFallbackAnalysisIfAbsent implements the overwrite policy for failed runs:

@@ -17,6 +17,8 @@ export type IncidentFilterState = {
   status: IncidentStatusFilter;
   severity: IncidentSeverityFilter;
   finalDecision: IncidentDecisionFilter;
+  sort: 'activity' | 'started';
+  order: 'asc' | 'desc';
 };
 
 export type AlertFilterState = {
@@ -161,6 +163,8 @@ export const DEFAULT_INCIDENT_FILTERS: IncidentFilterState = {
   status: 'all',
   severity: 'all',
   finalDecision: 'all',
+  sort: 'activity',
+  order: 'desc',
 };
 
 export const DEFAULT_ALERT_FILTERS: AlertFilterState = {

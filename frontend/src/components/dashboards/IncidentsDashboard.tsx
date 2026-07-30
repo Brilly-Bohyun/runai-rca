@@ -1,4 +1,4 @@
-import { Archive, CheckSquare, MoreHorizontal, RotateCcw, Trash2, X } from 'lucide-react';
+import { Archive, ArrowDown, ArrowUp, CheckSquare, ChevronsUpDown, MoreHorizontal, RotateCcw, Trash2, X } from 'lucide-react';
 import { type MouseEvent, useEffect, useMemo, useState } from 'react';
 
 import { type BulkIncidentAction, type IncidentView } from '../../api';
@@ -65,6 +65,30 @@ export function IncidentsDashboard({
 
   const updateFilter = <K extends keyof IncidentFilterState>(key: K, value: IncidentFilterState[K]) => {
     onFilterChange({ ...filters, [key]: value });
+  };
+  // Clicking the active column flips direction; a new column starts newest-first.
+  const toggleSort = (sort: IncidentFilterState['sort']) => {
+    onFilterChange({
+      ...filters,
+      sort,
+      order: filters.sort === sort && filters.order === 'desc' ? 'asc' : 'desc',
+    });
+  };
+  const SortHeader = ({ sort, label }: { sort: IncidentFilterState['sort']; label: string }) => {
+    const active = filters.sort === sort;
+    const Icon = !active ? ChevronsUpDown : filters.order === 'asc' ? ArrowUp : ArrowDown;
+    return (
+      <th aria-sort={!active ? 'none' : filters.order === 'asc' ? 'ascending' : 'descending'}>
+        <button
+          type="button"
+          className={`sort-header ${active ? 'is-active' : ''}`}
+          onClick={() => toggleSort(sort)}
+        >
+          <span>{label}</span>
+          <Icon size={12} aria-hidden="true" />
+        </button>
+      </th>
+    );
   };
   const toggleSelected = (id: string) => {
     setSelectedIDs((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
@@ -151,7 +175,8 @@ export function IncidentsDashboard({
                   />
                 </th>
                 <th>Alerts</th>
-                <th>Started</th>
+                <SortHeader sort="started" label="Started" />
+                <SortHeader sort="activity" label="Last activity" />
                 <th>Actions</th>
               </tr>
             </thead>
@@ -189,6 +214,7 @@ export function IncidentsDashboard({
                   <td><FinalDecision approvedAt={incident.user_approved_at} /></td>
                   <td>{incident.alert_count}</td>
                   <td>{formatTime(incident.fired_at)}</td>
+                  <td>{formatTime(incident.last_activity_at)}</td>
                   <td>
                     <IncidentRowActions
                       incident={incident}

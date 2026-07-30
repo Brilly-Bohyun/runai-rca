@@ -1015,6 +1015,42 @@ tbody tr:active td {
   line-height: 1.15;
 }
 
+/* Sortable header: same affordance as .column-filter, minus the select overlay. */
+.sort-header {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.28rem;
+  min-height: 1.5rem;
+  padding: 0;
+  border: 0;
+  border-radius: 0.35rem;
+  background: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.sort-header span {
+  line-height: 1.15;
+}
+
+.sort-header svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.sort-header:hover,
+.sort-header:focus-visible,
+.sort-header.is-active {
+  color: var(--nvidia-dark);
+}
+
+.sort-header.is-active svg {
+  color: var(--nvidia);
+}
+
 .column-filter select {
   position: absolute;
   inset: 0;
@@ -1061,7 +1097,7 @@ tbody tr:active td {
 }
 
 .incidents-table th:nth-child(2) {
-  width: 32%;
+  width: 26%;
 }
 
 .incidents-table th:nth-child(3),
@@ -1074,15 +1110,17 @@ tbody tr:active td {
 }
 
 .incidents-table th:nth-child(6) {
-  width: 7%;
+  width: 6%;
 }
 
-.incidents-table th:nth-child(7) {
-  width: 18%;
-}
-
+/* Started / Last activity: wide enough to hold "2026-07-30 15:47" on one line. */
+.incidents-table th:nth-child(7),
 .incidents-table th:nth-child(8) {
-  width: 9%;
+  width: 14%;
+}
+
+.incidents-table th:nth-child(9) {
+  width: 6%;
 }
 
 .alerts-table th:nth-child(1) {
@@ -1958,6 +1996,36 @@ td span.occurrence-pill {
 .llm-model-list {
   display: grid;
   padding: 0 0.8rem 0.62rem;
+}
+
+/* Hypothetical vendor cost — same row grid as the real per-model spend above,
+   separated so it never reads as money actually spent. */
+.llm-hosted-estimate {
+  display: grid;
+  padding: 0.55rem 0.8rem 0.62rem;
+  border-top: 1px solid #e6e9ef;
+}
+
+.llm-hosted-estimate .compact-empty {
+  margin: 0.45rem 0 0;
+}
+
+.llm-hosted-estimate-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+/* The picker always has a vendor selected, so .column-filter's "a filter is
+   applied" dot would be permanently lit and mean nothing. */
+.llm-hosted-estimate-head .column-filter.is-active::after {
+  content: none;
+}
+
+/* Two columns here (model, cost) — the provider lives in the picker above. */
+.llm-hosted-estimate .llm-model-row {
+  grid-template-columns: minmax(0, 1fr) 4rem;
 }
 
 .llm-model-row {

@@ -17,6 +17,8 @@ export function incidentFiltersForAPI(filters: IncidentFilterState): IncidentQue
     status: filters.status === 'all' ? undefined : filters.status,
     severity: filters.severity === 'all' ? undefined : filters.severity,
     finalDecision: filters.finalDecision === 'all' ? undefined : filters.finalDecision,
+    sort: filters.sort,
+    order: filters.order,
   };
 }
 
