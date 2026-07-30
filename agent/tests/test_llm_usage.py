@@ -6,6 +6,7 @@ import pytest
 
 from app.collectors.http_json import JsonResponse
 from app.llm import (
+    _normalized_usage,
     begin_usage_tracking,
     complete,
     complete_with_error,
@@ -268,3 +269,71 @@ def test_usage_with_cost_estimates_by_model() -> None:
     assert enriched["by_model"]["smart"]["cost_usd"] == 4.0
     assert enriched["cost_usd"] == 4.3
     assert "cost_usd" not in usage["by_model"]["cheap"]
+
+
+@pytest.mark.asyncio
+async def test_llm_usage_reads_anthropic_style_token_names(monkeypatch) -> None:
+    """A provider answering input/output_tokens must not be recorded as zero tokens.
+
+    The direct transport read only the OpenAI spelling, so such a call was
+    counted while its tokens were dropped — indistinguishable downstream from a
+    call that genuinely used nothing, and it priced out at $0.
+    """
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.local",
+        llm_model="m",
+        llm_api_key="k",
+        analysis_deadline_seconds=0,
+    )
+
+    async def fake_post_json(**_kwargs):
+        return JsonResponse(
+            url="u",
+            status_code=200,
+            data={
+                "choices": [{"message": {"content": "done"}}],
+                "usage": {"input_tokens": 11, "output_tokens": 7},
+            },
+        )
+
+    async def fake_impl(request: AlertAnalysisRequest) -> AlertAnalysisResponse:
+        await complete(settings, system="s", user="u")
+        return AlertAnalysisResponse(
+            status="ok",
+            thread_ts=request.thread_ts,
+            analysis="a",
+            analysis_summary="s",
+            analysis_detail="d",
+            analysis_type="firing",
+            analysis_quality="high",
+            missing_data=[],
+            warnings=[],
+            capabilities={},
+            context={},
+            artifacts=[],
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    orch = AnalysisOrchestrator(settings)
+    orch._analyze_impl = fake_impl  # type: ignore[assignment]
+
+    response = await orch.analyze(
+        AlertAnalysisRequest(alert=Alert(labels={"alertname": "x"}, annotations={}))
+    )
+
+    usage = response.context["llm_usage"]
+    assert usage["prompt_tokens"] == 11
+    assert usage["completion_tokens"] == 7
+    # Derived when the provider omits it, so the token metric stays usable.
+    assert usage["total_tokens"] == 18
+    assert usage["calls_without_usage"] == 0
+
+
+def test_normalized_usage_flags_an_unreadable_object() -> None:
+    # Signals the measurement gap instead of inventing a zero.
+    assert _normalized_usage({"tokens": 5}) is None
+    assert _normalized_usage({"prompt_tokens": 4}) == {
+        "prompt_tokens": 4,
+        "total_tokens": 4,
+    }

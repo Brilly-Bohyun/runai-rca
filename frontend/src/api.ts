@@ -14,11 +14,16 @@ export type PageRequest = { limit: number; offset: number };
 export type PageResult<T> = { items: T[]; page: PageInfo };
 export type IncidentView = 'active' | 'archived' | 'trash';
 export type BulkIncidentAction = 'archive' | 'unarchive' | 'restore' | 'trash' | 'delete_permanently';
+export type IncidentSort = 'activity' | 'started';
 export type IncidentFilters = {
   status?: string;
   severity?: string;
   finalDecision?: string;
   search?: string;
+  // Sorting is server-side: the list is paged, so ordering the page in hand
+  // would only shuffle the rows already fetched.
+  sort?: IncidentSort;
+  order?: 'asc' | 'desc';
 };
 export type AlertFilters = {
   status?: string;
@@ -58,6 +63,8 @@ export async function fetchIncidents(page?: PageRequest, view: IncidentView = 'a
       severity: filters.severity,
       final_decision: filters.finalDecision,
       q: filters.search,
+      sort: filters.sort,
+      order: filters.order,
     })}`,
   );
   return pageResult(response, page);

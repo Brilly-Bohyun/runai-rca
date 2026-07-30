@@ -228,6 +228,11 @@ backend:
     analysisBackfillIntervalSeconds: 300
     analysisBackfillBatch: 10
     analysisBackfillRetryCooldownSeconds: 900
+    # USD->KRW for the LLM cost panel. Refreshed once at startup and daily at
+    # 09:00 KST. A cluster without egress keeps fxUsdKrwFallback for the life of
+    # the deployment, so set that to something current if the feed is blocked.
+    fxRateUrl: "https://api.frankfurter.dev/v1/latest?from=USD&to=KRW"
+    fxUsdKrwFallback: 1452
     # Semantic embedding for similar-incident search. Empty embeddingUrl => offline
     # hash fallback (default, language-agnostic but lexical). Point at an
     # OpenAI-compatible /embeddings endpoint for real multilingual (incl. Korean)

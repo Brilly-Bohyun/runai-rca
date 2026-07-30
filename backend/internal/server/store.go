@@ -226,6 +226,25 @@ type IncidentListFilter struct {
 	// incident's title/metadata AND its analysis content + member-alert
 	// labels/annotations (see incidentMatchesSearchLocked).
 	Search string
+	// Sort names the ordering column: "" / "activity" (effective activity, the
+	// default) or "started" (fired_at). It rides on the filter because sorting a
+	// server-paged list client-side would only order the page in hand.
+	Sort string
+	// Ascending flips the default newest-first order.
+	Ascending bool
+}
+
+const (
+	incidentSortActivity = "activity"
+	incidentSortStarted  = "started"
+)
+
+func validIncidentSort(value string) bool {
+	switch value {
+	case "", incidentSortActivity, incidentSortStarted:
+		return true
+	}
+	return false
 }
 
 type IncidentListCounts struct {
@@ -665,10 +684,14 @@ func (s *Store) ListIncidentsPage(limit, offset int, views ...string) ([]Inciden
 }
 
 func incidentActivityAt(inc *Incident) time.Time {
-	if inc.LatestActivityAt.After(inc.FiredAt) {
-		return inc.LatestActivityAt
+	latest := inc.FiredAt
+	if inc.LatestActivityAt.After(latest) {
+		latest = inc.LatestActivityAt
 	}
-	return inc.FiredAt
+	if inc.AnalysisActivityAt.After(latest) {
+		latest = inc.AnalysisActivityAt
+	}
+	return latest
 }
 
 func (s *Store) ListIncidentsPageFiltered(limit, offset int, view string, filter IncidentListFilter) ([]Incident, int) {
@@ -699,13 +722,19 @@ func (s *Store) ListIncidentsPageFilteredWithCounts(limit, offset int, view stri
 		}
 		ordered = append(ordered, incident)
 	}
-	// A running analysis is the one row an operator is waiting on, so it leads
-	// regardless of when it fired; everything else stays newest-activity-first.
+	// Newest activity first by default. A started analysis stamps
+	// AnalysisActivityAt (BeginAnalyzing), so the row the operator is waiting on
+	// leads on its own — and a genuinely newer firing can still overtake it,
+	// which an unconditional analyzing-first branch used to prevent.
+	key := incidentActivityAt
+	if filter.Sort == incidentSortStarted {
+		key = func(inc *Incident) time.Time { return inc.FiredAt }
+	}
 	sort.SliceStable(ordered, func(i, j int) bool {
-		if ordered[i].IsAnalyzing != ordered[j].IsAnalyzing {
-			return ordered[i].IsAnalyzing
+		if filter.Ascending {
+			return key(ordered[i]).Before(key(ordered[j]))
 		}
-		return incidentActivityAt(ordered[i]).After(incidentActivityAt(ordered[j]))
+		return key(ordered[i]).After(key(ordered[j]))
 	})
 	counts := IncidentListCounts{}
 	for _, incident := range ordered {
@@ -1363,6 +1392,7 @@ func (s *Store) LLMSpendStats(days int, now time.Time) LLMSpendStats {
 			}
 		}
 	}
+	stats.HostedEstimates = hostedCostEstimates(stats.PromptTokens, stats.CompletionTokens)
 	return stats
 }
 
@@ -1876,11 +1906,6 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 			if !s.persistAnalysisRunLocked(existing) {
 				*existing = before
 				return AnalysisRun{}, false
-			}
-			if incidentID != "" {
-				if incident := s.incidents[incidentID]; incident != nil && now.After(incident.LatestActivityAt) {
-					incident.LatestActivityAt = now
-				}
 			}
 			return cloneAnalysisRun(existing), true
 		}

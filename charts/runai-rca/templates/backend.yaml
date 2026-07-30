@@ -96,6 +96,10 @@ spec:
               value: {{ .Values.backend.env.analysisBackfillBatch | quote }}
             - name: ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS
               value: {{ .Values.backend.env.analysisBackfillRetryCooldownSeconds | quote }}
+            - name: FX_RATE_URL
+              value: {{ .Values.backend.env.fxRateUrl | quote }}
+            - name: FX_USD_KRW_FALLBACK
+              value: {{ .Values.backend.env.fxUsdKrwFallback | quote }}
             - name: EMBEDDING_URL
               value: {{ .Values.backend.env.embeddingUrl | quote }}
             - name: EMBEDDING_MODEL

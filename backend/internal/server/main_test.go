@@ -1624,6 +1624,95 @@ func TestSimilarIncidentsFallBackToSparseWithoutDatabase(t *testing.T) {
 	}
 }
 
+func TestSimilarIncidentsRankByDiagnosisNotAlertTitle(t *testing.T) {
+	// The reported failure: an OOM incident whose root cause matched a stored
+	// incident word for word ranked BELOW one that merely shared its alert
+	// title, because the query carried only the alert and the stored documents
+	// carried RCA text.
+	store := NewStore()
+	const oomRCA = "The container exceeded its memory limit and was OOMKilled; " +
+		"CrashLoopBackOff is the restart state that followed."
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "KubePodNotReady", "namespace": "default", "pod": "oom-test"},
+		Annotations: map[string]string{"summary": "Pod has been in a non-ready state for more than 15 minutes."},
+	}
+
+	// Shares the alert title, but was diagnosed as a scheduling problem.
+	seedApprovedMemoryIncidentForTest(store, "INC-same-title", time.Now().UTC())
+	sameTitle := &IncidentMemory{
+		IncidentID:      "INC-same-title",
+		Title:           "Pod has been in a non-ready state for more than 15 minutes.",
+		Labels:          map[string]string{"alertname": "KubePodNotReady", "namespace": "default"},
+		AnalysisSummary: "The scheduler could not place the pod: no node satisfied its resource request.",
+	}
+	sameTitle.Vector = textVector(memoryText(*sameTitle))
+	store.memories[sameTitle.IncidentID] = sameTitle
+
+	// Different alert title, same root cause.
+	seedApprovedMemoryIncidentForTest(store, "INC-same-cause", time.Now().UTC())
+	sameCause := &IncidentMemory{
+		IncidentID:      "INC-same-cause",
+		Title:           "Pod is crash looping.",
+		Labels:          map[string]string{"alertname": "KubePodCrashLooping", "namespace": "default"},
+		AnalysisSummary: oomRCA,
+	}
+	sameCause.Vector = textVector(memoryText(*sameCause))
+	store.memories[sameCause.IncidentID] = sameCause
+
+	// The query is what gets embedded, so this is where the asymmetry lived. The
+	// dense path scores it by pure cosine distance against documents built from
+	// memoryText — no label bonus — so a query that omits this incident's RCA
+	// can only rank by alert likeness, however good the embedding model is.
+	store.mu.RLock()
+	before := store.similarIncidentQueryLocked(alert, "INC-current")
+	store.mu.RUnlock()
+	if strings.Contains(before, "OOMKilled") {
+		t.Fatalf("unanalyzed incident has no RCA to query with: %q", before)
+	}
+
+	store.incidents["INC-current"] = &Incident{IncidentID: "INC-current", Status: "firing"}
+	store.analysisRuns["ANL-current"] = &AnalysisRun{
+		RunID:           "ANL-current",
+		Status:          "complete",
+		IncidentID:      "INC-current",
+		AnalysisSummary: oomRCA,
+	}
+	store.mu.RLock()
+	after := store.similarIncidentQueryLocked(alert, "INC-current")
+	store.mu.RUnlock()
+	if !strings.Contains(after, "OOMKilled") {
+		t.Fatalf("an analyzed incident must query with its own RCA: %q", after)
+	}
+	// Identity stays in the query so the two sides keep the same shape as
+	// memoryText (title + labels + RCA).
+	if !strings.Contains(after, "KubePodNotReady") {
+		t.Fatalf("alert identity must survive alongside the RCA: %q", after)
+	}
+	// With the RCA present, the matching diagnosis now shares far more terms
+	// with the query than the shared title does.
+	queryVector := textVector(after)
+	causeScore := cosineSimilarity(queryVector, sameCause.Vector)
+	titleScore := cosineSimilarity(queryVector, sameTitle.Vector)
+	if causeScore <= titleScore {
+		t.Fatalf("matching root cause scored %.3f, shared title %.3f — diagnosis must win", causeScore, titleScore)
+	}
+}
+
+func TestAlertSearchTextOmitsThePodName(t *testing.T) {
+	// Pod names are ephemeral, so they are query noise: a rerun of the same
+	// workload never repeats them.
+	text := alertSearchText(Alert{
+		Labels: map[string]string{"alertname": "KubePodNotReady", "workload": "trainer", "pod": "trainer-7d9f8c6b5-x2k4p"},
+	})
+	if strings.Contains(text, "trainer-7d9f8c6b5-x2k4p") {
+		t.Fatalf("pod name must not reach the search text: %q", text)
+	}
+	if !strings.Contains(text, "trainer") {
+		t.Fatalf("workload identity must survive: %q", text)
+	}
+}
+
 func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	store := NewStore()
 	priorAlert := Alert{
@@ -3440,7 +3529,8 @@ func TestAdHocFingerprintIsContentDerived(t *testing.T) {
 
 func TestIncidentListPutsAnalyzingFirst(t *testing.T) {
 	// A running analysis is the row the operator is waiting on, so it leads even
-	// when a newer incident fired after it.
+	// when a newer incident fired after it — carried by the activity stamp
+	// BeginAnalyzing writes, not by a special analyzing-first sort branch.
 	store := NewStore()
 	mk := func(fingerprint string, ago time.Duration) *AlertRecord {
 		_, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: fingerprint}, Alert{
@@ -3452,7 +3542,7 @@ func TestIncidentListPutsAnalyzingFirst(t *testing.T) {
 		return record
 	}
 	old := mk("older", 2*time.Hour)
-	mk("newer", 1*time.Minute)
+	newer := mk("newer", 1*time.Minute)
 
 	items, _ := store.ListIncidentsPageFiltered(50, 0, "", IncidentListFilter{})
 	if len(items) != 2 || items[0].IncidentID != old.IncidentID {
@@ -3472,5 +3562,101 @@ func TestIncidentListPutsAnalyzingFirst(t *testing.T) {
 	}
 	if !items[0].IsAnalyzing || items[1].IsAnalyzing {
 		t.Fatalf("unexpected analyzing flags: %+v", items)
+	}
+
+	// The lead is a timestamp, not a pin: activity that lands after the analysis
+	// started is the more urgent row and overtakes it.
+	store.incidents[newer.IncidentID].LatestActivityAt = time.Now().UTC().Add(time.Minute)
+	items, _ = store.ListIncidentsPageFiltered(50, 0, "", IncidentListFilter{})
+	if items[0].IncidentID != newer.IncidentID {
+		t.Fatalf("activity after the analysis started must lead, got %q first", items[0].IncidentID)
+	}
+}
+
+func TestHostedCostEstimatesPriceInputAndOutputSeparately(t *testing.T) {
+	// Output tokens cost several times more than input on every vendor, so a
+	// single blended rate would understate the estimate badly.
+	got := hostedCostEstimates(1_000_000, 1_000_000)
+	byModel := map[string]float64{}
+	for _, estimate := range got {
+		byModel[estimate.Model] = estimate.CostUSD
+	}
+	// Claude Opus 5 lists at $5 in / $25 out per 1M tokens.
+	if want := 30.0; byModel["Claude Opus 5"] != want {
+		t.Fatalf("Claude Opus 5 estimate = %v, want %v", byModel["Claude Opus 5"], want)
+	}
+	if len(got) != len(hostedRates) {
+		t.Fatalf("expected one estimate per rate row, got %d of %d", len(got), len(hostedRates))
+	}
+	for _, estimate := range hostedCostEstimates(0, 0) {
+		if estimate.CostUSD != 0 {
+			t.Fatalf("no tokens must estimate to zero, got %+v", estimate)
+		}
+	}
+}
+
+func TestIncidentListSortsByRequestedColumn(t *testing.T) {
+	// "started" must order by fired_at even when later activity says otherwise —
+	// the whole point of the sortable header is to escape the activity order.
+	store := NewStore()
+	mk := func(name string, ago time.Duration) *AlertRecord {
+		_, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: name}, Alert{
+			Status:      "firing",
+			Labels:      map[string]string{"alertname": name},
+			Fingerprint: name,
+			StartsAt:    time.Now().UTC().Add(-ago).Format(time.RFC3339),
+		})
+		return record
+	}
+	oldest := mk("oldest", 90*24*time.Hour)
+	newest := mk("newest", time.Minute)
+	// The oldest incident is the most recently active, so activity and started
+	// order disagree — exactly the case the screenshot showed.
+	store.BeginAnalyzing(oldest.IncidentID, oldest.AlertID)
+
+	order := func(filter IncidentListFilter) []string {
+		items, _ := store.ListIncidentsPageFiltered(50, 0, "", filter)
+		ids := make([]string, 0, len(items))
+		for _, item := range items {
+			ids = append(ids, item.IncidentID)
+		}
+		return ids
+	}
+	if got := order(IncidentListFilter{}); got[0] != oldest.IncidentID {
+		t.Fatalf("default order must lead with newest activity, got %v", got)
+	}
+	if got := order(IncidentListFilter{Sort: incidentSortStarted}); got[0] != newest.IncidentID {
+		t.Fatalf("started desc must lead with the newest firing, got %v", got)
+	}
+	if got := order(IncidentListFilter{Sort: incidentSortStarted, Ascending: true}); got[0] != oldest.IncidentID {
+		t.Fatalf("started asc must lead with the oldest firing, got %v", got)
+	}
+}
+
+func TestIncidentWireActivityDoesNotMoveTheFlapAnchor(t *testing.T) {
+	// The dashboard column must carry the value the list is ordered by, but the
+	// STORED LatestActivityAt anchors the flapping-correlation window and has to
+	// stay alert-only — folding analysis time into it splits grouped workloads.
+	store := NewStore()
+	_, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "g"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "KubePodCrashLooping", "namespace": "monitoring", "pod": "loki-read-0"},
+		Fingerprint: "fp",
+		StartsAt:    time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339),
+	})
+	anchor := store.incidents[record.IncidentID].LatestActivityAt
+
+	store.BeginAnalyzing(record.IncidentID, record.AlertID)
+
+	stored := store.incidents[record.IncidentID]
+	if !stored.LatestActivityAt.Equal(anchor) {
+		t.Fatalf("analysis start moved the flapping anchor: %v -> %v", anchor, stored.LatestActivityAt)
+	}
+	items, _ := store.ListIncidentsPageFiltered(50, 0, "", IncidentListFilter{})
+	if len(items) != 1 {
+		t.Fatalf("expected 1 incident, got %d", len(items))
+	}
+	if !items[0].LatestActivityAt.Equal(stored.AnalysisActivityAt) {
+		t.Fatalf("wire activity %v should be the analysis start %v", items[0].LatestActivityAt, stored.AnalysisActivityAt)
 	}
 }

@@ -150,6 +150,9 @@ export type Incident = {
   severity: string;
   status: string;
   fired_at: string;
+  // The value the incident list is ordered by: the latest of firing, alert
+  // resolution, and analysis start.
+  last_activity_at: string;
   resolved_at?: string | null;
   user_approved_at?: string | null;
   archived_at?: string | null;
@@ -228,10 +231,24 @@ export type LLMSpendDay = LLMSpendBucket & {
   date: string;
 };
 
+export type HostedCostEstimate = {
+  provider: string;
+  model: string;
+  cost_usd: number;
+};
+
+export type FXRate = {
+  usd_krw: number;
+  usd_krw_at: string;
+  usd_krw_is_fallback: boolean;
+};
+
 export type LLMSpendStats = LLMSpendBucket & {
   days: number;
   by_model: Record<string, LLMSpendBucket>;
   daily: LLMSpendDay[];
+  hosted_estimates: HostedCostEstimate[];
+  fx: FXRate;
 };
 
 export type KPIBucket = {

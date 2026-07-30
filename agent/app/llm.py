@@ -253,13 +253,14 @@ async def complete_with_error(
         # Bound uncapped calls: a reasoning model with no ceiling thinks until
         # the per-call timeout and starves the rest of the analysis deadline.
         max_tokens = default_cap
-    # NAT owns only the default app model; explicit stage model overrides stay on HTTP.
-    # A NAT reply with no usable text falls back to the direct HTTP path (owner
-    # decision after the langchain validation run: one empty reply must not
-    # silently degrade the whole analysis to the deterministic English report).
-    # The warning names WHY it was empty (finish_reason / shape) so the pod log
-    # finally tells the truth instead of a blind "no reply".
-    nat_failure = ""
+    # NAT owns the default app model. Direct HTTP below serves the calls NAT is
+    # not wired for — a stage model override, or no NAT client injected at all.
+    #
+    # An unusable NAT reply is NOT retried over HTTP (owner decision
+    # 2026-07-30). Repeating the same generation on a second transport mostly
+    # burns the shared analysis deadline, and it made every failure ambiguous:
+    # two transports, two error strings, one composite message. NAT's own error
+    # is now the answer, and the warning names why it was unusable.
     if _nat_client.get() is not None and selected_model == settings.llm_model:
         text, nat_error = await _complete_with_nat_client(
             settings,
@@ -271,16 +272,15 @@ async def complete_with_error(
         )
         if text:
             return text, None
-        nat_failure = nat_error or "NAT returned no usable content without a diagnostic"
+        detail = nat_error or "NAT returned no usable content without a diagnostic"
         _log.warning(
-            "NAT LLM reply unusable "
-            "(purpose=%s, model=%s, requested_max_tokens=%s; %s); "
-            "retrying via direct HTTP",
+            "NAT LLM reply unusable (purpose=%s, model=%s, requested_max_tokens=%s; %s)",
             purpose or "unspecified",
             selected_model,
             max_tokens if max_tokens is not None else "provider-default",
-            nat_error,
+            detail,
         )
+        return None, detail
     payload: dict[str, Any] = {
         "model": selected_model,
         "messages": [
@@ -297,13 +297,6 @@ async def complete_with_error(
     # deterministic fallback. One retry with a doubled cap turns that into a
     # slower success; the analysis deadline still bounds the total spend.
     doubled = False
-    if nat_failure and "finish_reason=length" in nat_failure and payload.get("max_tokens"):
-        # NAT already proved this cap feeds the whole budget to reasoning —
-        # repeating the identical generation over HTTP is a guaranteed second
-        # failure that only burns the shared deadline. Start doubled instead;
-        # this consumes the one length retry.
-        payload["max_tokens"] = int(payload["max_tokens"]) * 2
-        doubled = True
     for budget_round in range(2):
         response = None
         for attempt in range(3):
@@ -328,14 +321,10 @@ async def complete_with_error(
         if not response.ok:
             _record_failed_call(selected_model)
             detail = " ".join(str(response.error or "").split())[:200]
-            return None, _with_nat_failure(
-                f"HTTP {response.status_code or '?'} {detail}".strip(), nat_failure
-            )
+            return None, f"HTTP {response.status_code or '?'} {detail}".strip()
         if not isinstance(response.data, dict):
             _record_failed_call(selected_model)
-            return None, _with_nat_failure(
-                "unexpected response shape from the LLM endpoint", nat_failure
-            )
+            return None, "unexpected response shape from the LLM endpoint"
         _record_usage(selected_model, response.data)
         if (
             not doubled
@@ -361,27 +350,14 @@ async def complete_with_error(
                     cleaned = strip_reasoning(content)
                     if cleaned:
                         return cleaned, None
-                    return None, _with_nat_failure(
-                        "reasoning-only reply (no content outside <think>)",
-                        nat_failure,
-                    )
+                    return None, "reasoning-only reply (no content outside <think>)"
                 reasoning_content = message.get("reasoning_content")
                 if isinstance(reasoning_content, str):
                     salvaged = parse_last_json_object(reasoning_content)
                     if salvaged is not None:
                         return json.dumps(salvaged, ensure_ascii=False), None
-        return None, _with_nat_failure(
-            _openai_unusable_reply_error(response.data), nat_failure
-        )
-    return None, _with_nat_failure(
-        _openai_unusable_reply_error(response.data), nat_failure
-    )
-
-
-def _with_nat_failure(direct_error: str, nat_failure: str) -> str:
-    if not nat_failure:
-        return direct_error
-    return f"nat: {nat_failure}; direct_http: {direct_error}"
+        return None, _openai_unusable_reply_error(response.data)
+    return None, _openai_unusable_reply_error(response.data)
 
 
 def _openai_finish_reason(data: dict[str, Any]) -> Any:
@@ -496,6 +472,35 @@ def _langchain_text(response: Any) -> str:
     return ""
 
 
+# OpenAI-style names are the common case, but OpenAI-compatible servers vary and
+# some answer with the Anthropic-style input/output spelling. Reading only one
+# spelling counted the call and silently dropped its tokens, which reads
+# downstream as a genuine zero rather than a missing measurement — and a zero
+# token count prices out as a zero cost estimate.
+_USAGE_ALIASES: dict[str, tuple[str, ...]] = {
+    "prompt_tokens": ("prompt_tokens", "input_tokens"),
+    "completion_tokens": ("completion_tokens", "output_tokens"),
+    "total_tokens": ("total_tokens",),
+}
+
+
+def _normalized_usage(raw: dict[str, Any]) -> dict[str, int] | None:
+    """Map one provider usage object onto our key names, or None if it carries none."""
+    usage: dict[str, int] = {}
+    for key, aliases in _USAGE_ALIASES.items():
+        for name in aliases:
+            value = raw.get(name)
+            if isinstance(value, int | float):
+                usage[key] = int(value)
+                break
+    if not usage:
+        return None
+    # Providers that report only the two halves still get a usable total.
+    if "total_tokens" not in usage:
+        usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+    return usage
+
+
 def _langchain_usage(response: Any) -> dict[str, int] | None:
     for raw in (
         getattr(response, "usage_metadata", None),
@@ -505,15 +510,8 @@ def _langchain_usage(response: Any) -> dict[str, int] | None:
     ):
         if not isinstance(raw, dict):
             continue
-        prompt = raw.get("prompt_tokens", raw.get("input_tokens"))
-        completion = raw.get("completion_tokens", raw.get("output_tokens"))
-        total = raw.get("total_tokens")
-        usage = {
-            "prompt_tokens": int(prompt or 0),
-            "completion_tokens": int(completion or 0),
-            "total_tokens": int(total or (int(prompt or 0) + int(completion or 0))),
-        }
-        if any(usage.values()):
+        usage = _normalized_usage(raw)
+        if usage and any(usage.values()):
             return usage
     return None
 
@@ -533,13 +531,24 @@ def _record_usage(model: str, data: dict[str, Any]) -> None:
         _log.info("llm usage", extra={"llm_usage": {"model": model, "calls_without_usage": 1}})
         return
 
+    usage = _normalized_usage(raw)
+    if usage is None:
+        # A usage object we cannot read is a measurement gap, not zero tokens —
+        # count it as such so the dashboard shows the shortfall instead of
+        # reporting confident zeros.
+        current["calls_without_usage"] += 1
+        bucket["calls_without_usage"] += 1
+        _log.warning(
+            "llm usage object carried no recognizable token counts",
+            extra={"llm_usage": {"model": model, "keys": sorted(raw)}},
+        )
+        return
+
     per_call: dict[str, Any] = {"model": model}
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        value = raw.get(key)
-        if isinstance(value, int | float):
-            current[key] += int(value)
-            bucket[key] += int(value)
-            per_call[key] = int(value)
+    for key, value in usage.items():
+        current[key] += value
+        bucket[key] += value
+        per_call[key] = value
     _log.info("llm usage", extra={"llm_usage": per_call})
 
 

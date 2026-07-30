@@ -22,11 +22,12 @@ import {
   dominantCapability,
   formatCompactNumber,
   formatDurationMinutes,
+  formatKRW,
   formatTime,
   formatUSD,
   normalizeAgentStatus,
 } from '../../utils/formatters';
-import { Metric, PanelHeader } from '../common/UiParts';
+import { ColumnFilter, Metric, PanelHeader } from '../common/UiParts';
 
 const TrendChartCanvas = lazy(() => import('../../TrendChartCanvas'));
 
@@ -263,6 +264,20 @@ function RecurrencePanel({ rows, stats }: { rows: RecurringIncidentRow[]; stats:
 }
 
 function LLMSpendPanel({ stats }: { stats: LLMSpendStats | null }) {
+  const estimates = stats?.hosted_estimates ?? [];
+  // Providers come from the backend rate table, so a new vendor row shows up in
+  // the picker without a frontend change.
+  const providers = useMemo(
+    () => [...new Set(estimates.map((estimate) => estimate.provider))],
+    [estimates],
+  );
+  const [provider, setProvider] = useState('');
+  const activeProvider = providers.includes(provider) ? provider : providers[0] ?? '';
+  const providerEstimates = estimates.filter((estimate) => estimate.provider === activeProvider);
+  const rate = stats?.fx?.usd_krw ?? 0;
+  // Say so when the rate is the configured default rather than today's feed —
+  // otherwise a blocked cluster shows a stale number that looks live.
+  const fxNote = stats?.fx?.usd_krw_is_fallback ? ' (fallback rate)' : '';
   const models = Object.entries(stats?.by_model ?? {})
     .sort(([, left], [, right]) => (right.cost_usd || right.total_tokens) - (left.cost_usd || left.total_tokens))
     .slice(0, 3);
@@ -296,6 +311,32 @@ function LLMSpendPanel({ stats }: { stats: LLMSpendStats | null }) {
         ))}
         {models.length === 0 && <p className="empty compact-empty">No LLM usage</p>}
       </div>
+      {providers.length > 0 && (stats?.total_tokens ?? 0) > 0 && (
+        <div className="llm-hosted-estimate">
+          <div className="llm-hosted-estimate-head">
+            <span className="compact-panel-title">Estimated</span>
+            <ColumnFilter
+              label={activeProvider}
+              value={activeProvider}
+              options={providers.map((name) => ({ label: name, value: name }))}
+              onChange={setProvider}
+            />
+          </div>
+          {providerEstimates.map((estimate) => (
+            <div className="llm-model-row" key={estimate.model}>
+              <span>{estimate.model}</span>
+              <em>
+                {formatUSD(estimate.cost_usd)}
+                {rate > 0 && ` (${formatKRW(estimate.cost_usd, rate)})`}
+              </em>
+            </div>
+          ))}
+          <p className="compact-empty">
+            Same token volume at vendor list prices. Local inference is $0.
+            {rate > 0 && ` USD/KRW ${Math.round(rate).toLocaleString('ko-KR')}${fxNote}.`}
+          </p>
+        </div>
+      )}
     </section>
   );
 }

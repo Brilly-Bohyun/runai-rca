@@ -157,8 +157,19 @@ type Incident struct {
 	// AnalysisSeq counts Slack-notified analyses (1 = Initial Analysis). Runs
 	// are updated in place on re-analysis, so rows can't be counted instead.
 	AnalysisSeq      int       `json:"analysis_seq"`
-	SlackThreadTS    string    `json:"-"`
-	LatestActivityAt time.Time `json:"-"`
+	SlackThreadTS string `json:"-"`
+	// LatestActivityAt is alert activity (fire/resolve). On the wire it carries
+	// the EFFECTIVE activity the list is ordered by — cloneIncident folds in
+	// FiredAt and AnalysisActivityAt — so the dashboard column can explain the
+	// order instead of the sort running on fields the browser never sees.
+	// Internal readers (the flapping window) must use the stored incident.
+	LatestActivityAt time.Time `json:"last_activity_at"`
+	// AnalysisActivityAt stamps when an analysis last STARTED, and exists only to
+	// order the incident list. It is deliberately NOT folded into
+	// LatestActivityAt: that field anchors the flapping-correlation window
+	// (shouldReuseIncidentForAlertLocked), so re-dating it to analysis time makes
+	// a staggered-StartsAt workload fail the window check and split into twins.
+	AnalysisActivityAt time.Time `json:"-"`
 }
 
 type AlertRecord struct {
@@ -241,6 +252,58 @@ type LLMSpendStats struct {
 	LLMSpendBucket
 	ByModel map[string]LLMSpendBucket `json:"by_model"`
 	Daily   []LLMSpendDay             `json:"daily"`
+	// HostedEstimates prices the SAME token volume against hosted vendors. The
+	// local LLM really is $0; this answers "what would this have cost".
+	HostedEstimates []HostedCostEstimate `json:"hosted_estimates"`
+	FX              FXRate               `json:"fx"`
+}
+
+// HostedCostEstimate is one vendor model's price for the measured token volume.
+type HostedCostEstimate struct {
+	Provider string  `json:"provider"`
+	Model    string  `json:"model"`
+	CostUSD  float64 `json:"cost_usd"`
+}
+
+// hostedRates are published list prices in USD per 1M tokens, input then output.
+// Vendors reprice often, so these are estimate inputs rather than billing
+// figures — recheck them against each vendor's pricing page:
+//
+//	Anthropic  platform.claude.com/docs/en/pricing
+//	OpenAI     developers.openai.com/api/docs/pricing
+//	Google     ai.google.dev/gemini-api/docs/pricing
+//
+// Prices below were read from those pages on 2026-07-30. Google's Pro tier
+// charges more above a 200k-token prompt; the cheaper band is used here because
+// a single RCA call never reaches it.
+var hostedRates = []struct {
+	Provider string
+	Model    string
+	In       float64
+	Out      float64
+}{
+	{"Anthropic", "Claude Opus 5", 5.00, 25.00},
+	{"Anthropic", "Claude Sonnet 5", 3.00, 15.00},
+	{"Anthropic", "Claude Haiku 4.5", 1.00, 5.00},
+	{"OpenAI", "GPT-5.6 Sol", 5.00, 30.00},
+	{"OpenAI", "GPT-5.6 Terra", 2.50, 15.00},
+	{"OpenAI", "GPT-5.6 Luna", 1.00, 6.00},
+	{"Google", "Gemini 3.1 Pro", 2.00, 12.00},
+	{"Google", "Gemini 3.6 Flash", 1.50, 7.50},
+	{"Google", "Gemini 3.5 Flash-Lite", 0.30, 2.50},
+}
+
+func hostedCostEstimates(promptTokens, completionTokens int) []HostedCostEstimate {
+	const perMillion = 1_000_000.0
+	out := make([]HostedCostEstimate, 0, len(hostedRates))
+	for _, rate := range hostedRates {
+		out = append(out, HostedCostEstimate{
+			Provider: rate.Provider,
+			Model:    rate.Model,
+			CostUSD: (float64(promptTokens)*rate.In + float64(completionTokens)*rate.Out) / perMillion,
+		})
+	}
+	return out
 }
 
 type KPIBucket struct {
@@ -291,6 +354,9 @@ type Server struct {
 	backfillRetryCooldown time.Duration
 	trashRetention        time.Duration
 	slack                 *SlackNotifier
+	fxRateURL             string
+	fxMu                  sync.RWMutex
+	fx                    FXRate
 }
 
 const (
@@ -385,6 +451,7 @@ func Run() {
 	go server.runTrashPurge(ctx)
 	go server.runSlackDeliveryRetry(ctx)
 	go server.runSlackSocketMode(ctx)
+	go server.runFXRefresh(ctx)
 
 	go func() {
 		log.Printf("Run:AI RCA backend listening on :%s", port)
@@ -466,9 +533,27 @@ func NewServer() *Server {
 		backfillInterval:      time.Duration(getenvInt("ANALYSIS_BACKFILL_INTERVAL_SECONDS", 300)) * time.Second,
 		backfillBatch:         backfillBatch,
 		backfillRetryCooldown: time.Duration(getenvInt("ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS", 900)) * time.Second,
-		trashRetention:        time.Duration(trashRetentionDays) * 24 * time.Hour,
-		slack:                 NewSlackNotifierFromEnv(),
+		trashRetention: time.Duration(trashRetentionDays) * 24 * time.Hour,
+		slack:          NewSlackNotifierFromEnv(),
+		// ECB reference rates, no API key. The .dev/v1 host is where the older
+		// frankfurter.app URL redirects — naming it directly skips the hop. A
+		// cluster without egress keeps the configured fallback so the won
+		// figures still render, flagged as a fallback in the UI.
+		fxRateURL: getenv("FX_RATE_URL", "https://api.frankfurter.dev/v1/latest?from=USD&to=KRW"),
+		fx:        FXRate{USDKRW: fallbackUSDKRW(), Fallback: true},
 	}
+}
+
+// fallbackUSDKRW is the rate used until the first successful fetch, and for the
+// lifetime of a deployment that cannot reach the feed at all. The default is a
+// recent observed rate, not a floor — a blocked cluster should override it.
+func fallbackUSDKRW() float64 {
+	const recentObservedRate = 1452 // 2026-07-29, ECB reference
+	rate := getenvInt("FX_USD_KRW_FALLBACK", recentObservedRate)
+	if rate <= 0 {
+		rate = recentObservedRate
+	}
+	return float64(rate)
 }
 
 func (s *Server) routes() http.Handler {
@@ -568,6 +653,12 @@ func (s *Server) handleIncidentList(w http.ResponseWriter, r *http.Request) {
 		Severity:      strings.TrimSpace(r.URL.Query().Get("severity")),
 		FinalDecision: strings.TrimSpace(r.URL.Query().Get("final_decision")),
 		Search:        strings.TrimSpace(r.URL.Query().Get("q")),
+		Sort:          strings.TrimSpace(r.URL.Query().Get("sort")),
+		Ascending:     r.URL.Query().Get("order") == "asc",
+	}
+	if !validIncidentSort(filter.Sort) {
+		writeError(w, http.StatusBadRequest, "invalid incident sort")
+		return
 	}
 	if !validIncidentStatusFilter(filter.Status) {
 		writeError(w, http.StatusBadRequest, "invalid incident status filter")
@@ -631,7 +722,11 @@ func (s *Server) handleLLMSpendStats(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, envelope(s.store.LLMSpendStats(days, time.Now().UTC())))
+	stats := s.store.LLMSpendStats(days, time.Now().UTC())
+	// The rate travels once and the dashboard multiplies, so every dollar figure
+	// on the panel converts against the same number.
+	stats.FX = s.fxRate()
+	writeJSON(w, http.StatusOK, envelope(stats))
 }
 
 func (s *Server) handleKPIStats(w http.ResponseWriter, r *http.Request) {
@@ -995,6 +1090,9 @@ func cloneIncident(in *Incident) *Incident {
 		return nil
 	}
 	out := *in
+	// Only clones leave the store, so folding here makes every serialization
+	// agree with the list order without ever touching the stored field.
+	out.LatestActivityAt = incidentActivityAt(in)
 	return &out
 }
 

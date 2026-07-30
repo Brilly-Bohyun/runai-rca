@@ -203,12 +203,40 @@ type IncidentMemory struct {
 
 func (s *Store) SimilarIncidentsForAlert(alert Alert, incidentID string, limit int) []SimilarIncident {
 	limit = capSimilarIncidentLimit(limit)
-	if results, ok := s.dbSearchSimilarIncidents(alertSearchText(alert), incidentID, limit); ok && len(results) > 0 {
+	// Read the query text under a brief lock and release it before searching:
+	// embedding and pgvector are network I/O and must never run under the store
+	// lock.
+	s.mu.RLock()
+	query := s.similarIncidentQueryLocked(alert, incidentID)
+	s.mu.RUnlock()
+	if results, ok := s.dbSearchSimilarIncidents(query, incidentID, limit); ok && len(results) > 0 {
 		return results
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.similarIncidentsLocked(alert, incidentID, limit)
+}
+
+// similarIncidentQueryLocked builds the search text the way memoryText builds
+// the stored document, so the two sides are comparable.
+//
+// Querying with the alert alone made the panel rank by how alike the ALERTS
+// look: the stored document carries the other incident's RCA, but the query
+// carried none of this incident's, so an identical alertname outscored an
+// identical root cause — the OOM incident whose diagnosis matched word for word
+// lost to one that only shared a title. Once this incident has an RCA of its
+// own, compare diagnosis to diagnosis. Before analysis lands, the alert is all
+// there is.
+func (s *Store) similarIncidentQueryLocked(alert Alert, incidentID string) string {
+	parts := []string{alertSearchText(alert)}
+	if run := s.latestAnalysisRunForIncidentLocked(incidentID); run != nil {
+		for _, value := range []string{run.AnalysisSummary, run.AnalysisDetail} {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				parts = append(parts, trimmed)
+			}
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int) []FeedbackHint {
@@ -442,12 +470,17 @@ func (s *Store) MarkAnalyzing(incidentID string, analyzing bool) {
 }
 
 // BeginAnalyzing flags the incident and alert as analyzing so the dashboard can
-// render an in-progress state for the whole lifecycle.
+// render an in-progress state for the whole lifecycle, and records the start as
+// incident activity. Starting an analysis IS activity, so the ordinary
+// newest-activity-first order floats the row the operator is waiting on — the
+// incident list needs no separate analyzing-first sort branch.
 func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
+	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if incident := s.incidents[incidentID]; incident != nil {
 		incident.IsAnalyzing = true
+		incident.AnalysisActivityAt = now
 		s.persistIncidentLocked(incident)
 	}
 	if alert := s.alerts[alertID]; alert != nil {
@@ -456,19 +489,11 @@ func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
 	}
 }
 
-// BeginManualAnalysis marks a dashboard-triggered reanalysis in progress while
-// keeping the last good RCA visible until a fresh result replaces it.
+// BeginManualAnalysis marks a dashboard-triggered reanalysis in progress. The
+// last good RCA stays visible because CreateAnalysisRunIfAllowed keeps it on the
+// reused run, not because this does anything different from BeginAnalyzing.
 func (s *Store) BeginManualAnalysis(incidentID string, alertID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if incident := s.incidents[incidentID]; incident != nil {
-		incident.IsAnalyzing = true
-		s.persistIncidentLocked(incident)
-	}
-	if alert := s.alerts[alertID]; alert != nil {
-		alert.IsAnalyzing = true
-		s.persistAlertLocked(alert)
-	}
+	s.BeginAnalyzing(incidentID, alertID)
 }
 
 // ApplyFallbackAnalysisIfAbsent implements the overwrite policy for failed runs:
@@ -617,7 +642,7 @@ func (s *Store) similarIncidentsLocked(
 	limit int,
 ) []SimilarIncident {
 	limit = capSimilarIncidentLimit(limit)
-	queryVector := textVector(alertSearchText(alert))
+	queryVector := textVector(s.similarIncidentQueryLocked(alert, currentIncidentID))
 	results := make([]SimilarIncident, 0, len(s.memories))
 	for _, memory := range s.memories {
 		if memory == nil {
@@ -713,12 +738,19 @@ func dedupeSimilarByIncident(results []SimilarIncident, limit int) []SimilarInci
 }
 
 func alertSearchText(alert Alert) string {
-	parts := []string{
+	// incidentTitle falls back to the summary annotation, so those two are the
+	// same sentence whenever one exists — emitting both counted the alert's
+	// boilerplate twice, weighting it against the text that actually tells two
+	// incidents apart.
+	parts := dedupeStrings(
 		incidentTitle(alert),
 		severity(alert),
 		alert.Annotations["summary"],
 		alert.Annotations["description"],
-	}
+	)
+	// No "pod": pod names are ephemeral high-entropy tokens, so they add noise to
+	// the query without identifying anything a rerun would share. The workload
+	// labels carry the stable identity.
 	for _, key := range []string{
 		"alertname",
 		"cluster",
@@ -727,14 +759,31 @@ func alertSearchText(alert Alert) string {
 		"namespace",
 		"workload",
 		"workload_name",
-		"pod",
 		"node",
 	} {
 		if value := alert.Labels[key]; value != "" {
 			parts = append(parts, value)
 		}
 	}
-	return strings.Join(parts, " ")
+	return strings.Join(dedupeStrings(parts...), " ")
+}
+
+// dedupeStrings keeps the first occurrence of each non-empty value. Repeated
+// values are extra weight in a bag-of-words vector, never extra signal.
+func dedupeStrings(values ...string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func memoryText(memory IncidentMemory) string {
@@ -883,7 +932,9 @@ func cosineSimilarity(a, b map[string]float64) float64 {
 }
 
 func labelSimilarityBonus(alertLabels, memoryLabels map[string]string) float64 {
-	keys := []string{"alertname", "cluster", "project", "queue", "namespace", "workload", "pod"}
+	// No "pod" — an ephemeral name never repeats across occurrences, so it can
+	// only ever withhold the bonus from a genuine recurrence.
+	keys := []string{"alertname", "cluster", "project", "queue", "namespace", "workload"}
 	score := 0.0
 	for _, key := range keys {
 		if alertLabels[key] != "" && alertLabels[key] == memoryLabels[key] {

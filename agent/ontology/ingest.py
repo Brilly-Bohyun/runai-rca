@@ -434,7 +434,14 @@ def _replace_attr(
         score = confidence_score(new_value)
         if score is not None and etype in {"analysis_run", "evidence", "hypothesis", "root_cause"}:
             _replace_attr(tx, etype, key_attr, key_value, "confidence_score", score, quoted=False)
-    value = f'"{esc(str(new_value))}"' if quoted else str(new_value)
+    if quoted:
+        value = f'"{esc(str(new_value))}"'
+    elif isinstance(new_value, bool):
+        # TypeQL boolean literals are lowercase. Python's str(True) == "True" is a
+        # parse error, so an unquoted bool wrote a query the server always rejects.
+        value = "true" if new_value else "false"
+    else:
+        value = str(new_value)
     tx.query(
         f'match $x isa {etype}, has {key_attr} "{esc(key_value)}"; '
         f"insert $x has {attr} {value};"
