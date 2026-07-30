@@ -41,7 +41,14 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 		if result.IncidentResolved {
 			resolvedIncidentIDs[incident.IncidentID] = struct{}{}
 		}
-		if status(alert.Status) != "resolved" && s.autoAnalyzeAllowed(alert) {
+		// result.Changed is the store's own verdict that this webhook carried new
+		// information. A repeat_interval resend of a still-firing alert (same
+		// fingerprint, same StartsAt) sets it false — analyzing that again spends a
+		// full agent run on zero new evidence, and a completed re-analysis whose
+		// hash differs auto-revokes the operator's approval along with the
+		// evaluation reviews and knowledge derived from it. Retry of a genuinely
+		// failed analysis stays covered by backfillOnce, which has its own cooldown.
+		if result.Changed && status(alert.Status) != "resolved" && s.autoAnalyzeAllowed(alert) {
 			if _, queued := autoAlertIDs[record.AlertID]; !queued {
 				autoAlertIDs[record.AlertID] = struct{}{}
 				autoAlertOrder = append(autoAlertOrder, record.AlertID)
