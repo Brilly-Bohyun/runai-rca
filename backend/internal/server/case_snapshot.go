@@ -576,19 +576,24 @@ func (s *Store) revokeCaseSnapshotsLocked(incidentID string, revokedAt time.Time
 // run's evaluation reviews are deleted (they scored text that no longer
 // exists) and knowledge derived from them is withdrawn.
 func (s *Store) AutoRevokeSupersededApproval(incidentID, newAnalysisHash string) (string, *time.Time, bool) {
-	if strings.TrimSpace(newAnalysisHash) == "" {
-		return "", nil, false
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[incidentID]
 	if incident == nil || incident.UserApprovedAt == nil {
 		return "", nil, false
 	}
+	// An approval kept across a completed re-analysis is the one outcome that
+	// looks like a bug from the dashboard, so name the reason. Both branches are
+	// deliberate; without this the operator can only guess which one fired.
+	if strings.TrimSpace(newAnalysisHash) == "" {
+		log.Printf("kept approval for %s: the completed re-analysis reported no analysis_hash", incidentID)
+		return "", nil, false
+	}
 	snapshot := s.caseSnapshots[s.activeCaseByIncident[incidentID]]
 	if snapshot != nil && snapshot.AnalysisHash == newAnalysisHash {
 		// The re-analysis reproduced the approved content exactly; the
 		// approval still vouches for what the operator read.
+		log.Printf("kept approval for %s: re-analysis reproduced the approved analysis hash %s", incidentID, newAnalysisHash)
 		return "", nil, false
 	}
 	now := time.Now().UTC()
@@ -681,7 +686,13 @@ func cloneCaseSnapshotValue(value any) any {
 		}
 		return out
 	case []string:
-		return append([]string(nil), typed...)
+		// A clone must never change the value's JSON shape. append([]string(nil))
+		// with zero elements returns nil, which marshals to `null`: every
+		// action-less compiled symptom reached the Agent validator as
+		// "actions": null and was rejected ("symptom actions must be strings"),
+		// and an empty probe-ID list became "probe template IDs must be safe
+		// identifier strings". Empty in, empty array out.
+		return append(make([]string, 0, len(typed)), typed...)
 	case []Artifact:
 		return cloneArtifacts(typed)
 	case map[string][]map[string]string:

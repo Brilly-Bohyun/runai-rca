@@ -9,6 +9,25 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      # The fake driver reports every UPDATE as one affected row, so a status
+      # guard that matches nothing still looks like success there. A real server
+      # is the only thing that catches it (it shipped "could not persist
+      # knowledge candidate approval" to operators). Keep the image in lockstep
+      # with charts/runai-rca/values.yaml.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: rca
+          POSTGRES_PASSWORD: rca
+          POSTGRES_DB: rcatest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rca -d rcatest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -19,6 +38,8 @@ jobs:
         run: go vet ./...
       - name: Test
         working-directory: backend
+        env:
+          RCA_TEST_POSTGRES_DSN: postgres://rca:rca@localhost:5432/rcatest?sslmode=disable
         run: go test ./...
 
   agent:

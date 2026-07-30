@@ -429,3 +429,26 @@ def test_non_catalog_family_package_fails_validation() -> None:
 
     assert result["valid"] is False
     assert any("closed catalog" in str(error) for error in result.get("errors", []))
+
+
+def test_null_actions_and_probe_ids_validate_as_empty() -> None:
+    """A matcher-only package must stay promotable.
+
+    The backend serves candidate payloads that can carry `null` for an empty
+    action or probe list, and null means "none recorded" — not a malformed
+    package. Rejecting it made every candidate whose evaluation recorded no
+    effective action permanently unpromotable.
+    """
+    snapshot = _snapshot()
+    package = snapshot["packages"][0]
+    symptom = package["compiled"]["failure_modes"][0]["symptoms"][0]
+    symptom["actions"] = None
+    symptom["actions_ko"] = None
+    package["compiled"]["probe_template_ids"] = {"workload_runtime_error": None}
+
+    result = validate_runtime_knowledge(package)
+
+    assert result["valid"] is True, result["errors"]
+    compiled = result["normalized"]["failure_modes"]["workload_runtime_error"][0]
+    assert compiled["actions"] == []
+    assert compiled["actions_ko"] == []

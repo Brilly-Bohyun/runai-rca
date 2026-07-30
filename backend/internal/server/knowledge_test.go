@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1461,5 +1462,32 @@ func TestValidatorRejectedCandidateCanBeRetriedButOthersCannot(t *testing.T) {
 	}
 	if candidate.ValidationError != "" {
 		t.Fatalf("activation must clear the stale validator error, got %q", candidate.ValidationError)
+	}
+}
+
+// The Agent validator receives the candidate payload as JSON, and every read of
+// a candidate goes through cloneKnowledgeCandidate. A clone that turns an empty
+// action list into `null` made every matcher-only candidate unpromotable with
+// "symptom actions must be strings" — the validator reads null as "not a list".
+func TestServedCandidatePayloadKeepsEmptyListsAsArrays(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	confirmKnowledgeSnapshot(store, snapshot)
+	candidate := store.knowledgeCandidateForSnapshotLocked(snapshot)
+	if candidate == nil {
+		t.Fatal("snapshot produced no candidate")
+	}
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+
+	// Exactly what validateKnowledgeCandidate sends to the Agent.
+	served, ok := store.KnowledgeCandidate(candidate.CandidateID)
+	if !ok {
+		t.Fatal("candidate not readable")
+	}
+	compiled, _ := served.Payload["compiled"].(map[string]any)
+	body := string(mustJSON(compiled))
+	if !strings.Contains(body, `"actions":[]`) {
+		t.Fatalf("action-less symptom must serialize as an empty array, got %s", body)
 	}
 }
