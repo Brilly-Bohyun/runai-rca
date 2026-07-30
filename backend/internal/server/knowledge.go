@@ -1633,7 +1633,10 @@ func (s *Store) FailKnowledgeCandidateValidation(id, reason string) (KnowledgeCa
 	if candidate == nil {
 		return KnowledgeCandidate{}, errors.New("knowledge candidate not found")
 	}
-	if candidate.Status != knowledgeCandidateReady {
+	// A retry of an already-rejected candidate must be able to re-record the
+	// verdict: refusing it made the handler answer "could not persist knowledge
+	// validation failure" instead of the reason the operator has to act on.
+	if candidate.Status != knowledgeCandidateReady && candidate.Status != knowledgeCandidateValidationFailed {
 		return KnowledgeCandidate{}, errors.New("knowledge candidate is not ready for review")
 	}
 	if strings.TrimSpace(reason) == "" {
