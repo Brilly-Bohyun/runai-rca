@@ -64,6 +64,14 @@ from app.services.general_guidance import general_guidance_lines
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.query_memory import QueryMemory
+from app.services.remediation import (
+    fill_placeholders,
+    format_memory,
+    image_repository,
+    image_typo_hint,
+    memory_sizing_action,
+    parse_memory,
+)
 from app.services.root_cause_ranking import (
     FAMILIES,
     RankedCause,
@@ -4392,6 +4400,9 @@ def _detail_from(
         facets = _facets_line(root_cause_candidates[0], language)
         if facets:
             lines.append(facets)
+    # What the failing entity was configured with — the limit that was exceeded,
+    # the request no node could satisfy, the capacity a node ran out of.
+    lines.extend(_observed_configuration_lines(results, eligible_support_ids, language))
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
     lines.extend(
@@ -4435,6 +4446,7 @@ def _detail_from(
         allow_cause_specific_actions=allow_cause_specific_actions,
         language=language,
         self_check_next=self_check_next,
+        facts=_remediation_facts(results, eligible_support_ids, target),
     )
     if numbered:
         lines.extend(numbered)
@@ -4659,26 +4671,90 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
         return ""
     rendered_codes = ", ".join(str(code) for code in codes)
     roots = getattr(graph_fixes, "root_xids", None) or {}
-    chain = "; ".join(
-        dict.fromkeys(
-            f"XID {root} → XID {observed}"
-            for observed, root_list in sorted(roots.items())
-            for root in root_list
+    root_status = getattr(graph_fixes, "root_xid_status", {}) or {}
+    ordered_chains = [
+        " → ".join(f"XID {node}" for node in [*root_list, observed])
+        for observed, root_list in sorted(roots.items())
+        if root_status.get(observed, "ordered") == "ordered"
+    ]
+    unordered = [
+        (observed, root_list)
+        for observed, root_list in sorted(roots.items())
+        if root_status.get(observed) == "complete-but-unordered"
+    ]
+    statuses = set(root_status.values())
+    if "degraded" in statuses:
+        qualification = (
+            " Causal-chain lookup was degraded by a query failure; shown upstream XIDs "
+            "may not include the root."
         )
-    )
+        qualification_ko = " 인과 사슬 조회가 쿼리 실패로 불완전합니다."
+    else:
+        qualification = ""
+        qualification_ko = ""
     if language == "ko":
-        if chain:
+        if ordered_chains:
+            if unordered:
+                details = "; ".join(
+                    f"XID {observed}의 상류 장애(완전, 순서 미상): "
+                    + ", ".join(str(root) for root in root_list)
+                    for observed, root_list in unordered
+                )
+                return (
+                    f"- 관련 GPU 오류(XID): {rendered_codes} — "
+                    f"인과 사슬(뿌리→관측): {'; '.join(ordered_chains)}; {details}. "
+                    "근본 원인을 먼저 조치하세요."
+                )
             return (
-                f"- 관련 GPU 오류(XID): {rendered_codes} — 인과 사슬(뿌리→관측): {chain}. "
-                "뿌리 XID를 먼저 조치하세요."
+                f"- 관련 GPU 오류(XID): {rendered_codes} — "
+                f"인과 사슬(뿌리→관측): {'; '.join(ordered_chains)}. "
+                + (
+                    "뿌리 XID를 먼저 조치하세요."
+                    if not qualification_ko
+                    else qualification_ko.strip()
+                )
             )
-        return f"- 관련 GPU 오류(XID): {rendered_codes} — 세부 조치는 아래 권장 조치를 참고."
-    if chain:
+        if unordered:
+            details = "; ".join(
+                f"XID {observed}의 상류 장애(완전, 순서 미상): "
+                + ", ".join(str(root) for root in root_list)
+                for observed, root_list in unordered
+            )
+            return f"- 관련 GPU 오류(XID): {rendered_codes} — {details}. 근본 원인을 먼저 조치하세요."
+        return (
+            f"- 관련 GPU 오류(XID): {rendered_codes} — "
+            "세부 조치는 아래 권장 조치를 참고."
+            + qualification_ko
+        )
+    if ordered_chains:
+        if unordered:
+            details = "; ".join(
+                f"upstream faults of {observed} (complete, order unknown): "
+                + ", ".join(str(root) for root in root_list)
+                for observed, root_list in unordered
+            )
+            return (
+                f"- Related GPU errors (XID): {rendered_codes} — causal chain "
+                f"(root → observed): {'; '.join(ordered_chains)}; {details}. "
+                "Fix the origin first."
+            )
         return (
             f"- Related GPU errors (XID): {rendered_codes} — causal chain (root → observed): "
-            f"{chain}. Fix the root XID first."
+            f"{'; '.join(ordered_chains)}."
+            + (" Fix the root XID first." if not qualification else qualification)
         )
-    return f"- Related GPU errors (XID): {rendered_codes} — see the recommended actions below."
+    if unordered:
+        details = "; ".join(
+            f"upstream faults of {observed} (complete, order unknown): "
+            + ", ".join(str(root) for root in root_list)
+            for observed, root_list in unordered
+        )
+        return f"- Related GPU errors (XID): {rendered_codes} — {details}. Fix the origin first."
+    return (
+        f"- Related GPU errors (XID): {rendered_codes} — "
+        "see the recommended actions below."
+        + qualification
+    )
 
 
 def _xid_diagnostic_guidance_lines(
@@ -5393,6 +5469,76 @@ def _known_issue_cause_lines(
     return out
 
 
+_OOM_REASONS = frozenset({"OOMKilled"})
+_IMAGE_PULL_REASONS = frozenset(
+    {"ImagePullBackOff", "ErrImagePull", "InvalidImageName", "ErrImageNeverPull"}
+)
+
+
+def _remediation_facts(
+    results: list[CollectorResult],
+    eligible_evidence_ids: set[str] | None,
+    target: AnalysisTarget,
+) -> dict[str, str]:
+    """Observed values that make curated guidance executable for THIS incident.
+
+    Curated actions are family-level knowledge written with placeholders, and the
+    sizing advice for an OOMKill needs a number no catalogue can carry.  Both come
+    from the same eligible, target-verified typed artifacts the cause statement
+    uses, so a rendered command can never name a pod, image, or limit this run did
+    not actually observe.
+    """
+    facts = {
+        "namespace": target.namespace,
+        "pod": target.pod,
+        "node": target.node,
+        "workload": target.workload_name,
+        "workload_kind": target.workload_type,
+    }
+    facts = {key: value for key, value in facts.items() if value}
+    if not eligible_evidence_ids:
+        return facts
+    for result in results:
+        for item in result.artifacts:
+            if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
+                continue
+            payload = getattr(item, "result", None)
+            if getattr(item, "type", "") != "kubernetes_container_lifecycle":
+                continue
+            if not _typed_artifact_is_verified(payload):
+                continue
+            # The live Pod the collector actually read beats a stale alert label.
+            for key in ("pod", "namespace"):
+                if str(payload.get(key) or ""):
+                    facts[key] = str(payload[key])
+            for container in payload.get("containers", []):
+                if not isinstance(container, dict):
+                    continue
+                reasons = {
+                    str(state.get("reason") or "")
+                    for key in ("state", "lastTerminated")
+                    if isinstance(state := container.get(key), dict)
+                }
+                resources = container.get("resources")
+                resources = resources if isinstance(resources, dict) else {}
+                if reasons & _OOM_REASONS and "oom" not in facts:
+                    limits = resources.get("limits")
+                    requests = resources.get("requests")
+                    facts["oom"] = "true"
+                    facts["container"] = str(container.get("name") or "")
+                    if isinstance(limits, dict) and limits.get("memory"):
+                        facts["memory_limit"] = str(limits["memory"])
+                    if isinstance(requests, dict) and requests.get("memory"):
+                        facts["memory_request"] = str(requests["memory"])
+                if reasons & _IMAGE_PULL_REASONS and "image" not in facts:
+                    image = str(container.get("image") or "")
+                    if image:
+                        facts["image"] = image
+                        facts["repo"] = image_repository(image)
+                        facts.setdefault("container", str(container.get("name") or ""))
+    return {key: value for key, value in facts.items() if value}
+
+
 def _numbered_actions(
     plan: InvestigationPlan | None,
     graph_fixes: GraphRemediation | None,
@@ -5408,6 +5554,7 @@ def _numbered_actions(
     allow_cause_specific_actions: bool | None = None,
     language: str = "en",
     self_check_next: str = "",
+    facts: dict[str, str] | None = None,
 ) -> list[str]:
     """One deduped priority list: self-check and matched symptom first, then
     alert/component/known-issue and signature-specific graph guidance."""
@@ -5430,6 +5577,20 @@ def _numbered_actions(
     # disappear when Korean synthesis fails and the deterministic report wins.
     if self_check_next.strip():
         ordered.append(self_check_next)
+    # Sizing and spelling advice derived from the observed spec. The catalogue can
+    # only say "compare the limit with the working set"; these carry the actual
+    # values, so they lead the list — including under ``exclusive_actions``, whose
+    # curated text they quantify rather than contradict.
+    observed = facts or {}
+    if allow_cause_specific_actions:
+        ordered.extend(
+            line
+            for line in (
+                memory_sizing_action(observed, language),
+                image_typo_hint(observed, language),
+            )
+            if line
+        )
     if (
         allow_cause_specific_actions
         and symptom_matches[0:1]
@@ -5444,7 +5605,11 @@ def _numbered_actions(
             dict.fromkeys(
                 action
                 for raw in actions
-                if (action := _safe_line(raw, limit=420, masker=masker))
+                if (
+                    action := _safe_line(
+                        fill_placeholders(str(raw), observed), limit=420, masker=masker
+                    )
+                )
             )
         )
         return [f"{index}. {action}" for index, action in enumerate(rendered[:8], start=1)]
@@ -5488,7 +5653,12 @@ def _numbered_actions(
         # to crowd the exact symptom actions out of the eight-item report cap.
         # Keep only signature-specific graph fixes (XIDs) in executable actions;
         # symptom remediation below is selected from the observed evidence.
-        root_codes = {r for roots in graph_fixes.root_xids.values() for r in roots}
+        root_codes = {
+            root
+            for observed, roots in graph_fixes.root_xids.items()
+            if graph_fixes.root_xid_status.get(observed, "ordered") == "ordered"
+            for root in roots
+        }
         # Fix the ROOT of the causal chain before its downstream symptoms.
         for code in sorted(graph_fixes.xid_fixes, key=lambda c: (c not in root_codes, c)):
             if language == "ko":
@@ -5521,7 +5691,9 @@ def _numbered_actions(
     numbered: list[str] = []
     action_masker = build_masker(())
     for action in ordered:
-        action = _safe_line(action, limit=420, masker=action_masker)
+        action = _safe_line(
+            fill_placeholders(str(action), observed), limit=420, masker=action_masker
+        )
         if not action or action in seen:
             continue
         seen.add(action)
@@ -5808,7 +5980,7 @@ def _reason_specific_detail(
             reason, observations = deeper[0], [deeper]
         else:
             exit_code = next((item[2] for item in terminated if item[2] is not None), None)
-            return _restart_loop_detail(exit_code, language)
+            return _restart_loop_detail(exit_code, _observed_restarts(terminated), language)
     if reason == "CreateContainerConfigError":
         detail = _config_error_detail([item[1] for item in observations], language)
         return detail or _config_error_generic(language)
@@ -5821,24 +5993,22 @@ def _reason_specific_detail(
     if reason == "CreateContainerError":
         return _container_create_detail([item[1] for item in observations], language)
     if reason == "OOMKilled":
-        limit = _memory_limit(observations)
-        if language == "ko":
-            return "컨테이너가 메모리 limit을 초과해 커널이 OOM kill(exit 137) 했습니다" + (
-                f" (limit: {limit})." if limit else "."
-            )
-        return "The container exceeded its memory limit and the kernel OOM-killed it (exit 137)" + (
-            f" (limit: {limit})." if limit else "."
-        )
+        return _oom_detail(_memory_sizing(observations), language)
     if reason in {"Unschedulable", "SchedulingGated"}:
         detail = _scheduling_detail([item[1] for item in observations], language)
         return detail or _scheduling_error_generic(language)
     if reason in {"ImagePullBackOff", "ErrImagePull"}:
-        detail = _image_pull_detail([item[1] for item in observations], language)
-        return detail or _image_pull_generic(language)
+        observed = _observed_image(observations)
+        detail = _image_pull_detail([item[1] for item in observations], language, observed)
+        return detail or _image_pull_generic(language, observed)
     if reason == "InvalidImageName":
-        return _invalid_image_name_detail([item[1] for item in observations], language)
+        return _invalid_image_name_detail(
+            [item[1] for item in observations], language, _observed_image(observations)
+        )
     if reason == "ErrImageNeverPull":
-        return _never_pull_detail([item[1] for item in observations], language)
+        return _never_pull_detail(
+            [item[1] for item in observations], language, _observed_image(observations)
+        )
     return ""
 
 
@@ -5938,13 +6108,20 @@ def _typed_last_terminated_observations(
     return found
 
 
-def _typed_artifact_is_verified(payload: object) -> bool:
+def _scoped_present(payload: object) -> bool:
+    """A typed observation that actually happened inside the incident window."""
     observation = payload.get("observation") if isinstance(payload, dict) else None
     return bool(
         isinstance(observation, dict)
         and observation.get("polarity") == "present"
         and observation.get("coverage") == "scoped"
-        and observation.get("target_identity_verified") is True
+    )
+
+
+def _typed_artifact_is_verified(payload: object) -> bool:
+    observation = payload.get("observation") if isinstance(payload, dict) else None
+    return _scoped_present(payload) and bool(
+        isinstance(observation, dict) and observation.get("target_identity_verified") is True
     )
 
 
@@ -6035,8 +6212,27 @@ def _container_create_detail(messages: list[str], language: str) -> str:
     )
 
 
-def _restart_loop_detail(exit_code: object | None, language: str) -> str:
-    suffix = f" (exit {exit_code})" if exit_code is not None else ""
+def _observed_restarts(
+    observations: list[tuple[str, str, object | None, dict[str, Any]]],
+) -> int | None:
+    """Kubernetes' own restart counter for the target container."""
+    for _, _, _, source in observations:
+        container = source.get("container", {})
+        if isinstance(container, dict) and isinstance(container.get("restartCount"), int):
+            return int(container["restartCount"])
+    return None
+
+
+def _restart_loop_detail(
+    exit_code: object | None, restarts: int | None = None, language: str = "en"
+) -> str:
+    """"Restarting" without the counter reads the same at 2 restarts and at 400."""
+    facts = []
+    if exit_code is not None:
+        facts.append(f"exit {exit_code}")
+    if restarts:
+        facts.append(f"{restarts}회 재시작" if language == "ko" else f"{restarts} restarts")
+    suffix = f" ({', '.join(facts)})" if facts else ""
     return (
         f"컨테이너가 반복 재시작 중입니다{suffix}."
         if language == "ko"
@@ -6044,7 +6240,33 @@ def _restart_loop_detail(exit_code: object | None, language: str) -> str:
     )
 
 
-def _memory_limit(observations: list[tuple[str, str, object | None, dict[str, Any]]]) -> str:
+def _oom_detail(sizing: tuple[str, str, str], language: str) -> str:
+    """Name the configured ceiling and reservation that the kill happened under."""
+    container, limit, request = sizing
+    if language == "ko":
+        base = "컨테이너가 메모리 limit을 초과해 커널이 OOM kill(exit 137) 했습니다"
+        if not limit:
+            return f"{base}."
+        subject = f"컨테이너 `{container}`의 현재 설정은" if container else "현재 설정은"
+        reservation = f"request {request}" if request else "request 미설정"
+        return f"{base}. {subject} memory limit {limit}, {reservation}입니다."
+    base = "The container exceeded its memory limit and the kernel OOM-killed it (exit 137)"
+    if not limit:
+        return f"{base}."
+    subject = f"container `{container}` is" if container else "it is"
+    reservation = f"request {request}" if request else "no memory request"
+    return f"{base}. Currently {subject} configured with memory limit {limit} and {reservation}."
+
+
+def _memory_sizing(
+    observations: list[tuple[str, str, object | None, dict[str, Any]]],
+) -> tuple[str, str, str]:
+    """Observed ``(container, limits.memory, requests.memory)`` for the OOM detail.
+
+    An operator's first question on an OOMKill is which ceiling was exceeded and
+    what was reserved, so both sides of the spec are reported — a set limit with
+    an unset request is itself a finding.
+    """
     for _, _, _, source in observations:
         container = source.get("container", {})
         resources = container.get("resources") if isinstance(container, dict) else None
@@ -6052,26 +6274,40 @@ def _memory_limit(observations: list[tuple[str, str, object | None, dict[str, An
             resources = source.get("payload", {}).get("resources", {})
         limits = resources.get("limits") if isinstance(resources, dict) else None
         if isinstance(limits, dict) and limits.get("memory"):
-            return str(limits["memory"])
-    return ""
+            requests = resources.get("requests") if isinstance(resources, dict) else None
+            request = (
+                str(requests["memory"])
+                if isinstance(requests, dict) and requests.get("memory")
+                else ""
+            )
+            name = str(container.get("name") or "") if isinstance(container, dict) else ""
+            return name, str(limits["memory"]), request
+    return "", "", ""
 
 
 def _scheduling_detail(messages: list[str], language: str) -> str:
     for message in messages:
+        # One canned sentence per pattern loses the rest of the scheduler's own
+        # per-node tally ("2 Insufficient gpu, 3 didn't match affinity"), which is
+        # the whole breakdown an operator needs. Quote the verdict alongside it.
+        verdict = _scheduler_verdict(message, language)
         if "didn't match Pod's node affinity/selector" in message:
             return (
                 "구체적으로는 Pod의 nodeSelector/affinity 불일치로 스케줄링할 수 없습니다."
                 if language == "ko"
                 else "Specifically, a nodeSelector/affinity mismatch prevents scheduling."
-            )
+            ) + verdict
         if match := re.search(r"Insufficient (\S+)", message, re.IGNORECASE):
+            # The scheduler ends the sentence right after the resource name, and
+            # `nvidia.com/gpu` has internal dots — strip only trailing punctuation.
+            resource = match.group(1).rstrip(".,;")
             return (
-                f"구체적으로는 스케줄 가능한 노드의 {match.group(1)} 리소스가 부족합니다."
+                f"구체적으로는 스케줄 가능한 노드의 {resource} 리소스가 부족합니다."
                 if language == "ko"
                 else (
-                    f"Specifically, schedulable nodes have insufficient {match.group(1)} resources."
+                    f"Specifically, schedulable nodes have insufficient {resource} resources."
                 )
-            )
+            ) + verdict
         if re.search(r"untolerated taint", message, re.IGNORECASE):
             return (
                 "구체적으로는 Pod가 노드 taint를 tolerate하지 않아 스케줄링할 수 없습니다."
@@ -6080,8 +6316,24 @@ def _scheduling_detail(messages: list[str], language: str) -> str:
                     "Specifically, the Pod does not tolerate a node taint, so it cannot be "
                     "scheduled."
                 )
-            )
+            ) + verdict
     return ""
+
+
+_SCHEDULER_VERDICT = re.compile(r"\d+/\d+ nodes are available", re.IGNORECASE)
+
+
+def _scheduler_verdict(message: str, language: str) -> str:
+    """The scheduler's verbatim node tally, bounded — machine text, not a guess.
+
+    Quoted whole rather than cut at the first period: resource names carry dots
+    ("2 Insufficient nvidia.com/gpu"), and the tail of the tally is the part that
+    lists every OTHER reason nodes were rejected.
+    """
+    if not _SCHEDULER_VERDICT.search(message or ""):
+        return ""
+    verdict = _short_sentence(message, limit=220)
+    return f" (스케줄러: {verdict})" if language == "ko" else f" (scheduler: {verdict})"
 
 
 def _scheduling_error_generic(language: str) -> str:
@@ -6092,10 +6344,27 @@ def _scheduling_error_generic(language: str) -> str:
     )
 
 
-def _image_pull_detail(messages: list[str], language: str) -> str:
+def _observed_image(
+    observations: list[tuple[str, str, object | None, dict[str, Any]]],
+) -> str:
+    """The image the target container is configured to run, from typed state.
+
+    The kubelet Event message usually repeats the reference, but not in every
+    failure mode; the Pod's own container status always carries it, so the report
+    can name the exact reference instead of a bare "could not pull the image".
+    """
+    for _, _, _, source in observations:
+        container = source.get("container", {})
+        if isinstance(container, dict) and container.get("image"):
+            return str(container["image"])
+    return ""
+
+
+def _image_pull_detail(messages: list[str], language: str, observed: str = "") -> str:
     for message in messages:
         image = _IMAGE_REFERENCE.search(message)
-        suffix = f" ('{image.group(1)}')" if image else ""
+        reference = image.group(1) if image else observed
+        suffix = f" ('{reference}')" if reference else ""
         if re.search(r"not found|manifest unknown", message, re.IGNORECASE):
             return (
                 f"구체적으로는 이미지 또는 tag{suffix}가 registry에 없습니다."
@@ -6111,16 +6380,20 @@ def _image_pull_detail(messages: list[str], language: str) -> str:
     return ""
 
 
-def _image_pull_generic(language: str) -> str:
+def _image_pull_generic(language: str, observed: str = "") -> str:
+    suffix = f" '{observed}'" if observed else ""
     return (
-        "구체적으로는 registry에서 이미지를 pull하지 못했습니다."
+        f"구체적으로는 registry에서 이미지{suffix}를 pull하지 못했습니다."
         if language == "ko"
-        else "Specifically, Kubernetes could not pull the image from the registry."
+        else f"Specifically, Kubernetes could not pull image{suffix} from the registry."
     )
 
 
-def _invalid_image_name_detail(messages: list[str], language: str) -> str:
-    name = next((match.group(1) for message in messages if (match := _IMAGE_REFERENCE.search(message))), "")
+def _invalid_image_name_detail(messages: list[str], language: str, observed: str = "") -> str:
+    name = (
+        next((match.group(1) for message in messages if (match := _IMAGE_REFERENCE.search(message))), "")
+        or observed
+    )
     suffix = f" '{name}'" if name else ""
     return (
         f"구체적으로는 이미지 참조{suffix} 형식이 올바르지 않습니다."
@@ -6129,8 +6402,11 @@ def _invalid_image_name_detail(messages: list[str], language: str) -> str:
     )
 
 
-def _never_pull_detail(messages: list[str], language: str) -> str:
-    name = next((match.group(1) for message in messages if (match := _IMAGE_REFERENCE.search(message))), "")
+def _never_pull_detail(messages: list[str], language: str, observed: str = "") -> str:
+    name = (
+        next((match.group(1) for message in messages if (match := _IMAGE_REFERENCE.search(message))), "")
+        or observed
+    )
     suffix = f" '{name}'" if name else ""
     return (
         f"구체적으로는 imagePullPolicy Never인데 이미지{suffix}가 노드에 없습니다."
@@ -6175,6 +6451,464 @@ def _facets_line(top: RankedCause, language: str) -> str:
         return ""
     label = "분류(Facets)" if ko else "Facets"
     return f"- {label}: " + " · ".join(parts)
+
+
+# Typed artifacts that carry the configuration of the entity they type, in the
+# order the report reads: the container, then the Pod's demand, then the node.
+_CONFIGURATION_KINDS = (
+    "kubernetes_container_lifecycle",
+    "kubernetes_probe",
+    "kubernetes_pod_scheduling",
+    "runai_queue_quota",
+    "kubernetes_storage_claim",
+    "kubernetes_node_gpu_resources",
+    "kubernetes_node_condition",
+)
+# Node-scoped artifacts carry no ``target_identity_verified`` flag: they are only
+# ever collected for the alert's own node, so requiring one would drop every line.
+_NODE_SCOPED_CONFIGURATION_KINDS = frozenset(
+    {"kubernetes_node_condition", "kubernetes_node_gpu_resources"}
+)
+# Reasons that make a Bound claim's configuration worth printing: the claim is
+# not itself blocked, but the volume it points at failed to attach or mount.
+_STORAGE_EVENT_REASONS = frozenset(
+    {
+        "FailedAttachVolume",
+        "FailedBinding",
+        "FailedDetachVolume",
+        "FailedMount",
+        "ProvisioningFailed",
+        "VolumeResizeFailed",
+    }
+)
+# Resource keys worth printing, in the order an operator reads them. Anything
+# else the spec carries (hugepages, extended devices) stays in the artifact.
+_CONTAINER_RESOURCE_KEYS = ("memory", "cpu", "nvidia.com/gpu", "ephemeral-storage")
+_NODE_RESOURCE_KEYS = ("memory", "cpu", "ephemeral-storage", "pods", "nvidia.com/gpu")
+_CONFIG_LABELS = {
+    "en": {
+        "container": "Configured",
+        "probe": "Probe settings",
+        "requested": "Requested",
+        "storage": "Storage claim",
+        "requested_size": "requested",
+        "bound_size": "bound",
+        "gpu": "Node GPUs",
+        "gpu_free": "free",
+        "gpu_held": "held by scheduled Pods",
+        "gpu_pods": "pods",
+        "node": "Node capacity",
+        "selector": "nodeSelector",
+        "scheduler": "scheduler",
+        "runai_gpus": "Run:ai GPUs allocated/requested",
+        "runai_allocated": "Run:ai GPUs allocated",
+        "runai_fraction": "GPU fraction",
+        "runai_gang": "pod group requests",
+        "runai_pods": "gang",
+        "runai_type": "resource type",
+        "runai_state": "Run:ai status",
+        "quota": "Project quota",
+        "quota_gpu": "GPUs requested/quota",
+        "quota_allocated": "allocated",
+        "quota_limit": "hard limit",
+        "quota_weight": "over-quota weight",
+        "quota_pool": "node pool",
+        "unlimited": "unlimited",
+        "unset": "unset",
+    },
+    "ko": {
+        "container": "현재 설정",
+        "probe": "프로브 설정",
+        "requested": "요청 리소스",
+        "storage": "스토리지 클레임",
+        "requested_size": "요청",
+        "bound_size": "실제 bound",
+        "gpu": "노드 GPU",
+        "gpu_free": "여유",
+        "gpu_held": "기존 Pod 점유",
+        "gpu_pods": "Pod 수",
+        "node": "노드 용량",
+        "selector": "nodeSelector",
+        "scheduler": "scheduler",
+        "runai_gpus": "Run:ai GPU 할당/요청",
+        "runai_allocated": "Run:ai GPU 할당",
+        "runai_fraction": "GPU fraction",
+        "runai_gang": "pod group 요청",
+        "runai_pods": "gang",
+        "runai_type": "리소스 유형",
+        "runai_state": "Run:ai 상태",
+        "quota": "프로젝트 quota",
+        "quota_gpu": "GPU 요청/quota",
+        "quota_allocated": "할당",
+        "quota_limit": "상한",
+        "quota_weight": "over-quota 가중치",
+        "quota_pool": "node pool",
+        "unlimited": "무제한",
+        "unset": "미설정",
+    },
+}
+
+
+_BYTE_RESOURCE_KEYS = frozenset({"memory", "ephemeral-storage"})
+
+
+def _resource_display(key: str, value: object) -> str:
+    """Show `memory: 419430400` as 400Mi — a real spec writes plain bytes.
+
+    Only when the unit form is EXACT: ``format_memory`` rounds up for anything
+    that is not a whole binary unit, and a report must not restate a limit as a
+    number the spec does not contain.
+    """
+    text = str(value)
+    if key not in _BYTE_RESOURCE_KEYS or not text.isdigit():
+        return text
+    size = parse_memory(text)
+    if size is None:
+        return text
+    formatted = format_memory(size)
+    return formatted if parse_memory(formatted) == size else text
+
+
+def _resource_pairs(resources: object, keys: tuple[str, ...], unset: str) -> list[str]:
+    """``memory limit 512Mi / request 256Mi`` for every key the spec actually sets."""
+    if not isinstance(resources, dict):
+        return []
+    limits = resources.get("limits") if isinstance(resources.get("limits"), dict) else {}
+    requests = resources.get("requests") if isinstance(resources.get("requests"), dict) else {}
+    pairs: list[str] = []
+    for key in keys:
+        limit, request = limits.get(key), requests.get(key)
+        if not limit and not request:
+            continue
+        sides = [f"limit {_resource_display(key, limit)}" if limit else f"limit {unset}"]
+        sides.append(
+            f"request {_resource_display(key, request)}" if request else f"request {unset}"
+        )
+        pairs.append(f"{key} " + " / ".join(sides))
+    return pairs
+
+
+def _flat_resource_pairs(resources: object, keys: tuple[str, ...]) -> list[str]:
+    """``memory 128Gi`` for a single-sided mapping (node allocatable, requests)."""
+    if not isinstance(resources, dict):
+        return []
+    return [
+        f"{key} {_resource_display(key, resources[key])}" for key in keys if resources.get(key)
+    ]
+
+
+def _runai_allocation_parts(allocation: object, labels: dict[str, str]) -> list[str]:
+    """Run:ai's own accounting: what it asked the scheduler for, what it got.
+
+    ``allocated < requested`` is the pending workload's answer, and it is a
+    DIFFERENT limit from node capacity — a project can be at its quota while GPUs
+    sit free. Values are printed verbatim; the scheduler's vocabulary for the
+    resource type is its own.
+    """
+    if not isinstance(allocation, dict) or not allocation:
+        return []
+    parts: list[str] = []
+    requested = str(allocation.get("requested_gpus") or "")
+    # What the Pod holds NOW beats the assigned figure when both are present.
+    allocated = str(
+        allocation.get("current_allocated_gpus") or allocation.get("allocated_gpus") or ""
+    )
+    if requested and allocated:
+        parts.append(f"{labels['runai_gpus']} {allocated}/{requested}")
+    elif allocated:
+        # A fractional workload publishes no requested figure — only its slice.
+        parts.append(f"{labels['runai_allocated']} {allocated}")
+    if fraction := str(allocation.get("gpu_fraction") or ""):
+        devices = str(allocation.get("gpu_fraction_devices") or "")
+        suffix = f" × {devices}" if devices and devices != "1" else ""
+        parts.append(f"{labels['runai_fraction']} {fraction}{suffix}")
+    gang = str(allocation.get("podgroup_requested_gpus") or "")
+    if gang and gang != requested:
+        parts.append(f"{labels['runai_gang']} {gang}")
+    pending, running = (
+        str(allocation.get("pending_pods") or ""),
+        str(allocation.get("running_pods") or ""),
+    )
+    # A gang that is partly up is the classic Run:ai pending shape.
+    if pending and pending != "0":
+        parts.append(f"{labels['runai_pods']} {running or '0'} running / {pending} pending")
+    for key, label in (("resource_type", "runai_type"), ("runai_status", "runai_state")):
+        if value := str(allocation.get(key) or ""):
+            parts.append(f"{labels[label]} {value}")
+    return parts
+
+
+def _observed_configuration_lines(
+    results: list[CollectorResult],
+    eligible_evidence_ids: set[str] | None,
+    language: str,
+) -> list[str]:
+    """The problem entity's own settings, from the typed artifacts that named it.
+
+    Every mechanism sentence answers WHAT failed; an operator's next question is
+    always what the thing was configured with — the limit that was exceeded, the
+    request no node could satisfy, the capacity a node ran out of.  Each typed
+    artifact carries the configuration of the entity it types, so this walks the
+    same eligible, target-verified evidence and needs no per-family table.
+    """
+    if not eligible_evidence_ids:
+        return []
+    labels = _CONFIG_LABELS.get(language, _CONFIG_LABELS["en"])
+    unset = labels["unset"]
+    lines: dict[str, str] = {}
+    for result in results:
+        for item in result.artifacts:
+            if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
+                continue
+            kind = getattr(item, "type", "")
+            payload = getattr(item, "result", None)
+            if kind in lines or kind not in _CONFIGURATION_KINDS:
+                continue
+            # Pod-scoped artifacts prove they are about the alert Pod and use the
+            # full bar. Node-scoped ones are only ever collected for the alert's own
+            # node, so they carry no identity flag to check — requiring one would
+            # silently drop every node-capacity line.
+            verified = (
+                _scoped_present(payload)
+                if kind in _NODE_SCOPED_CONFIGURATION_KINDS
+                else _typed_artifact_is_verified(payload)
+            )
+            if verified and (line := _configuration_line(kind, payload, labels, unset)):
+                lines[kind] = line
+    # Two failures leave the responsible SETTING in a different artifact from the
+    # evidence, so they are resolved after the eligible walk and never override it:
+    # a not-Ready container has no causal container state (the kubelet reports an
+    # Unhealthy Event), and a Bound claim is not itself blocked when the volume it
+    # points at fails to attach or mount. In both cases the event must be eligible
+    # evidence; the settings are then read off the identity-verified spec.
+    if "kubernetes_probe" not in lines and _probe_failure_observed(
+        results, eligible_evidence_ids
+    ):
+        if line := _probe_configuration_line(results, labels):
+            lines["kubernetes_probe"] = line
+    # Quota is a policy object read live: it states the ceiling, never that the
+    # ceiling was hit in this window. The eligible unschedulable observation is
+    # what makes it relevant, exactly as the event does for probes and claims.
+    if "runai_queue_quota" not in lines and "kubernetes_pod_scheduling" in lines:
+        if line := _identity_verified_configuration_line(
+            results, "runai_queue_quota", labels, unset
+        ):
+            lines["runai_queue_quota"] = line
+    if "kubernetes_storage_claim" not in lines and _warning_event_observed(
+        results, eligible_evidence_ids, _STORAGE_EVENT_REASONS
+    ):
+        if line := _identity_verified_configuration_line(
+            results, "kubernetes_storage_claim", labels, unset
+        ):
+            lines["kubernetes_storage_claim"] = line
+    return [_safe_line(lines[kind], limit=400) for kind in _CONFIGURATION_KINDS if kind in lines]
+
+
+def _warning_event_observed(
+    results: list[CollectorResult],
+    eligible_evidence_ids: set[str],
+    reasons: frozenset[str],
+) -> bool:
+    """An eligible, target-verified Warning event with one of these exact reasons."""
+    for result in results:
+        for item in result.artifacts:
+            if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
+                continue
+            if getattr(item, "type", "") != "kubernetes_warning_events":
+                continue
+            payload = getattr(item, "result", None)
+            if not _typed_artifact_is_verified(payload):
+                continue
+            for event in payload.get("events", []):
+                if (
+                    isinstance(event, dict)
+                    and str(event.get("reason") or "") in reasons
+                    and event.get("target_identity_verified") is True
+                ):
+                    return True
+    return False
+
+
+def _probe_failure_observed(
+    results: list[CollectorResult], eligible_evidence_ids: set[str]
+) -> bool:
+    return _warning_event_observed(results, eligible_evidence_ids, frozenset({"Unhealthy"}))
+
+
+def _identity_verified_configuration_line(
+    results: list[CollectorResult], kind: str, labels: dict[str, str], unset: str
+) -> str:
+    """Render a config line from an identity-verified artifact of any polarity.
+
+    Used only when a separate eligible event already established the failure: the
+    artifact supplies WHAT the entity is configured with, never THAT it failed.
+    """
+    for result in results:
+        for item in result.artifacts:
+            if getattr(item, "type", "") != kind:
+                continue
+            payload = getattr(item, "result", None)
+            observation = payload.get("observation") if isinstance(payload, dict) else None
+            if not (
+                isinstance(observation, dict)
+                and observation.get("target_identity_verified") is True
+            ):
+                continue
+            if line := _configuration_line(kind, payload, labels, unset):
+                return line
+    return ""
+
+
+def _probe_configuration_line(results: list[CollectorResult], labels: dict[str, str]) -> str:
+    """Probe handler and thresholds from the identity-verified target Pod spec."""
+    for result in results:
+        for item in result.artifacts:
+            if getattr(item, "type", "") != "kubernetes_container_lifecycle":
+                continue
+            payload = getattr(item, "result", None)
+            observation = payload.get("observation") if isinstance(payload, dict) else None
+            if not (
+                isinstance(observation, dict)
+                and observation.get("target_identity_verified") is True
+            ):
+                continue
+            for container in payload.get("containers", []):
+                probes = container.get("probes") if isinstance(container, dict) else None
+                if not isinstance(probes, dict) or not probes:
+                    continue
+                rendered = [
+                    f"{kind} " + _probe_text(settings)
+                    for kind, settings in probes.items()
+                    if isinstance(settings, dict)
+                ]
+                name = str(container.get("name") or "")
+                subject = f"{labels['probe']} ({name})" if name else labels["probe"]
+                return f"- {subject}: " + " · ".join(rendered)
+    return ""
+
+
+def _probe_text(settings: dict[str, Any]) -> str:
+    handler = str(settings.get("handler") or "")
+    timings = ", ".join(
+        f"{_PROBE_LABELS[field]} {settings[field]}" + ("s" if field.endswith("Seconds") else "")
+        for field in _PROBE_LABELS
+        if settings.get(field) is not None
+    )
+    return f"{handler} ({timings})" if handler and timings else handler or timings
+
+
+# Kubernetes' own field names, shortened but not renamed — an operator has to
+# find these keys in the spec to change them.
+_PROBE_LABELS = {
+    "initialDelaySeconds": "delay",
+    "periodSeconds": "period",
+    "timeoutSeconds": "timeout",
+    "failureThreshold": "failures",
+    "successThreshold": "successes",
+}
+
+
+def _configuration_line(
+    kind: str, payload: dict[str, Any], labels: dict[str, str], unset: str
+) -> str:
+    if kind == "kubernetes_container_lifecycle":
+        for container in payload.get("containers", []):
+            if not isinstance(container, dict):
+                continue
+            pairs = _resource_pairs(container.get("resources"), _CONTAINER_RESOURCE_KEYS, unset)
+            if image := str(container.get("image") or ""):
+                pairs.append(f"image {image}")
+            if pairs:
+                name = str(container.get("name") or "")
+                subject = f"{labels['container']} ({name})" if name else labels["container"]
+                return f"- {subject}: " + " · ".join(pairs)
+        return ""
+    if kind == "kubernetes_pod_scheduling":
+        resources = payload.get("resources")
+        parts: list[str] = []
+        for name, spec in (resources or {}).items() if isinstance(resources, dict) else ():
+            requested = spec.get("requests") if isinstance(spec, dict) else None
+            if pairs := _flat_resource_pairs(requested, _CONTAINER_RESOURCE_KEYS):
+                parts.append(f"{name}: " + ", ".join(pairs))
+        selector = payload.get("node_selector")
+        if isinstance(selector, dict) and selector:
+            rendered = ", ".join(f"{key}={value}" for key, value in sorted(selector.items()))
+            parts.append(f"{labels['selector']} {rendered}")
+        if scheduler := str(payload.get("scheduler") or ""):
+            parts.append(f"{labels['scheduler']} {scheduler}")
+        parts.extend(_runai_allocation_parts(payload.get("runai_allocation"), labels))
+        return f"- {labels['requested']}: " + " · ".join(parts) if parts else ""
+    if kind == "runai_queue_quota":
+        parts = []
+        quota = str(payload.get("gpu_quota") or "")
+        requested = str(payload.get("gpu_requested") or "")
+        if quota or requested:
+            # requested/quota is the borrow question: above quota, the project is
+            # only served from idle capacity, and only if its weight allows it.
+            parts.append(
+                f"{labels['quota_gpu']} {requested or '?'}/{quota or labels['unlimited']}"
+            )
+        if allocated := str(payload.get("gpu_allocated") or ""):
+            parts.append(f"{labels['quota_allocated']} {allocated}")
+        if limit := str(payload.get("gpu_limit") or ""):
+            parts.append(f"{labels['quota_limit']} {limit}")
+        if weight := str(payload.get("gpu_over_quota_weight") or ""):
+            parts.append(f"{labels['quota_weight']} {weight}")
+        if pool := str(payload.get("node_pool") or ""):
+            parts.append(f"{labels['quota_pool']} {pool}")
+        if not parts:
+            return ""
+        queue = str(payload.get("queue") or "")
+        subject = f"{labels['quota']} ({queue})" if queue else labels["quota"]
+        return f"- {subject}: " + " · ".join(parts)
+    if kind == "kubernetes_storage_claim":
+        claim = str(payload.get("claim") or "")
+        parts = []
+        if requested := payload.get("requested_storage"):
+            actual = payload.get("actual_storage")
+            # A bound PV can be larger than the request; both numbers matter.
+            parts.append(
+                f"{labels['requested_size']} {requested}"
+                + (f" ({labels['bound_size']} {actual})" if actual and actual != requested else "")
+            )
+        for key, label in (("storage_class", "storageClass"), ("volume_mode", "volumeMode")):
+            if value := payload.get(key):
+                parts.append(f"{label} {value}")
+        if modes := payload.get("access_modes"):
+            parts.append(", ".join(str(mode) for mode in modes))
+        if phase := payload.get("phase"):
+            parts.append(f"phase {phase}")
+        if volume := payload.get("volume_name"):
+            parts.append(f"PV {volume}")
+        if not parts:
+            return ""
+        subject = f"{labels['storage']} ({claim})" if claim else labels["storage"]
+        return f"- {subject}: " + " · ".join(parts)
+    if kind == "kubernetes_node_gpu_resources":
+        # The comparison a pending GPU workload turns on: what the node can give
+        # against what the Pods already on it hold.
+        node = str(payload.get("node") or "")
+        free, allocatable = payload.get("gpu_estimated_free"), payload.get("gpu_allocatable")
+        if free is None or allocatable is None:
+            return ""
+        parts = [
+            f"{labels['gpu_free']} {free}/{allocatable}",
+            f"{labels['gpu_held']} {payload.get('gpu_requested')}",
+        ]
+        if capacity := payload.get("gpu_capacity"):
+            parts.append(f"capacity {capacity}")
+        if pods := payload.get("scheduled_non_terminal_pods"):
+            parts.append(f"{labels['gpu_pods']} {pods}")
+        subject = f"{labels['gpu']} ({node})" if node else labels["gpu"]
+        return f"- {subject}: " + " · ".join(parts)
+    if kind == "kubernetes_node_condition":
+        pairs = _flat_resource_pairs(payload.get("allocatable"), _NODE_RESOURCE_KEYS)
+        node = str(payload.get("node") or "")
+        if not pairs:
+            return ""
+        subject = f"{labels['node']} ({node})" if node else labels["node"]
+        return f"- {subject}: " + ", ".join(pairs)
+    return ""
 
 
 def _as_sentence(text: str) -> str:
@@ -6487,9 +7221,18 @@ def _knowledge_base_lines(
         )
     history = kg_context.get("location_history") or []
     if history:
+        history_truncated = bool(kg_context.get("location_history_truncated"))
+        rendered_history = min(len(history), 4)
+        history_count = (
+            f"At least {len(history)} past resolved incident(s)"
+            if history_truncated
+            else f"{len(history)} past resolved incident(s)"
+        )
         body.append(
-            f"- {len(history)} past resolved incident(s) at this alert's location "
-            "(different alerts, same node/namespace):"
+            f"- {history_count} at this alert's location "
+            "(different alerts, same node/namespace"
+            + (f"; showing {rendered_history}" if history_truncated else "")
+            + "):"
         )
         for item in history[:4]:
             where = active_masker.mask_text(str(item.get("where") or "location"))
@@ -6504,6 +7247,7 @@ def _knowledge_base_lines(
             )
             body.append(f"  - {incident_id} ({where}): {summary}")
     topology = kg_context.get("workload_topology") or {}
+    topology_status = kg_context.get("workload_topology_status") or ""
     if topology.get("services") or topology.get("pvcs"):
         parts = []
         if topology.get("services"):
@@ -6517,7 +7261,16 @@ def _knowledge_base_lines(
                 f" — PVC shared with {len(shared)} other workload(s): "
                 + ", ".join(shared[:5])
             )
+        if topology.get("shared_storage_truncated"):
+            searched = ", ".join(topology.get("shared_storage_pvcs") or [])
+            line += f" — shared-storage checked only on PVC(s) {searched}"
         body.append(active_masker.mask_text(line))
+    elif topology_status == "complete":
+        body.append("- Workload topology (stable identity): no Services or PVCs found.")
+    elif topology_status == "skipped_missing_namespace":
+        body.append(
+            "- Workload topology (stable identity): lookup skipped because the alert has no namespace."
+        )
     prior = kg_context.get("prior_incidents") or []
     if prior:
         body.append(f"- This alert recurred in {len(prior)} prior incident(s):")
@@ -6581,6 +7334,11 @@ def _kb_remediation_lines(
                 header,
                 *[f"  - {_safe_line(a, limit=360, masker=active_masker)}" for a in actions[:5]],
             ]
+        symptom_name = _safe_line(symptom.get("symptom"), limit=160, masker=active_masker)
+        return [
+            f"Matched symptom **{symptom_name}** ({_family_label(family)}); "
+            "family prior from the knowledge base (no verified action recorded)."
+        ]
     # No symptom keyword matched the observed evidence: don't dump a generic family
     # checklist as if it were a match — say so plainly.
     return ["- No closely-matching prior knowledge for this evidence yet."]

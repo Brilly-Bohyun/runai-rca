@@ -26,6 +26,7 @@ from app.collectors.base import AnalysisTarget
 from app.config import Settings
 from app.knowledge import _keyword_hits
 from app.ontology.typedb_client import TypeDBClient, escape_typeql
+from ontology.normalization import workload_uid
 
 _log = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ select $iid, $sum;
 # the storage blast radius.
 _WORKLOAD_SERVICES_QUERY = """
 match
-  $w isa workload, has name "{workload}";
+  $w isa workload, has workload_uid "{workload_uid}";
   (endpoint: $s, backend: $w) isa exposes;
   $s isa service, has name $sn;
 select $sn;
@@ -70,7 +71,7 @@ select $sn;
 
 _WORKLOAD_PVCS_QUERY = """
 match
-  $w isa workload, has name "{workload}";
+  $w isa workload, has workload_uid "{workload_uid}";
   (consumer: $w, storage: $p) isa uses_storage;
   $p isa pvc, has name $pn;
 select $pn;
@@ -80,8 +81,8 @@ _SHARED_PVC_QUERY = """
 match
   $p isa pvc, has name "{pvc}";
   (consumer: $o, storage: $p) isa uses_storage;
-  $o isa workload, has name $on;
-select $on;
+  $o isa workload, has name $on, has workload_uid $ou;
+select $on, $ou;
 """
 
 _PRIOR_QUERY = """
@@ -137,8 +138,10 @@ select $statement, $outcome;
 _FN_FIXES_FOR_XID = "match let $x in fixes_for_xid({code}); select $x;"
 _FN_TRIGGER_FOR_XID = "match let $x in trigger_for_xid({code}); select $x;"
 _FN_XIDS_FOR_GPU_MODEL = 'match let $x in xids_for_gpu_model("{model}"); select $x;'
-# Reverse leads_to: the root fault(s) that escalate INTO an observed XID.
+# Validated one-hop reverse leads_to, used only to order a complete recursive result.
 _FN_ROOT_XIDS_FOR = "match let $x in root_xids_for({code}); select $x;"
+# Transitive reverse leads_to: every fault that escalates INTO an observed XID.
+_FN_ROOT_XID_CHAIN_FOR = "match let $x in root_xid_chain_for({code}); select $x;"
 _FN_CAUSES_FOR_SYMPTOM = 'match let $x in causes_for_symptom("{symptom}"); select $x;'
 _FN_DEPENDENCIES_FOR_COMPONENT = 'match let $x in dependencies_for_component("{component}"); select $x;'
 _FN_CHECKS_FOR_COMPONENT_PATH = 'match let $x, $y in checks_for_component_path("{component}"); select $x, $y;'
@@ -182,6 +185,18 @@ match
   (symptom: $sy, remedy: $ac) isa resolved_by;
   $ac isa action, has statement $st;
 select $fam, $sn, $kw, $st;
+"""
+
+# Operator-confirmed promotions may establish a family before an action has
+# been verified.  They are still keyword-matchable family priors, just with no
+# remediation to render.
+_KNOWLEDGE_ACTIONLESS_QUERY = """
+match
+  $rc isa root_cause, has subtype $fam;
+  (symptom: $sy, cause: $rc) isa indicates;
+  $sy isa symptom, has name $sn, has keyword $kw;
+  not { (symptom: $sy, remedy: $ac) isa resolved_by; };
+select $fam, $sn, $kw;
 """
 
 _KNOWLEDGE_REASON_QUERY = """
@@ -230,8 +245,11 @@ class KGContext:
     prior_incidents: list[dict[str, str]] = field(default_factory=list)
     # Resolved incidents that fired at the same node/namespace, any alert name.
     location_history: list[dict[str, str]] = field(default_factory=list)
+    location_history_truncated: bool = False
     # Stable-identity Service/PVC attachments of the target workload.
     workload_topology: dict[str, Any] = field(default_factory=dict)
+    # Complete lookup, or why the topology lookup was skipped.
+    workload_topology_status: str = ""
     case_cards: list[dict[str, Any]] = field(default_factory=list)
     # family -> [{symptom, keywords[], actions[]}]  (curated knowledge layer)
     knowledge: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -249,7 +267,9 @@ class KGContext:
             "blast_radius_workload_names": self.blast_radius_workload_names,
             "prior_incidents": self.prior_incidents,
             "location_history": self.location_history,
+            "location_history_truncated": self.location_history_truncated,
             "workload_topology": self.workload_topology,
+            "workload_topology_status": self.workload_topology_status,
             "case_cards": self.case_cards,
             "knowledge": self.knowledge,
             "reasoning": self.reasoning,
@@ -312,7 +332,9 @@ async def enrich(
         blast_radius_workload_names=data["blast_radius_workload_names"],
         prior_incidents=data["prior_incidents"],
         location_history=data.get("location_history") or [],
+        location_history_truncated=bool(data.get("location_history_truncated")),
         workload_topology=data.get("workload_topology") or {},
+        workload_topology_status=str(data.get("workload_topology_status") or ""),
         case_cards=data["case_cards"],
         knowledge=data["knowledge"],
         reasoning=data["reasoning"],
@@ -331,10 +353,10 @@ class GraphRemediation:
     xid_fixes: dict[int, list[str]] = field(default_factory=dict)
     xid_triggers: dict[int, str] = field(default_factory=dict)
     model_xids: dict[str, list[int]] = field(default_factory=dict)
-    # observed XID -> root XID(s) that escalate into it, walked TRANSITIVELY back
-    # along the leads_to chain (nearest hop first). E.g. observing 154 with chain
-    # 144 -> 48 -> 154 yields [48, 144]: both the near cause and the true origin.
+    # observed XID -> complete transitive ancestors, in causal order when known.
     root_xids: dict[int, list[int]] = field(default_factory=dict)
+    # observed XID -> ordered, complete-but-unordered, or degraded.
+    root_xid_status: dict[int, str] = field(default_factory=dict)
     verified_actions: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -355,6 +377,7 @@ class GraphRemediation:
             "xid_triggers": {str(k): v for k, v in self.xid_triggers.items()},
             "model_xids": {k: v for k, v in self.model_xids.items()},
             "root_xids": {str(k): v for k, v in self.root_xids.items()},
+            "root_xid_status": {str(k): v for k, v in self.root_xid_status.items()},
             "verified_actions": self.verified_actions,
             "warnings": self.warnings,
         }
@@ -418,18 +441,14 @@ def _query_remediation(
             if triggers:
                 out.xid_triggers[code] = triggers[0]
             # Drill to the ROOT of the leads_to causal chain: which fault(s)
-            # escalate INTO this observed XID. root_xids_for is one hop back, so
-            # we walk it TRANSITIVELY (bounded BFS) — a chain 144 → 48 → 154 must
-            # surface 144 as the origin of 154, not just the intermediate 48.
+            # escalate INTO this observed XID. TypeDB's recursive function returns
+            # the full chain in one query, so a chain 144 → 48 → 154 surfaces both
+            # the intermediate 48 and true origin 144.
             # Surfacing the true root (and its fix) is the ontology's precision
-            # win: fix the origin, not the downstream symptom. root_xids_for is
-            # newer than the validated functions, so a query error must NOT wipe
-            # the fixes above: _root_chain_for isolates per-hop failures.
-            # TypeDB 3.11 rejects a recursive function whose input is also
-            # read from an attribute. Keep the traversal in Python instead:
-            # it is bounded, cycle-safe, and composes the validated one-hop
-            # root_xids_for function without a failed query per XID.
-            roots = _root_chain_for(run, code)
+            # win: fix the origin, not the downstream symptom. A query error must
+            # NOT wipe the fixes above: _root_chain_for isolates that failure.
+            roots, root_status = _root_chain_for(run, code)
+            out.root_xid_status[code] = root_status
             if roots:
                 out.root_xids[code] = roots
                 for root in roots:
@@ -449,47 +468,51 @@ def _query_remediation(
     return out
 
 
-# Cap the causal walk so a mis-loaded cyclic edge can never spin forever and the
-# root list stays operator-legible. Real XID chains are short (<= a few hops).
-_MAX_CHAIN_NODES = 16
-_MAX_CHAIN_DEPTH = 6
+def _root_chain_for(run: Any, code: int) -> tuple[list[int], str]:
+    """Complete ancestors, causally ordered only when every hop is available."""
+    try:
+        roots = {
+            int(value)
+            for value in _values(run(_FN_ROOT_XID_CHAIN_FOR.format(code=code)))
+            if _is_int(value)
+        }
+    except Exception:  # noqa: BLE001 - best-effort drill-down, never fatal
+        return [], "degraded"
+    roots.discard(code)
+    nodes = roots | {code}
+    try:
+        parents = {
+            node: {
+                int(value)
+                for value in _values(run(_FN_ROOT_XIDS_FOR.format(code=node)))
+                if _is_int(value)
+            }
+            & nodes
+            for node in sorted(nodes)
+        }
+    except Exception:  # noqa: BLE001 - completeness came from recursion
+        return sorted(roots), "complete-but-unordered"
 
+    children = {node: [] for node in nodes}
+    for child, direct_parents in parents.items():
+        for parent in direct_parents:
+            children[parent].append(child)
+    for direct_children in children.values():
+        direct_children.sort()
 
-def _root_chain_for(run: Any, code: int) -> list[int]:
-    """Transitive ancestors of `code` along leads_to, nearest hop first.
-
-    Repeatedly applies the validated one-hop `root_xids_for` backward from the
-    observed code, accumulating every fault that (directly or indirectly)
-    escalates into it. Cycle-safe (visited set) and bounded (`_MAX_CHAIN_*`).
-    Best-effort: a failed hop is skipped, never fatal.
-    """
     ordered: list[int] = []
-    seen: set[int] = {code}
-    frontier: list[int] = [code]
-    depth = 0
-    while frontier and depth < _MAX_CHAIN_DEPTH and len(ordered) < _MAX_CHAIN_NODES:
-        depth += 1
-        nxt: list[int] = []
-        for cur in frontier:
-            try:
-                rows = run(_FN_ROOT_XIDS_FOR.format(code=cur))
-            except Exception:  # noqa: BLE001 - best-effort drill-down, never fatal
-                continue
-            for value in _values(rows):
-                if not _is_int(value):
-                    continue
-                root = int(value)
-                if root in seen:
-                    continue
-                seen.add(root)
-                ordered.append(root)
-                nxt.append(root)
-                if len(ordered) >= _MAX_CHAIN_NODES:
-                    break
-            if len(ordered) >= _MAX_CHAIN_NODES:
-                break
-        frontier = nxt
-    return ordered
+    ready = sorted(node for node, direct_parents in parents.items() if not direct_parents)
+    while ready:
+        node = ready.pop(0)
+        ordered.append(node)
+        for child in children[node]:
+            parents[child].remove(node)
+            if not parents[child]:
+                ready.append(child)
+        ready.sort()
+    if len(ordered) != len(nodes):
+        return sorted(roots), "complete-but-unordered"
+    return [node for node in ordered if node != code], "ordered"
 
 
 def _statements(rows: list[dict[str, Any]]) -> list[str]:
@@ -770,6 +793,7 @@ def _query_kg(
         # Past resolved incidents at the same location (any alert name) — the
         # infra layer's "have we seen trouble HERE before" signal.
         location_history: list[dict[str, str]] = []
+        location_history_truncated = False
         seen_locations: set[str] = set()
         for where, query in (
             ("node " + target.node, _NODE_HISTORY_QUERY.format(node=escape_typeql(target.node)))
@@ -797,6 +821,7 @@ def _query_kg(
                     }
                 )
                 if len(location_history) >= 6:
+                    location_history_truncated = True
                     break
             if len(location_history) >= 6:
                 break
@@ -804,34 +829,48 @@ def _query_kg(
         # Topology around the stem workload identity: exposing Services, used
         # PVCs, and the storage blast radius (other workloads on the same PVC).
         workload_topology: dict[str, Any] = {}
-        if target.workload_name:
-            workload = escape_typeql(target.workload_name)
+        workload_topology_status = ""
+        # Namespace-less alerts cannot name one graph workload safely: do not
+        # fall back to the ambiguous display name.
+        if target.workload_name and target.namespace:
+            workload_topology_status = "complete"
+            workload = workload_uid(target.namespace, target.workload_name)
             services = sorted(
                 {
                     str(r.get("sn"))
-                    for r in run(_WORKLOAD_SERVICES_QUERY.format(workload=workload))
+                    for r in run(
+                        _WORKLOAD_SERVICES_QUERY.format(workload_uid=escape_typeql(workload))
+                    )
                     if r.get("sn")
                 }
             )
             pvcs = sorted(
                 {
                     str(r.get("pn"))
-                    for r in run(_WORKLOAD_PVCS_QUERY.format(workload=workload))
+                    for r in run(
+                        _WORKLOAD_PVCS_QUERY.format(workload_uid=escape_typeql(workload))
+                    )
                     if r.get("pn")
                 }
             )
             shared: list[str] = []
-            for pvc in pvcs[:3]:
+            shared_storage_pvcs = pvcs[:3]
+            for pvc in shared_storage_pvcs:
                 for r in run(_SHARED_PVC_QUERY.format(pvc=escape_typeql(pvc))):
                     other = str(r.get("on") or "")
-                    if other and other != target.workload_name and other not in shared:
+                    other_uid = str(r.get("ou") or "")
+                    if other and other_uid != workload and other not in shared:
                         shared.append(other)
             if services or pvcs:
                 workload_topology = {
                     "services": services[:10],
                     "pvcs": pvcs[:10],
                     "shared_storage_workloads": shared[:10],
+                    "shared_storage_pvcs": shared_storage_pvcs,
+                    "shared_storage_truncated": len(pvcs) > len(shared_storage_pvcs),
                 }
+        elif target.workload_name:
+            workload_topology_status = "skipped_missing_namespace"
 
         prior: list[dict[str, Any]] = []
         if target.alert_name:
@@ -881,7 +920,7 @@ def _query_kg(
                 }
             )
 
-        knowledge_rows = run(_KNOWLEDGE_QUERY)
+        knowledge_rows = [*run(_KNOWLEDGE_QUERY), *run(_KNOWLEDGE_ACTIONLESS_QUERY)]
         knowledge_reason_rows = run(_KNOWLEDGE_REASON_QUERY)
         knowledge_exclusive_action_rows = run(_KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY)
         knowledge_reason_ko_rows = run(_KNOWLEDGE_REASON_KO_QUERY)
@@ -982,7 +1021,9 @@ def _query_kg(
         "blast_radius_workload_names": workloads[:20],
         "prior_incidents": prior[:5],
         "location_history": location_history,
+        "location_history_truncated": location_history_truncated,
         "workload_topology": workload_topology,
+        "workload_topology_status": workload_topology_status,
         "case_cards": case_cards,
         "knowledge": knowledge,
         "reasoning": reasoning,

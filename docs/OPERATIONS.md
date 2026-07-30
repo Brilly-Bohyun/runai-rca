@@ -22,8 +22,8 @@ receiver was routed. Confirm the live path:
 
 ```bash
 # Alerts and analysis runs the backend has actually received/started
-curl -s http://<backend-or-frontend>/api/v1/alerts | jq '.[0]'
-curl -s http://<backend-or-frontend>/api/v1/analysis-runs | jq '.[0]'
+curl -s http://<backend-or-frontend>/api/v1/alerts | jq '.data[0]'
+curl -s http://<backend-or-frontend>/api/v1/analysis-runs | jq '.data[0]'
 
 # Agent process liveness (means the API is up, NOT that a collector produced evidence)
 curl -s http://<agent>/healthz
@@ -85,6 +85,46 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --incide
 kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 ```
 
+### Interrogate a surprising graph answer
+
+`--count` covers only projected incidents, alerts, and nodes. These read-only
+queries check the curated knowledge and executable runbook currently in this
+database; `reduce` returns a single `count` row.
+
+```bash
+# Curated knowledge symptoms (a symptom must have both cause and action edges).
+kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --raw 'match $s isa symptom; (symptom: $s, cause: $c) isa indicates; (symptom: $s, remedy: $a) isa resolved_by; reduce $count = count($s);'
+# Bad: `{'count': 0}` means the curated symptom/action knowledge was not loaded.
+
+# Curated actions reachable from those knowledge symptoms.
+kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --raw 'match $s isa symptom; (symptom: $s, cause: $c) isa indicates; (symptom: $s, remedy: $a) isa resolved_by; reduce $count = count($a);'
+# Bad: `{'count': 0}` means no curated remediation action is available.
+
+# Steps in the runtime's named diagnostic runbook.
+kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --raw 'match $r isa runbook, has name "k8s-senior-troubleshooting"; (runbook: $r, step: $s) isa runbook_contains; reduce $count = count($s);'
+# Bad: `{'count': 0}` means the executable runbook was not loaded.
+
+# Reasoning-function canary: this catalog symptom must resolve to its family.
+kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --raw 'match let $x in causes_for_symptom("NVML Driver/Library Version Mismatch"); select $x;'
+# Bad: no `gpu_hardware_error` row, or `query failed`, means the catalog or function definition is missing/stale.
+```
+
+There is no graph-side ingest watermark. The last successful `typedb-ingest` Job
+completion is the freshness signal, but it is a **PROXY** for graph freshness:
+it says when the Job completed, not which records it projected, and Kubernetes
+Job history retention applies.
+
+```bash
+kubectl get jobs -n <ns> -l app.kubernetes.io/component=typedb-ingest -o json | jq -r '[.items[] | select(.status.succeeded == 1) | .status.completionTime] | max // "no successful retained Job"'
+```
+
+To find stranded topology (a workload with no `runs_on` edge), run:
+
+```bash
+kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --raw 'match $w isa workload, has workload_uid $uid, has name $name; not { (host: $n, guest: $w) isa runs_on; }; select $uid, $name;'
+# Bad: any returned workload is stranded from node topology.
+```
+
 - **Graph looks empty?** Ingest only projects incidents **resolved ≥
   `resolvedGraceHours` (6h) ago**; a fresh cluster simply has nothing eligible
   yet. If `--recent` returns rows but one incident is missing, that incident's
@@ -114,7 +154,7 @@ created only from an active, Dashboard-approved CaseSnapshot carrying an explici
 that are not active remain intentionally unconverted. Re-analyze and approve the
 case to create an eligible trace-v3 snapshot, then run the backfill again.
 
-See [Knowledge Base → Querying the graph](KNOWLEDGE-BASE.md#querying-the-graph)
+See [Knowledge Base → TypeDB enrichment](KNOWLEDGE-BASE.md#5-in-depth-optional-typedb-enrichment)
 for TypeDB Studio access.
 
 ## Grafana MCP (Prometheus / Loki) diagnostics

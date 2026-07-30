@@ -42,8 +42,8 @@ flowchart LR
 파이프라인은 PostgreSQL을 사용합니다. TypeDB는 선택 사항인 토폴로지와 승인 이력 관계에만
 사용하며, 두 번째 운영 신뢰 원천이 아닙니다.
 
-테이블은 시작 시 백엔드가 자동 생성합니다(`backend/store_postgres.go`). 백엔드 소유 테이블은
-12개이며, 역할별로 묶으면 다음과 같습니다. 나머지 둘 — `rca_dataset`와
+테이블은 시작 시 백엔드가 자동 생성합니다(`backend/internal/server/store_postgres.go`). 백엔드 소유 테이블은
+13개이며, 역할별로 묶으면 다음과 같습니다. 나머지 둘 — `rca_dataset`와
 `ontology_backfill_cursors` — 는 Go 백엔드가 아니라 에이전트의 Python 오프라인 잡이 생성합니다.
 
 **수집 & 분석**
@@ -84,6 +84,7 @@ flowchart LR
 | 테이블 | 목적 | 주요 컬럼 |
 |---|---|---|
 | `chat_conversations` | 챗봇 대화 스레드. 인시던트/알림 컨텍스트에 연결 | `conversation_id` (PK), `incident_id`, `alert_id`, `messages` (JSONB), `context_label` |
+| `deleted_alert_episodes` | 하드 삭제된 알림 에피소드가 이후 웹훅으로 복원되지 않도록 남기는 tombstone | `fingerprint` (PK), `fired_at`, `deleted_at` |
 | `rca_dataset` | 오프라인 eval 데이터셋 — CronJob이 라벨된 인시던트를 누적, curated 세트로 export | `dataset_id` (PK), `incident_id`, `alertname`, `expected_family`, `approved`, `question` (JSONB) |
 | `ontology_backfill_cursors` | 일회성 백필 북킵(스냅샷 → TypeDB) | `cursor_name` (PK), `approved_at`, `case_id` |
 
@@ -146,10 +147,9 @@ supported root-cause claim 및 반증 없는 canonical supporting evidence가 �
 스키마: `agent/ontology/schema.tql` (TypeQL 3.x). 세 개의 계층.
 
 ### 인프라 계층 — *인제스트로 채워짐*
-`cluster`, `node`, `namespace`, `project`, `queue`, `workload`, `pod`,
-`control_plane_component`.
-GPU는 별도 엔티티가 아니라 `node`/`queue`/`project`의 속성(`gpu_allocated`,
-`gpu_requested`)으로 모델링됩니다.
+`node`, `workload`, `service`, `pvc`, `control_plane_component`.
+GPU는 속성으로 모델링됩니다. `gpu_allocated`는 `node`만 소유하고,
+`gpu_requested`는 선언되어 있지만 소유 엔티티가 없습니다.
 
 ### 인시던트 / RCA 계층 — *인제스트로 채워짐*
 `alert`, `incident`(이전 RCA를 질의할 수 있도록 `analysis_summary` 소유),
@@ -174,13 +174,22 @@ GPU는 별도 엔티티가 아니라 `node`/`queue`/`project`의 속성(`gpu_all
 테스트가 이를 강제합니다.
 
 ### 관계
-- **토폴로지**: `scopes` (cluster→node/project), `runs_on` (node→pod),
-  `belongs_to` (workload→pod), `in_project`, `submitted_to` (workload→queue),
-  `contains` (namespace→pod/workload/component), `depends_on` (component→component)
-- **인시던트**: `grouped_into` (incident←alert), `analyzed_by`, `similar_to`
-- **지식**: `has_symptom`, `indicates` (symptom→cause), `has_cause`,
-  `fixed_by` (cause→action), `resolved_by` (symptom→action), `supported_by`
-  (←evidence), `emits`, `applies_to` (xid→gpu_model), `leads_to` (xid→xid)
+- **토폴로지**: `runs_on` (host→guest), `exposes` (endpoint→backend),
+  `uses_storage` (consumer→storage), `depends_on` (dependent→dependency)
+- **인시던트**: `grouped_into` (incident←member), `has_symptom` (incident→symptom),
+  `analyzed_by` (incident→run), `diagnosis` (run+incident→cause),
+  `case_projection` (case→finding), `resolution` (finding→remedy),
+  `supported_by` (claim←proof), `contradicted_by` (claim←proof)
+- **지식**: `indicates` (symptom→cause), `resolved_by` (symptom→remedy),
+  `runbook_contains` (runbook→step), `runbook_entry` (runbook→step),
+  `diagnostic_transition` (prior→next), `diagnostic_outcome` (step→cause),
+  `diagnostic_recommendation` (step→remedy), `probe_template_for` (step→template),
+  `package_has_template` (package→template+binding), `applies_to` (fault→model),
+  `leads_to` (cause_fault→effect_fault)
+- **추적 투영**: `hypothesis_for` (run+incident→hypothesis),
+  `probe_execution_for` (execution→template), `probe_execution_tests`
+  (execution→hypothesis), `probe_execution_evidence` (execution→proof),
+  `rejected_evidence_link` (hypothesis→proof)
 
 ### 채워짐 vs 모델링됨
 | 상태 | 엔티티 / 관계 |
@@ -188,7 +197,7 @@ GPU는 별도 엔티티가 아니라 `node`/`queue`/`project`의 속성(`gpu_all
 | ✅ 채워짐 (`ontology/ingest.py`) | 인프라 + 인시던트 계층 + 토폴로지/`grouped_into` |
 | ✅ 지식 (`load_knowledge` / `load_troubleshooting` / 기타 `load_*`) | symptom/cause/action과 실행형 runbook 단계·전이·결론·조치, XID, component 의존성 |
 | 🟦 승격됨 (`ingest.py --promote-knowledge`) | 운영자가 확인한 RCA로부터 `confirmed:<alert>` 증상 → 패밀리 → 조치 |
-| ⬜ 모델링됨, 아직 미공급 | `evidence`, `analysis_run`, `similar_to`, `supported_by`, GPU 속성 |
+| ⬜ 모델링됨, 아직 미공급 | GPU 속성 |
 
 ---
 

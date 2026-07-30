@@ -82,7 +82,7 @@ erDiagram
 
 | 스키마 용어 | 뜻 | 예시 |
 | --- | --- | --- |
-| Entity | 이름을 가진 대상 | incident, component, evidence, action |
+| Entity | 이름을 가진 대상 | incident, control_plane_component, evidence, action |
 | Attribute | 대상의 속성 | `incident_id`, confidence, 마스킹된 summary |
 | Relation | 의미 있는 연결 | `supported_by`, `depends_on` |
 | Role | relation 안에서 참여자의 역할 | diagnosis는 주장, evidence는 증명 |
@@ -95,8 +95,8 @@ symptom → 확인된 action), `has_symptom`은 인시던트가 보인 증상을
 
 현재 스키마는 **운영 family 16개 + 보조 상태 3개**입니다. `failure_modes.yaml`의
 16개는 운영자용 taxonomy이고, `platform_version_bug`, `expected_known_behavior`,
-`insufficient_evidence`는 보조 분류 상태입니다. `root_cause` subtype은 총 19개이며,
-닫힌 vocabulary 자체는 변경하지 않습니다.
+`insufficient_evidence`는 보조 분류 상태입니다. `cause_instance sub root_cause`까지
+포함하면 `root_cause` subtype은 총 20개이며, 닫힌 vocabulary 자체는 변경하지 않습니다.
 
 runbook은 의도적으로 두 겹입니다: 실행 가능한 runbook 하나가 모든 diagnostic
 step을 담고(walk와 모든 probe ID가 여기 있음), 도메인별 runbook
@@ -151,8 +151,10 @@ flowchart LR
 | --- | --- | --- |
 | `causes_for_symptom` | 큐레이션 후보 family | 여전히 live 매치 필요 |
 | `dependencies_for_component` / `checks_for_component_path` | 의존성 인식 점검 | 장애 주장 아님 |
-| `affected_workloads_for_node` | blast-radius 문맥 | 인과 증명 아님 |
-| 승인 사례/action 함수 | 레이블된 과거 문맥 | evidence gate 통과 불가 |
+| `_BLAST_QUERY` | blast-radius 문맥 | 인과 증명 아님 |
+| `_PRIOR_QUERY` → `_CASE_CARD_QUERY` | 레이블된 과거 CaseCard 문맥 | evidence gate 통과 불가 |
+| `_KNOWLEDGE_QUERY`(승격된 `confirmed:{alert_name}` symptom 포함) | symptom별 remediation | 여전히 live 매치 필요 |
+| `_FN_DIAGNOSTIC_TRANSITIONS` | diagnostic tree 전이 | 읽기 전용 planner 안내 |
 
 정밀 시그니처 매치가 검색의 시작점입니다. failure-mode symptom, NVIDIA XID 코드, alert text,
 known issue를 모든 family에서 찾습니다. family ranker는 후보 순서와 설명만 제공할 뿐입니다.
@@ -186,15 +188,16 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --incide
 kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 ```
 
-### 자세히 보기: 함수와 Studio 참고
+### 자세히 보기: 런타임 쿼리와 Studio 참고
 
-| 함수 | 묻는 내용 |
+| 런타임 경로 | 묻는 내용 |
 | --- | --- |
 | `causes_for_symptom` | 하나의 live-matched symptom에 맞는 큐레이션 family는 무엇인가? |
 | `dependencies_for_component` / `checks_for_component_path` | 이 컴포넌트는 무엇에 의존하며 무엇을 점검해야 하는가? |
-| `affected_workloads_for_node` | 노드의 blast radius는 무엇인가? |
-| `approved_incidents_for_cause` / `evidence_for_approved_cause` | 어떤 승인 사례가 유용한 레이블된 문맥인가? |
-| `verified_actions_for_family` | 운영자가 확인한 어떤 조치가 과거 안내가 되는가? |
+| `_BLAST_QUERY` | 노드의 blast radius는 무엇인가? |
+| `_PRIOR_QUERY` → `_CASE_CARD_QUERY` | 이전 동일-alert 인시던트의 CaseCard는 무엇인가? |
+| `_KNOWLEDGE_QUERY`(승격된 `confirmed:{alert_name}` symptom 포함) | live symptom에 맞는 조치는 무엇인가? |
+| `_FN_DIAGNOSTIC_TRANSITIONS` | 이 diagnostic tree를 이어 가는 전이는 무엇인가? |
 
 ```typeql
 # 하나의 run에 속한 주장과 이를 지지하는 evidence

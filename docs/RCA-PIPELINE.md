@@ -182,7 +182,7 @@ vice versa:
 The postgres agent queries the **Run:ai control-plane database itself** when
 `RUNAI_DB_DSN` is set (workloads/audit/authorization/… schemas) — not just the
 RCA store. The tool description is enriched with schema ownership from the
-[architecture topology](KNOWLEDGE-BASE.md#platform-architecture-topology), so the
+[architecture topology](KNOWLEDGE-BASE.md), so the
 loop knows where to look.
 
 It continues until the agent is done, repeats a query, or reaches the analysis
@@ -274,12 +274,13 @@ ranked alternative survives the same check, the pipeline emits
 ## 7. Ontology enrichment
 
 The **orchestrator** consults the optional TypeDB knowledge graph (not a parallel
-collector) — see [Knowledge Base](KNOWLEDGE-BASE.md#typedb-ontology):
+collector) — see [Knowledge Base](KNOWLEDGE-BASE.md#5-in-depth-optional-typedb-enrichment):
 
 - `enrich()`: node **blast radius** (how many workloads share the alerting node)
   and **prior same-alert incidents** with their stored RCA.
-- `graph_remediation()`: `fixes_for_family`, `fixes_for_xid`, and reverse
-  `leads_to` **root-XID chains** (fix the origin, not the downstream symptom).
+- `graph_remediation()`: symptom-keyed `_KNOWLEDGE_QUERY` (including promoted
+  `confirmed:{alert_name}` symptoms), `fixes_for_xid`, and reverse `leads_to`
+  **root-XID chains** (fix the origin, not the downstream symptom).
 
 Degrades to empty when TypeDB is off/unreachable; never raises.
 
@@ -289,6 +290,39 @@ Degrades to empty when TypeDB is off/unreachable; never raises.
 Recommended Actions → Appendix** — the ~1-page document an operator (or a Word
 export) reads. Every conclusion in it is produced by code; no LLM authors the
 report.
+
+**Observed configuration.** Every mechanism sentence answers *what* failed; the
+operator's next question is always what the thing was configured with. Each
+typed artifact therefore carries the configuration of the entity it types, and
+Root Cause renders one compact line per entity from the *eligible* ones — so no
+per-family table is needed and nothing is stated without an observation behind
+it:
+
+| Line | Source artifact | Names |
+| --- | --- | --- |
+| `Configured (main)` | `kubernetes_container_lifecycle` | memory/cpu/GPU limits and requests, image |
+| `Probe settings (main)` | `kubernetes_warning_events` + Pod spec | handler and thresholds, gated on an eligible `Unhealthy` event |
+| `Requested` | `kubernetes_pod_scheduling` | per-container requests, `nodeSelector`, `schedulerName`, Run:ai's own GPU accounting |
+| `Project quota` | `runai_queue_quota` | requested vs quota, hard limit, over-quota weight |
+| `Storage claim` | `kubernetes_storage_claim` | requested size, storageClass, access modes, phase |
+| `Node GPUs` | `kubernetes_node_gpu_resources` | free/allocatable and what scheduled Pods hold |
+| `Node capacity` | `kubernetes_node_condition` | the node's allocatable capacity |
+
+Two failures leave the responsible setting in a *different* artifact from the
+evidence, so they are resolved after the eligible walk and never override it: a
+not-Ready container has no causal container state (the kubelet reports an
+`Unhealthy` Event), and a Bound claim is not itself blocked when the volume it
+points at fails to attach. In both cases the event must be eligible evidence
+while the settings are read off the identity-verified spec.
+
+**Actions carry values, not placeholders.** Curated actions are family-level
+knowledge written with placeholders; the numbered list substitutes what the run
+observed (see [KNOWLEDGE-BASE.md](KNOWLEDGE-BASE.md)). Where the catalogue cannot
+carry a number, the report derives one: a container OOMKilled at a known limit
+gets the old limit as its new request (its demonstrated working set), twice the
+old limit as the new ceiling, and a ready-to-run command — `kubectl set
+resources` only for kinds kubectl can patch, `kubectl edit` on the owner for a
+CRD-owned Pod such as a Run:ai or Grove workload.
 
 When `language=ko` and an LLM is configured, `_translate_report_lines_ko` runs
 **last** — after the Self-Check, operator-question and general-guidance blocks
@@ -310,7 +344,7 @@ carries `status`, `duration_seconds`, `model` and `max_tokens`.
 The **Troubleshooting Playbook** section appends, for any implicated platform
 component, its failure effect, its BFS **dependency check order** (e.g.
 `cluster-sync → status-updater → runai-backend-traefik`), and its ready-to-run
-`kubectl` checks — from the [architecture topology](KNOWLEDGE-BASE.md#platform-architecture-topology).
+`kubectl` checks — from the [architecture topology](KNOWLEDGE-BASE.md).
 
 ## 9. Runtime harness
 

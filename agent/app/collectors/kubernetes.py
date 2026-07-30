@@ -1798,6 +1798,13 @@ class KubernetesCollector:
         artifacts.append(_pod_lifecycle_artifact(self.name, target, responses))
         if scheduling_artifact is not None:
             artifacts.append(scheduling_artifact)
+            # The Pod cannot be scheduled, so the project's scheduler quota is
+            # worth one read: a project at its quota waits even with free GPUs.
+            artifacts.extend(
+                await _queue_quota_artifacts(
+                    self.name, self._settings, target, time_range=causal_time_range
+                )
+            )
         artifacts.append(
             _container_lifecycle_artifact(
                 self.name,
@@ -2010,6 +2017,18 @@ class KubernetesCollector:
                         },
                     )
                 )
+            # The claims this Pod mounts are named in its own spec, so their
+            # size/class/phase is target-verified configuration — the thing an
+            # operator has to change on a storage failure.
+            artifacts.extend(
+                await _storage_claim_artifacts(
+                    self.name,
+                    self._settings,
+                    target,
+                    topology["pvcs"],
+                    time_range=event_time_range,
+                )
+            )
         if exec_probes:
             exec_successes = [probe for probe in exec_probes if not probe.get("error")]
             # A probe that couldn't START (binary absent, exec subresource down) is
@@ -3808,6 +3827,12 @@ def _pod_lifecycle_artifact(
     )
 
 
+# kube-scheduler's own PodScheduled=False reasons. The set is NOT a filter — a
+# Pod that is not scheduled is never benign, whoever wrote the reason — it only
+# marks which reasons this agent already understands. Run:ai's KAI scheduler adds
+# its own (the binder reports a post-placement bind failure this way), and an
+# allowlist silently dropped the whole artifact for those: no requests, no quota,
+# no nodeSelector, nothing. Unknown reasons are reported verbatim and logged.
 _POD_SCHEDULING_REASONS = frozenset({"unschedulable", "schedulinggated"})
 
 
@@ -3842,14 +3867,27 @@ def _pod_scheduling_artifact(
         if _boolean_condition_status(condition.get("status")) is not False:
             continue
         reason = str(condition.get("reason") or "").strip().casefold()
-        if reason in _POD_SCHEDULING_REASONS:
-            scheduling_reason = reason
-            scheduling_message = str(condition.get("message") or "")
-            break
+        if not reason:
+            continue
+        if reason not in _POD_SCHEDULING_REASONS:
+            _log.warning(
+                "unmapped PodScheduled=False reason %r on pod %s/%s; reported verbatim "
+                "without a family promotion",
+                reason,
+                target.namespace,
+                target.pod,
+            )
+        scheduling_reason = reason
+        scheduling_message = str(condition.get("message") or "")
+        break
     if not scheduling_reason:
         return None
 
     observed_target = resolved_pod_anchor or target
+    # What the Pod ASKED FOR is the other half of "no node could take it": the
+    # scheduler's message names the shortage, these name the demand that hit it.
+    spec = pod_object.get("spec") if isinstance(pod_object.get("spec"), dict) else {}
+    node_selector = spec.get("nodeSelector") if isinstance(spec.get("nodeSelector"), dict) else {}
     return artifact(
         agent=agent,
         source="kubernetes",
@@ -3879,6 +3917,21 @@ def _pod_scheduling_artifact(
             },
             "pod": observed_target.pod,
             "namespace": observed_target.namespace,
+            "resources": pod_summary.get("resources") or {},
+            # Run:ai's scheduler accounting for the same Pod: a workload can be
+            # unschedulable because the cluster is full OR because its own
+            # project/gang accounting says it may not run yet.
+            **(
+                {"runai_allocation": pod_summary["runai_allocation"]}
+                if pod_summary.get("runai_allocation")
+                else {}
+            ),
+            **({"node_selector": node_selector} if node_selector else {}),
+            **(
+                {"scheduler": str(spec.get("schedulerName"))}
+                if spec.get("schedulerName")
+                else {}
+            ),
             "condition": {
                 "type": "PodScheduled",
                 "status": "False",
@@ -3998,6 +4051,220 @@ def _container_lifecycle_artifact(
         },
         highlights=salient_markers(container_diagnostics),
     )
+
+
+_UNLIMITED_QUOTA = "-1"
+
+
+def _queue_quota_summary(queue: dict[str, object]) -> dict[str, object]:
+    """Project quota vs what the queue holds, from a scheduling.run.ai/v2 Queue.
+
+    ``quota`` is the deserved share and ``limit`` the hard ceiling, both -1 when
+    unset; ``overQuotaWeight`` decides how much idle capacity the project may
+    borrow. A project sits at its quota while GPUs are free elsewhere in the
+    cluster, which is why node capacity alone cannot explain a pending workload.
+    """
+    metadata = queue.get("metadata") if isinstance(queue.get("metadata"), dict) else {}
+    spec = queue.get("spec") if isinstance(queue.get("spec"), dict) else {}
+    status = queue.get("status") if isinstance(queue.get("status"), dict) else {}
+    labels = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
+    resources = spec.get("resources") if isinstance(spec.get("resources"), dict) else {}
+    gpu = resources.get("gpu") if isinstance(resources.get("gpu"), dict) else {}
+    summary: dict[str, object] = {
+        "queue": metadata.get("name"),
+        "project": labels.get("project"),
+        # A project has one queue per node pool plus a top-level one.
+        "node_pool": labels.get("runai/node-pool"),
+        "department": labels.get("runai/department-name"),
+        "parent_queue": spec.get("parentQueue"),
+        "priority": spec.get("priority"),
+    }
+    for field, key in (("quota", "gpu_quota"), ("limit", "gpu_limit")):
+        value = gpu.get(field)
+        if value is not None and str(value) != _UNLIMITED_QUOTA:
+            summary[key] = str(value)
+    if gpu.get("overQuotaWeight") is not None:
+        summary["gpu_over_quota_weight"] = str(gpu["overQuotaWeight"])
+    for field, key in (("requested", "gpu_requested"), ("allocated", "gpu_allocated")):
+        values = status.get(field)
+        if isinstance(values, dict) and values.get(_GPU_RESOURCE) is not None:
+            summary[key] = str(values[_GPU_RESOURCE])
+    return summary
+
+
+async def _queue_quota_artifacts(
+    agent: str,
+    settings: Settings,
+    target: AnalysisTarget,
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Read the alert project's scheduler queues when its Pod cannot be scheduled.
+
+    Only reached for an unschedulable target, so the quota is fetched exactly when
+    it can explain the wait. The queue is CURRENT state — it types as context, not
+    as proof about the incident window; the report prints it as configuration.
+    """
+    if not target.project:
+        return []
+    response = await k8s_read(
+        settings, "queues", label_selector=f"project={target.project}", full_object=True
+    )
+    payload = _normalize_k8s_payload(response.get("data"))
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if response.get("error") or not isinstance(items, list):
+        return []
+    artifacts = []
+    for queue in items[:3]:
+        if not isinstance(queue, dict):
+            continue
+        summary = _queue_quota_summary(queue)
+        if str(summary.get("project") or "") != target.project:
+            continue
+        if "gpu_quota" not in summary and "gpu_requested" not in summary:
+            continue
+        artifacts.append(
+            artifact(
+                agent=agent,
+                source="kubernetes",
+                type="runai_queue_quota",
+                status="ok",
+                confidence="medium",
+                title=ko_en(settings, "Run:ai 프로젝트 quota", "Run:ai project quota"),
+                query=kubectl_repr("queues", name=str(summary.get("queue") or "")),
+                summary=ko_en(
+                    settings,
+                    f"Queue {summary.get('queue')}: GPU quota "
+                    f"{summary.get('gpu_quota', '무제한')}, 요청 "
+                    f"{summary.get('gpu_requested', '?')}, 할당 "
+                    f"{summary.get('gpu_allocated', '?')}.",
+                    f"Queue {summary.get('queue')}: GPU quota "
+                    f"{summary.get('gpu_quota', 'unlimited')}, requested "
+                    f"{summary.get('gpu_requested', '?')}, allocated "
+                    f"{summary.get('gpu_allocated', '?')}.",
+                ),
+                result={
+                    "observation": {
+                        "kind": "runai_queue_quota",
+                        "predicate": "runai_queue_quota",
+                        # Quota is a live read of a policy object. It explains the
+                        # ceiling, never that the ceiling was hit in this window.
+                        "polarity": "unknown",
+                        "coverage": "partial",
+                        "target_identity_verified": True,
+                        "observed_entity": {
+                            "kind": "queue",
+                            "name": str(summary.get("queue") or ""),
+                        },
+                        "observation_window": {},
+                        "snapshot_role": "current_context",
+                    },
+                    **summary,
+                },
+            )
+        )
+    return artifacts
+
+
+_UNBOUND_CLAIM_PHASES = frozenset({"Pending", "Lost"})
+
+
+def _pvc_summary(pvc: dict[str, object]) -> dict[str, object]:
+    """Requested size, class, modes and binding — `kubectl describe pvc` in brief."""
+    metadata = pvc.get("metadata") if isinstance(pvc.get("metadata"), dict) else {}
+    spec = pvc.get("spec") if isinstance(pvc.get("spec"), dict) else {}
+    status = pvc.get("status") if isinstance(pvc.get("status"), dict) else {}
+    resources = spec.get("resources") if isinstance(spec.get("resources"), dict) else {}
+    requests = resources.get("requests") if isinstance(resources.get("requests"), dict) else {}
+    capacity = status.get("capacity") if isinstance(status.get("capacity"), dict) else {}
+    return {
+        "claim": metadata.get("name"),
+        "namespace": metadata.get("namespace"),
+        "phase": status.get("phase"),
+        "requested_storage": requests.get("storage"),
+        # A bound PV can be LARGER than the request; the operator needs the real one.
+        "actual_storage": capacity.get("storage"),
+        "storage_class": spec.get("storageClassName"),
+        "access_modes": [str(mode) for mode in spec.get("accessModes") or []],
+        "volume_mode": spec.get("volumeMode"),
+        "volume_name": spec.get("volumeName"),
+    }
+
+
+async def _storage_claim_artifacts(
+    agent: str,
+    settings: Settings,
+    target: AnalysisTarget,
+    claims: list[str],
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Type each claim the target Pod mounts, with its spec and binding state.
+
+    Identity needs no inference: the claim name came out of this Pod's own
+    ``spec.volumes``.  An unbound claim observed while the alert is still firing
+    is what the Pod is waiting on, so it types as a scoped observation the same
+    way a waiting container state does; a Bound claim stays configuration, which
+    a storage Warning event can still make worth printing.
+    """
+    if not claims or not target.namespace or not _namespace_allowed(settings, target.namespace):
+        return []
+    firing = not str(target.resolved_at or "").strip()
+    artifacts = []
+    for claim in claims[:3]:
+        response = await k8s_read(
+            settings,
+            "persistentvolumeclaims",
+            namespace=target.namespace,
+            name=claim,
+            full_object=True,
+        )
+        payload = _normalize_k8s_payload(response.get("data"))
+        if response.get("error") or not isinstance(payload, dict):
+            continue
+        summary = _pvc_summary(payload)
+        if str(summary.get("claim") or "") != claim:
+            continue
+        unbound = str(summary.get("phase") or "") in _UNBOUND_CLAIM_PHASES
+        blocking = bool(unbound and firing and time_range)
+        observation = {
+            "kind": "kubernetes_storage_claim",
+            "predicate": "kubernetes_storage_claim",
+            "polarity": "present" if blocking else "unknown",
+            "coverage": "scoped" if blocking else "partial",
+            "target_identity_verified": True,
+            "observed_entity": {
+                "kind": "persistentvolumeclaim",
+                "name": claim,
+                "namespace": target.namespace,
+            },
+            "observation_window": time_range if blocking else {},
+            "snapshot_role": "live_incident" if blocking else "current_context",
+        }
+        artifacts.append(
+            artifact(
+                agent=agent,
+                source="kubernetes",
+                type="kubernetes_storage_claim",
+                status="ok",
+                confidence="high" if blocking else "low",
+                title=ko_en(settings, "스토리지 클레임(PVC)", "Storage claim (PVC)"),
+                query=kubectl_repr(
+                    "persistentvolumeclaims", namespace=target.namespace, name=claim
+                ),
+                summary=ko_en(
+                    settings,
+                    f"PVC {claim}: phase {summary.get('phase')}, 요청 "
+                    f"{summary.get('requested_storage')}, storageClass "
+                    f"{summary.get('storage_class')}.",
+                    f"PVC {claim}: phase {summary.get('phase')}, requested "
+                    f"{summary.get('requested_storage')}, storageClass "
+                    f"{summary.get('storage_class')}.",
+                ),
+                result={"observation": observation, **summary},
+            )
+        )
+    return artifacts
 
 
 def _workload_topology(pod_object: object, services: list[dict]) -> dict[str, list[str]]:
@@ -4237,12 +4504,23 @@ def _container_diagnostics(pod_summary: dict[str, object] | None) -> list[dict[s
     statuses = pod_summary.get("containerStatuses")
     if not isinstance(statuses, list):
         return []
+    # The spec's per-container resources and the image reference ride along with
+    # the lifecycle facts: an OOMKilled report has to name the limit/request it
+    # was configured with, and an ImagePullBackOff report the reference it failed
+    # to pull.  This typed artifact is what the report's cause and remediation
+    # layers read, so a fact absent here can never reach the operator.
+    spec_resources = pod_summary.get("resources")
+    spec_resources = spec_resources if isinstance(spec_resources, dict) else {}
+    spec_probes = pod_summary.get("probes")
+    spec_probes = spec_probes if isinstance(spec_probes, dict) else {}
     diagnostics: list[dict[str, object]] = []
     for item in statuses:
         if not isinstance(item, dict):
             continue
         state = item.get("state") if isinstance(item.get("state"), dict) else {}
         last_state = item.get("lastState") if isinstance(item.get("lastState"), dict) else {}
+        resources = spec_resources.get(str(item.get("name") or ""))
+        probes = spec_probes.get(str(item.get("name") or ""))
         diagnostics.append(
             {
                 "name": item.get("name"),
@@ -4253,6 +4531,9 @@ def _container_diagnostics(pod_summary: dict[str, object] | None) -> list[dict[s
                 "lastTerminated": _state_reason(last_state.get("terminated"))
                 if isinstance(last_state.get("terminated"), dict)
                 else None,
+                **({"image": item["image"]} if item.get("image") else {}),
+                **({"resources": resources} if isinstance(resources, dict) and resources else {}),
+                **({"probes": probes} if isinstance(probes, dict) and probes else {}),
             }
         )
     return diagnostics
@@ -4972,6 +5253,52 @@ def _event_message_mentions_target(message: str, target: AnalysisTarget) -> bool
     return False
 
 
+# The Run:ai scheduler writes its own accounting onto every workload Pod it
+# admits. This is the request-vs-allocated comparison a pending GPU workload
+# turns on, and it needs no Run:ai API: the base collector already reads the Pod.
+# Closed vocabulary, keys observed on a live 2.26 cluster — an unknown key is
+# ignored rather than guessed at.
+_RUNAI_ALLOCATION_ANNOTATIONS: dict[str, str] = {
+    # Written on every admitted Pod. The ``-current-`` pair appears on gang
+    # workloads and can lag the desired figure, so both are kept: "current" is
+    # what the Pod holds now, the plain key is what the scheduler assigned.
+    "runai-allocated-gpus": "allocated_gpus",
+    "runai-current-allocated-gpus": "current_allocated_gpus",
+    "runai-current-requested-gpus": "requested_gpus",
+    "runai-podgroup-requested-gpus": "podgroup_requested_gpus",
+    "runai-total-requested-gpus": "total_requested_gpus",
+    "runai-allocated-gpu-memory": "allocated_gpu_memory",
+    "runai-allocated-mig-gpus": "allocated_mig_gpus",
+    # A fractional (shared-GPU) workload declares NO nvidia.com/gpu resource at
+    # all — its slice lives only here and in Run:ai's own device plugin.
+    "gpu-fraction": "gpu_fraction",
+    "gpu-fraction-num-devices": "gpu_fraction_devices",
+    # Names the ConfigMap that wires the slice; the reservation Pod holding it
+    # lives in another namespace entirely.
+    "runai/shared-gpu-configmap": "shared_gpu_configmap",
+    "runai-pending-pods": "pending_pods",
+    "runai-running-pods": "running_pods",
+    "runai-calculated-status": "runai_status",
+    # "Regular" whole-GPU vs "Fraction" shared-GPU; the scheduler also names
+    # borrowed capacity here, so it is reported verbatim, never interpreted.
+    "received-resource-type": "resource_type",
+    "runai-used-nodes": "used_nodes",
+    "runai-nodepools": "node_pools",
+    "pod-group-name": "pod_group",
+}
+
+
+def _runai_allocation(annotations: object) -> dict[str, str]:
+    """Run:ai's own scheduling accounting, as written on the Pod."""
+    if not isinstance(annotations, dict):
+        return {}
+    return {
+        field: str(annotations[key]).strip()
+        for key, field in _RUNAI_ALLOCATION_ANNOTATIONS.items()
+        if str(annotations.get(key) or "").strip()
+    }
+
+
 def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
     metadata = pod.get("metadata") if isinstance(pod.get("metadata"), dict) else {}
     status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
@@ -4980,9 +5307,14 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
     # Per-container limits/requests — the `kubectl describe` fact an operator
     # reaches for first on a memory/CPU-limit alert.
     resources: dict[str, object] = {}
+    # Probe settings sit next to the resources for the same reason: a container
+    # that stays not-Ready is failing a probe whose thresholds are the fix.
+    probes: dict[str, object] = {}
     for container in spec.get("containers", []) if isinstance(spec.get("containers"), list) else []:
         if isinstance(container, dict) and isinstance(container.get("name"), str):
             resources[container["name"]] = container.get("resources") or {}
+            if probe_summary := _probe_summary(container):
+                probes[container["name"]] = probe_summary
     conditions = [
         condition for condition in status.get("conditions", []) if isinstance(condition, dict)
     ]
@@ -5002,9 +5334,59 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
         "conditions": compact(conditions, limit=5),
         "containerStatuses": compact(containers, limit=5),
         "resources": resources,
+        **({"probes": probes} if probes else {}),
+        **(
+            {"runai_allocation": allocation}
+            if (allocation := _runai_allocation(metadata.get("annotations")))
+            else {}
+        ),
         **({"reason": status["reason"]} if status.get("reason") else {}),
         **({"message": status["message"]} if status.get("message") else {}),
     }
+
+
+_PROBE_TIMING_FIELDS = (
+    "initialDelaySeconds",
+    "periodSeconds",
+    "timeoutSeconds",
+    "failureThreshold",
+    "successThreshold",
+)
+
+
+def _probe_summary(container: dict[str, object]) -> dict[str, object]:
+    """Handler + thresholds for each configured probe, dropping k8s defaults."""
+    summary: dict[str, object] = {}
+    for kind in ("livenessProbe", "readinessProbe", "startupProbe"):
+        probe = container.get(kind)
+        if not isinstance(probe, dict):
+            continue
+        entry: dict[str, object] = {
+            field: probe[field] for field in _PROBE_TIMING_FIELDS if probe.get(field) is not None
+        }
+        if handler := _probe_handler(probe):
+            entry["handler"] = handler
+        if entry:
+            summary[kind.removesuffix("Probe")] = entry
+    return summary
+
+
+def _probe_handler(probe: dict[str, object]) -> str:
+    """``httpGet /healthz:8080`` — what the kubelet actually calls."""
+    http = probe.get("httpGet")
+    if isinstance(http, dict):
+        scheme = str(http.get("scheme") or "HTTP").lower()
+        return f"{scheme}GET {http.get('path') or '/'}:{http.get('port')}"
+    tcp = probe.get("tcpSocket")
+    if isinstance(tcp, dict):
+        return f"tcpSocket {tcp.get('port')}"
+    grpc = probe.get("grpc")
+    if isinstance(grpc, dict):
+        return f"grpc {grpc.get('port')}"
+    command = probe.get("exec")
+    if isinstance(command, dict) and isinstance(command.get("command"), list):
+        return "exec " + " ".join(str(part) for part in command["command"][:4])
+    return ""
 
 
 def _condition_is_failure(condition: dict[str, object]) -> bool:
@@ -5368,7 +5750,34 @@ def _pod_gpu_request(pod: object) -> tuple[Decimal, int]:
         overhead_gpu, valid = _gpu_quantity(overhead.get(_GPU_RESOURCE))
         effective += overhead_gpu
         invalid += 0 if valid else 1
+    if effective == 0:
+        # Consulted ONLY when Kubernetes sees no GPU request, so a whole-GPU
+        # workload (which declares both) can never be counted twice.
+        fraction, bad = _runai_shared_gpu_request(pod)
+        effective += fraction
+        invalid += bad
     return effective, invalid
+
+
+def _runai_shared_gpu_request(pod: dict[str, object]) -> tuple[Decimal, int]:
+    """A shared-GPU Pod's slice, which is invisible to Kubernetes.
+
+    Run:ai fractional workloads reserve GPU memory through their own device
+    plugin and declare no ``nvidia.com/gpu`` at all, so a node packed with
+    half-GPU Pods used to report its GPUs as entirely free. The scheduler records
+    what it actually handed out in this annotation.
+
+    MIG is deliberately excluded: ``runai-allocated-mig-gpus`` was 0 on every Pod
+    measured, so whether its unit is devices or whole-GPU equivalents is unknown,
+    and a wrong multiplier here would silently corrupt the node's free-GPU figure.
+    """
+    metadata = pod.get("metadata") if isinstance(pod.get("metadata"), dict) else {}
+    annotations = metadata.get("annotations")
+    raw = annotations.get("runai-allocated-gpus") if isinstance(annotations, dict) else None
+    if raw in (None, ""):
+        return Decimal(0), 0
+    quantity, valid = _gpu_quantity(raw)
+    return (quantity, 0) if valid else (Decimal(0), 1)
 
 
 def _display_gpu_quantity(value: Decimal | None) -> int | float | None:
@@ -5482,15 +5891,28 @@ async def _collect_gpu_node_resource_observations(
         pods_error = str(pods_result.get("error") or "")
         if not pods_error and not pods_query_ok:
             pods_error = "assigned Pod list was not machine-readable"
+        # A sampled value cannot explain a historical incident, and free GPUs must
+        # never substantiate a shortage. But a node with NO free GPU, sampled while
+        # the alert is still firing, is the exhaustion the pending Pod is waiting
+        # on — the same live-snapshot rule the node conditions already use.
+        exhausted = (
+            request_complete
+            and allocatable is not None
+            and estimated_free is not None
+            and estimated_free <= 0
+        )
+        firing = not str(target.resolved_at or "").strip()
+        window = incident_time_range(target)
+        live_exhaustion = bool(node_verified and exhausted and firing and window)
         observation: dict[str, object] = {
             "kind": "kubernetes_node_gpu_resources",
             "predicate": "kubernetes_node_gpu_resources",
-            # These values are sampled now. They explain current capacity but
-            # cannot prove that the same state caused a historical incident.
-            "polarity": "unknown" if node_verified else "unavailable",
-            "coverage": "partial",
-            "observation_window": {},
-            "snapshot_role": "current_context",
+            "polarity": (
+                "present" if live_exhaustion else "unknown" if node_verified else "unavailable"
+            ),
+            "coverage": "scoped" if live_exhaustion else "partial",
+            "observation_window": window if live_exhaustion else {},
+            "snapshot_role": "live_incident" if live_exhaustion else "current_context",
         }
         if node_verified:
             observation["observed_entity"] = {"kind": "node", "name": node}
@@ -5517,7 +5939,7 @@ async def _collect_gpu_node_resource_observations(
             "node_query_status_code": node_result.get("status_code"),
             "pods_query_url": pods_result.get("url"),
             "pods_query_status_code": pods_result.get("status_code"),
-            "snapshot_role": "current_context",
+            "snapshot_role": "live_incident" if live_exhaustion else "current_context",
             "observation": observation,
         }
 
@@ -5795,6 +6217,10 @@ def _node_condition_artifacts(
                         "node": node,
                         "condition": condition_type,
                         "status": raw_status or "Unknown",
+                        # "kubelet has disk pressure" says nothing about how much
+                        # the node had to begin with; the capacity it is measured
+                        # against belongs with the condition.
+                        "allocatable": data.get("allocatable") or {},
                         "timestamp_provenance": timestamps,
                         "matched_incident_timestamps": matched_timestamps,
                         "observation": observation,
