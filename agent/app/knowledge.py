@@ -1460,16 +1460,24 @@ def _validate_runtime_probe_template_ids(
             raise ValueError(
                 f"package {package_id} probe template IDs must be safe identifier strings"
             )
-        unknown_ids = [
-            template_id
-            for template_id in raw_ids
-            if template_id not in _bundled_probe_template_ids()
-        ]
-        if unknown_ids:
-            raise ValueError(
-                f"package {package_id} references unknown bundled probe template IDs"
+        # The runbook walk that produced these IDs resolves its tree from TypeDB
+        # first and only falls back to this bundled YAML, and TypeDB ingestion is
+        # additive across upgrades. So an ID can be genuinely executed by a run
+        # and still be absent here — rejecting the package for that reason
+        # permanently discards knowledge over a probe reference. Drop the
+        # unresolvable IDs instead and keep the failure-mode guidance, which is
+        # what this catalog's fail-closed contract always promised.
+        known = _bundled_probe_template_ids()
+        resolved = tuple(dict.fromkeys(t for t in raw_ids if t in known))
+        if unknown := [t for t in raw_ids if t not in known]:
+            _log.warning(
+                "package %s references probe template IDs missing from the bundled tree; "
+                "dropping them: %s",
+                package_id,
+                ", ".join(sorted(unknown)),
             )
-        out[family.strip()] = tuple(dict.fromkeys(raw_ids))
+        if resolved:
+            out[family.strip()] = resolved
     return out
 
 

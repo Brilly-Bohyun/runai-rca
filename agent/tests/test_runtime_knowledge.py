@@ -5,6 +5,7 @@ import pytest
 from app.config import load_settings
 from app.knowledge import (
     DEFAULT_FAMILIES,
+    _bundled_probe_template_ids,
     KnowledgeRegistry,
     match_failure_mode_symptoms,
     validate_runtime_knowledge,
@@ -333,18 +334,26 @@ async def test_registry_rejects_probe_template_args_or_queries(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_registry_rejects_unknown_probe_template_id(monkeypatch) -> None:
+async def test_registry_drops_unknown_probe_template_id_but_keeps_package(monkeypatch) -> None:
+    # The walk resolves its runbook from TypeDB first, so a probe a run really
+    # executed can be absent from the bundled YAML. That must cost the probe
+    # reference, not the whole learned package.
     monkeypatch.setattr("app.knowledge.httpx.AsyncClient", _Client)
+    known = sorted(_bundled_probe_template_ids())[0]
     payload = _snapshot()
     payload["packages"][0]["compiled"]["probe_template_ids"] = {
-        "workload_runtime_error": ["unknown-probe-template-01"]
+        "workload_runtime_error": ["unknown-probe-template-01", known],
+        "image_pull_error": ["unknown-probe-template-02"],
     }
     _Client.responses = [_Response(200, payload)]
     _Client.headers = []
     registry = KnowledgeRegistry(mode="assist", snapshot_url="http://backend/snapshot")
 
-    assert await registry.refresh() is False
-    assert "unknown bundled probe template IDs" in str(registry.health()["last_sync_error"])
+    assert await registry.refresh() is True
+    assert registry.health()["last_sync_error"] in (None, "")
+    assert registry.probe_template_ids_for_family("workload_runtime_error") == [known]
+    # A family left with no resolvable probe is dropped rather than kept empty.
+    assert registry.probe_template_ids_for_family("image_pull_error") == []
 
 
 def test_settings_default_runtime_snapshot_url_and_mode(monkeypatch) -> None:
