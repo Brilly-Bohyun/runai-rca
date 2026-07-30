@@ -496,6 +496,35 @@ def _langchain_text(response: Any) -> str:
     return ""
 
 
+# OpenAI-style names are the common case, but OpenAI-compatible servers vary and
+# some answer with the Anthropic-style input/output spelling. Reading only one
+# spelling counted the call and silently dropped its tokens, which reads
+# downstream as a genuine zero rather than a missing measurement — and a zero
+# token count prices out as a zero cost estimate.
+_USAGE_ALIASES: dict[str, tuple[str, ...]] = {
+    "prompt_tokens": ("prompt_tokens", "input_tokens"),
+    "completion_tokens": ("completion_tokens", "output_tokens"),
+    "total_tokens": ("total_tokens",),
+}
+
+
+def _normalized_usage(raw: dict[str, Any]) -> dict[str, int] | None:
+    """Map one provider usage object onto our key names, or None if it carries none."""
+    usage: dict[str, int] = {}
+    for key, aliases in _USAGE_ALIASES.items():
+        for name in aliases:
+            value = raw.get(name)
+            if isinstance(value, int | float):
+                usage[key] = int(value)
+                break
+    if not usage:
+        return None
+    # Providers that report only the two halves still get a usable total.
+    if "total_tokens" not in usage:
+        usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+    return usage
+
+
 def _langchain_usage(response: Any) -> dict[str, int] | None:
     for raw in (
         getattr(response, "usage_metadata", None),
@@ -505,15 +534,8 @@ def _langchain_usage(response: Any) -> dict[str, int] | None:
     ):
         if not isinstance(raw, dict):
             continue
-        prompt = raw.get("prompt_tokens", raw.get("input_tokens"))
-        completion = raw.get("completion_tokens", raw.get("output_tokens"))
-        total = raw.get("total_tokens")
-        usage = {
-            "prompt_tokens": int(prompt or 0),
-            "completion_tokens": int(completion or 0),
-            "total_tokens": int(total or (int(prompt or 0) + int(completion or 0))),
-        }
-        if any(usage.values()):
+        usage = _normalized_usage(raw)
+        if usage and any(usage.values()):
             return usage
     return None
 
@@ -533,13 +555,24 @@ def _record_usage(model: str, data: dict[str, Any]) -> None:
         _log.info("llm usage", extra={"llm_usage": {"model": model, "calls_without_usage": 1}})
         return
 
+    usage = _normalized_usage(raw)
+    if usage is None:
+        # A usage object we cannot read is a measurement gap, not zero tokens —
+        # count it as such so the dashboard shows the shortfall instead of
+        # reporting confident zeros.
+        current["calls_without_usage"] += 1
+        bucket["calls_without_usage"] += 1
+        _log.warning(
+            "llm usage object carried no recognizable token counts",
+            extra={"llm_usage": {"model": model, "keys": sorted(raw)}},
+        )
+        return
+
     per_call: dict[str, Any] = {"model": model}
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        value = raw.get(key)
-        if isinstance(value, int | float):
-            current[key] += int(value)
-            bucket[key] += int(value)
-            per_call[key] = int(value)
+    for key, value in usage.items():
+        current[key] += value
+        bucket[key] += value
+        per_call[key] = value
     _log.info("llm usage", extra={"llm_usage": per_call})
 
 
