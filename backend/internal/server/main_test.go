@@ -1624,6 +1624,95 @@ func TestSimilarIncidentsFallBackToSparseWithoutDatabase(t *testing.T) {
 	}
 }
 
+func TestSimilarIncidentsRankByDiagnosisNotAlertTitle(t *testing.T) {
+	// The reported failure: an OOM incident whose root cause matched a stored
+	// incident word for word ranked BELOW one that merely shared its alert
+	// title, because the query carried only the alert and the stored documents
+	// carried RCA text.
+	store := NewStore()
+	const oomRCA = "The container exceeded its memory limit and was OOMKilled; " +
+		"CrashLoopBackOff is the restart state that followed."
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "KubePodNotReady", "namespace": "default", "pod": "oom-test"},
+		Annotations: map[string]string{"summary": "Pod has been in a non-ready state for more than 15 minutes."},
+	}
+
+	// Shares the alert title, but was diagnosed as a scheduling problem.
+	seedApprovedMemoryIncidentForTest(store, "INC-same-title", time.Now().UTC())
+	sameTitle := &IncidentMemory{
+		IncidentID:      "INC-same-title",
+		Title:           "Pod has been in a non-ready state for more than 15 minutes.",
+		Labels:          map[string]string{"alertname": "KubePodNotReady", "namespace": "default"},
+		AnalysisSummary: "The scheduler could not place the pod: no node satisfied its resource request.",
+	}
+	sameTitle.Vector = textVector(memoryText(*sameTitle))
+	store.memories[sameTitle.IncidentID] = sameTitle
+
+	// Different alert title, same root cause.
+	seedApprovedMemoryIncidentForTest(store, "INC-same-cause", time.Now().UTC())
+	sameCause := &IncidentMemory{
+		IncidentID:      "INC-same-cause",
+		Title:           "Pod is crash looping.",
+		Labels:          map[string]string{"alertname": "KubePodCrashLooping", "namespace": "default"},
+		AnalysisSummary: oomRCA,
+	}
+	sameCause.Vector = textVector(memoryText(*sameCause))
+	store.memories[sameCause.IncidentID] = sameCause
+
+	// The query is what gets embedded, so this is where the asymmetry lived. The
+	// dense path scores it by pure cosine distance against documents built from
+	// memoryText — no label bonus — so a query that omits this incident's RCA
+	// can only rank by alert likeness, however good the embedding model is.
+	store.mu.RLock()
+	before := store.similarIncidentQueryLocked(alert, "INC-current")
+	store.mu.RUnlock()
+	if strings.Contains(before, "OOMKilled") {
+		t.Fatalf("unanalyzed incident has no RCA to query with: %q", before)
+	}
+
+	store.incidents["INC-current"] = &Incident{IncidentID: "INC-current", Status: "firing"}
+	store.analysisRuns["ANL-current"] = &AnalysisRun{
+		RunID:           "ANL-current",
+		Status:          "complete",
+		IncidentID:      "INC-current",
+		AnalysisSummary: oomRCA,
+	}
+	store.mu.RLock()
+	after := store.similarIncidentQueryLocked(alert, "INC-current")
+	store.mu.RUnlock()
+	if !strings.Contains(after, "OOMKilled") {
+		t.Fatalf("an analyzed incident must query with its own RCA: %q", after)
+	}
+	// Identity stays in the query so the two sides keep the same shape as
+	// memoryText (title + labels + RCA).
+	if !strings.Contains(after, "KubePodNotReady") {
+		t.Fatalf("alert identity must survive alongside the RCA: %q", after)
+	}
+	// With the RCA present, the matching diagnosis now shares far more terms
+	// with the query than the shared title does.
+	queryVector := textVector(after)
+	causeScore := cosineSimilarity(queryVector, sameCause.Vector)
+	titleScore := cosineSimilarity(queryVector, sameTitle.Vector)
+	if causeScore <= titleScore {
+		t.Fatalf("matching root cause scored %.3f, shared title %.3f — diagnosis must win", causeScore, titleScore)
+	}
+}
+
+func TestAlertSearchTextOmitsThePodName(t *testing.T) {
+	// Pod names are ephemeral, so they are query noise: a rerun of the same
+	// workload never repeats them.
+	text := alertSearchText(Alert{
+		Labels: map[string]string{"alertname": "KubePodNotReady", "workload": "trainer", "pod": "trainer-7d9f8c6b5-x2k4p"},
+	})
+	if strings.Contains(text, "trainer-7d9f8c6b5-x2k4p") {
+		t.Fatalf("pod name must not reach the search text: %q", text)
+	}
+	if !strings.Contains(text, "trainer") {
+		t.Fatalf("workload identity must survive: %q", text)
+	}
+}
+
 func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	store := NewStore()
 	priorAlert := Alert{
