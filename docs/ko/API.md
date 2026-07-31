@@ -40,7 +40,7 @@ Backend:
 
 - `POST /webhook/alertmanager`
 - `GET /api/v1/openapi.json`
-- `GET /api/v1/incidents?view=active|archived|trash` (`status`, `severity`, `final_decision`, `q`로도 필터 가능)
+- `GET /api/v1/incidents?view=active|archived|trash` (`status`, `severity`, `final_decision`, `q`로도 필터 가능. `sort=activity|started`와 `order=asc|desc`로 정렬)
 - `GET /api/v1/incidents/{id}`
 - `POST /api/v1/incidents/{id}/analyze`
 - `POST /api/v1/incidents/{id}/cancel`
@@ -76,6 +76,7 @@ Backend:
 - `GET /api/v1/knowledge-candidates?status=...`
 - `GET /api/v1/knowledge-candidates/{id}`
 - `POST /api/v1/knowledge-candidates/{id}/decision`
+- `DELETE /api/v1/knowledge-candidates/{id}`
 - `GET /api/v1/knowledge-packages?include_retired=true|false`
 - `GET /api/v1/knowledge-packages/{id}`
 - `POST /api/v1/knowledge-packages/{id}/retire`
@@ -98,6 +99,12 @@ Backend:
 `view=trash`를 사용합니다. 목록은 `status`, `severity`, `final_decision`, `q`(자유
 텍스트) 필터도 받습니다. 유효하지 않은 view 값은 HTTP 400을 반환합니다. 목록
 페이지네이션의 `total`은 선택한 view 기준으로 계산됩니다.
+
+목록이 페이지 단위라 정렬은 서버에서 수행합니다. `sort=activity`(기본)는
+`last_activity_at`, `sort=started`는 `fired_at` 기준이며 각각 `order=desc`(기본)
+또는 `order=asc`를 받습니다. `last_activity_at`은 발생·알림 해소·분석 시작 중 가장
+최근 시각이므로, 방금 시작된 분석은 별도 분기 없이 자기 타임스탬프로 목록 최상단에
+올라옵니다. 플래핑 윈도우의 기준 시각은 별도 필드이며 분석으로 갱신되지 않습니다.
 
 인시던트 라이프사이클 액션:
 
@@ -172,6 +179,13 @@ evidence가 canonical이고 반증이 없고 supporting evidence가 비어 있�
 `updated_at`으로 갱신됩니다. 적격해진 candidate는 `ready_for_review`로 돌아오며, 활성화
 전에는 여전히 명시적인 candidate decision이 필요합니다.
 
+`DELETE /api/v1/knowledge-candidates/{id}`는 리뷰 큐에 남은 죽은 행을 정리합니다.
+정리 목적 전용이라 `validation_failed`와 `rejected`에서만 허용되고, 살아 있는 상태이거나
+아직 은퇴하지 않은 package를 소유한 candidate는 409로 거부됩니다 — 런타임 스냅샷이
+서빙 중인 행을 잃는 일은 없습니다. case 링크와 감사 이벤트는 같은 트랜잭션에서 함께
+삭제됩니다. candidate id는 내용에서 파생되므로, 같은 지식을 다시 만들어내는 평가가
+있으면 행도 다시 생성됩니다.
+
 ## Bulk incident lifecycle action
 
 여러 인시던트에 같은 lifecycle action을 적용하려면 다음을 호출합니다:
@@ -225,7 +239,10 @@ Content-Type: application/json
 
 `GET /api/v1/stats/llm-spend?days=N`은 analysis-run `metadata.llm_usage`를
 토큰, 호출 수, 실패 호출 수, 추정 USD 비용, 일별 버킷, 모델별 breakdown으로 집계합니다.
-조회 기간은 1..90일 범위입니다.
+조회 기간은 1..90일 범위입니다. 여기에 더해 `hosted_estimates`(같은 실측 토큰량을
+Anthropic·OpenAI·Google 공시 요율로 환산한 비용. 입력과 출력을 따로 계산)와
+`fx`(USD/KRW 환율, 갱신 시각, 환율 피드에 도달하지 못해 설정된 fallback을 쓰는
+중이면 `usd_krw_is_fallback`)를 반환합니다.
 
 `GET /api/v1/stats/kpi?days=N`은 time-to-RCA와 time-to-resolve의 평균/p50/p90,
 일별 버킷을 반환합니다. time-to-RCA는 인시던트별 최초 성공 완료 시각을 사용하므로 이후

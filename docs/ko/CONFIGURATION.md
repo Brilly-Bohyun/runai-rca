@@ -102,7 +102,7 @@ flowchart LR
 | `LLM_MODEL` | OpenAI 호환 모델 이름(예: `auto-router`) |
 | `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` / `LLM_MODEL_INSIGHT` | 단계별 모델 override. 비어 있으면 `LLM_MODEL`로 폴백합니다 |
 | `LLM_API_KEY` | OpenAI 호환 API 키 시크릿. 세 가지 LLM 변수가 모두 설정되면 대화형 채팅 응답이 활성화됩니다 |
-| `LLM_REQUEST_TIMEOUT_SECONDS` | 호출당 LLM 요청 타임아웃(채팅과 직접 폴백 추론). 기본값 `300`, `0` = 무제한 |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | 호출당 LLM 요청 타임아웃(채팅, 그리고 단계별 모델 재정의에 쓰이는 직접 HTTP 전송). 기본값 `300`, `0` = 무제한 |
 | `LLM_PRICING_JSON` | 모델별 추정 LLM 비용을 위한 선택 사항 JSON map. 각 모델에 `prompt_per_mtok`, `completion_per_mtok` 값을 둡니다 |
 | `ENABLE_NAT_RUNTIME` | 인프로세스 NeMo Agent Toolkit 엔진을 통해 분석을 실행합니다. 기본값 `true` |
 | `NAT_CONFIG_FILE` | 내부 NeMo 엔진 워크플로 구성 경로. 기본값 `configs/runai_rca_engine.yml` |
@@ -127,6 +127,8 @@ flowchart LR
 | `ANALYSIS_BACKFILL_INTERVAL_SECONDS` | 백엔드: RCA를 완료하지 못한 채 남은 알림을 다시 처리하는 주기. 기본값 `300`(`0`은 비활성화) |
 | `ANALYSIS_BACKFILL_BATCH` | 백엔드: 백필 틱당 다시 처리하는 알림 수. 기본값 `10` |
 | `ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS` | 백엔드: 실패한 알림을 재시도하기 전의 쿨다운. 기본값 `900` |
+| `FX_RATE_URL` | 백엔드: LLM 비용 패널용 USD→KRW 환율 피드. 기동 시 1회, 이후 매일 09:00 KST에 갱신합니다. 비었거나 도달 불가면 fallback을 유지하고 패널이 그 사실을 표시합니다 |
+| `FX_USD_KRW_FALLBACK` | 백엔드: 피드에 도달할 수 없을 때 사용하는 환율. 기본값 `1452`. 외부 egress가 없는 클러스터라면 최신 값으로 설정하세요 |
 | `EMBEDDING_URL` | 백엔드: 유사 인시던트 검색을 위한 OpenAI 호환 `/embeddings` 엔드포인트. 비어 있으면 오프라인 피처 해시 폴백(기본값, 어휘 기반) |
 | `EMBEDDING_MODEL` | 백엔드: 임베딩 모델 이름(`EMBEDDING_URL`과 함께 사용) |
 | `EMBEDDING_DIM` | 백엔드: 임베딩 벡터 차원. 기본값 `384`. 모델과 일치해야 하며, 변경하면 기존 행을 다시 임베딩해야 합니다 |
@@ -153,6 +155,11 @@ NeMo Agent Toolkit 워크플로:
   `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`를 제공하세요.
 - `NAT_CONFIG_FILE`은 에이전트 이미지에 고정 경로로 포함된 내부 값입니다. 배포에서
   재정의하는 것은 지원하지 않습니다.
+- 기본 모델은 NAT가 소유하며, 쓸 수 없는 NAT 응답을 직접 HTTP 전송으로 **재시도하지
+  않습니다**. 같은 생성을 두 번째 전송로에서 반복해도 공유 분석 데드라인만 태웠고,
+  두 전송의 오류가 합쳐진 문자열이 원인 대신 재시도 과정을 설명했기 때문입니다. 이제
+  NAT의 오류가 그대로 답입니다. 직접 HTTP는 NAT가 연결되지 않은 호출 — 단계별 모델
+  재정의, NAT 클라이언트 미주입 — 에만 쓰이며 자체 length 재시도는 유지합니다.
 
 LiteLLM/OpenAI 호환 엔드포인트를 위한 Helm 재정의 예시:
 
@@ -178,6 +185,7 @@ helm upgrade --install runai-rca charts/runai-rca \
 | `backend.env.knowledgeValidatorUrl` | 승인 시 사용하는 Agent validator 기본 URL을 재정의합니다. 비어 있으면 클러스터 내부 Agent 서비스를 사용하고 백엔드가 `/knowledge/validate`를 덧붙입니다 |
 | `backend.env.language` / `agent.env.language` | RCA 언어를 `en` 또는 `ko`로 설정합니다 |
 | `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` / `manualAgentRequestTimeoutSeconds` | 백엔드 시작 DB 타임아웃, 자동/채팅 에이전트 타임아웃, 운영자가 트리거한 분석 타임아웃 |
+| `backend.env.fxRateUrl` / `backend.env.fxUsdKrwFallback` | LLM 비용 패널용 USD→KRW 피드와 오프라인 fallback. egress가 없는 클러스터는 배포 수명 동안 fallback을 유지합니다 |
 | `secrets.keys.*` | DB, Run:ai, Grafana, NVIDIA, LLM 자격 증명에 대한 기존 Secret 키 이름 |
 | `secrets.existingSecret` | Run:ai/NVIDIA/LLM 자격 증명, 그리고 기본적으로 DB 키를 위한 기존 Secret |
 | `secrets.databaseExistingSecret` | `DATABASE_URL` / `POSTGRES_DSN`에만 사용되는 기존 Secret |

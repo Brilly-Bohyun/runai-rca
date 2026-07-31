@@ -56,10 +56,16 @@ Python offline jobs, not the Go backend.
 |---|---|---|
 | `incidents` | Correlated alert groups — the unit of RCA and the Slack thread | `incident_id` (PK), `correlation_key`, `status`, `fired_at`, `resolved_at`, `alert_count`, `analysis_seq`, `user_approved_at` |
 | `alerts` | Individual alerts; a re-firing alert accrues here | `alert_id` (PK), `incident_id`, `fingerprint`, `occurrence_count`, `occurrence_pods` (JSONB), `labels`/`annotations` (JSONB), `thread_ts` |
-| `analysis_runs` | **RCA source of truth** — the full output of every analysis run | `run_id` (PK), `source` (`auto`/`manual`/`chat`/`feedback`), `status`, `target_type`/`target_id`, `analysis_summary`/`analysis_detail`, `analysis_quality`, `root_cause_family`, `capabilities`/`missing_data`/`warnings`/`artifacts` (JSONB) |
+| `analysis_runs` | **RCA source of truth** — the full output of every analysis run | `run_id` (PK), `source` (`auto`/`backfill`/`manual`/`chat`/`feedback`), `status`, `target_type`/`target_id`, `analysis_summary`/`analysis_detail`, `analysis_quality`, `root_cause_family`, `capabilities`/`missing_data`/`warnings`/`artifacts` (JSONB) |
 | `incident_embeddings` | Similarity memory — find past look-alike incidents. One row per approved incident (`alert_id` retained but always empty) | `incident_id`, `alert_id` (`''`), `analysis_summary`/`analysis_detail`, `vector_json` (JSONB), `embedding vector(N)` (N = `EMBEDDING_DIM`, default 384) + HNSW cosine index |
 
 > The per-alert RCA columns (`analysis_*`, `capabilities`, …) have been **removed** from `alerts` — the RCA lives on `analysis_runs`. The backend no longer creates or reads them; drop any leftover columns from existing DBs manually (documented in `store_postgres.go`).
+
+> **One row per alert, not one per trigger.** An `auto` run reuses the alert's
+> existing `auto` row (after the cooldown) and also takes over a `backfill` row —
+> backfill is the system's own retry of the analysis `auto` owes that alert, so a
+> second full row would duplicate the whole artifact payload (~600 KB in a live
+> deployment). Operator-authored rows (`manual`, `chat`) are never taken over.
 
 **Operator feedback & evaluation**
 
@@ -124,6 +130,7 @@ flowchart TD
 | **Link** | A candidate with the same `knowledge_fingerprint` already exists | `knowledge_candidate_cases`, bump `supporting_case_count` | Cross-incident dedup — no duplicate candidate |
 | **Publish** | Operator approves the candidate (`POST /api/v1/knowledge-candidates/…`) | `knowledge_packages` (`active`, `mirror_status=pending`); prior same-fingerprint package → `retired` | Content-hash **revalidation** — candidate must still be `ready_for_review` and hash-stable |
 | **Mirror** | `typedb-package-mirror-job` CronJob (`ontology/mirror_packages.py`) | TypeDB upsert; `knowledge_packages.mirror_status` → `current`/`failed` | **Advisory** — a failed mirror never blocks activation |
+| **Delete** | Operator clears a dead row from the review queue (`DELETE /api/v1/knowledge-candidates/{id}`) | Removes the candidate with its `knowledge_candidate_cases` links and `knowledge_events`, in one transaction | `validation_failed` / `rejected` only, and refused while it still owns a non-retired package |
 | **Audit** | Every transition above | `knowledge_events` (append-only) | — |
 
 A **shadow** publish (`ShadowKnowledgeCandidate`) stages a package for review

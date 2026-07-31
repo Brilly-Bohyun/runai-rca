@@ -155,7 +155,18 @@ feed the live analysis is controlled by `DYNAMIC_KNOWLEDGE_MODE` (default
   markers that name the contributing package, family, and symptom.
 
 Runtime-package families are hard-validated against the closed `families.yaml`
-catalog; a package naming a family outside it is rejected.
+catalog; a package naming a family outside it is rejected — with one explicit
+exception. A `novel_*` family minted by the open-world path is accepted and
+compiled **matcher-only**: the closed catalog is the *headline* vocabulary, and a
+matcher-only family can never lead an RCA, so its mechanism and confirmed
+remediation surface as guidance instead of dead-ending the whole open-world path
+at approval.
+
+Two more serving rules on the runtime snapshot: one unusable package is dropped
+and the rest of the refresh is kept (a snapshot where *everything* fails still
+raises, carrying the per-package reasons), and a `shadow` package does not
+register its probes into the plan — observe-only is exactly the effect an
+operator chose by shadowing it. Approval-time validation stays strict.
 
 ## 4. Worked example: NVIDIA Xid 79
 

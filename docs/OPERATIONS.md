@@ -50,9 +50,13 @@ Work down this list — the usual causes, most common first:
    webhook) or `MAX_CONCURRENT_AGENT_RUNS`. The backfill loop
    (`ANALYSIS_BACKFILL_INTERVAL_SECONDS`) re-drives dropped alerts — wait a cycle
    or raise the caps.
-4. **Auto re-analysis cooldown.** If an alert re-fired but no new run appeared,
-   it may still be inside the auto re-analysis cooldown (default 360 minutes), so
-   the existing run was reused instead.
+4. **Auto re-analysis cooldown, or a resend with nothing new.** If an alert
+   re-fired but no new run appeared, it may still be inside the auto re-analysis
+   cooldown (default 360 minutes), so the existing run was reused instead. Past
+   the cooldown, an Alertmanager *resend* of the same episode — same fingerprint
+   and `StartsAt`, no severity escalation, no new occurrence — is skipped by
+   design: it carries no new evidence, and re-analyzing it would revoke the
+   operator's approval and the knowledge derived from it.
 5. **Backend hung up before the agent finished.** If
    `AGENT_REQUEST_TIMEOUT_SECONDS` (960) is ever set below the agent's
    `ANALYSIS_DEADLINE_SECONDS` (900), the backend cancels mid-analysis and the

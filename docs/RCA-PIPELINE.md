@@ -178,6 +178,19 @@ vice versa:
 | loki | `logql_query` | range query only |
 | runai | `runai_api_search` + `runai_api_get` | GET-only, path must start `/api/` (method hardcoded) |
 | postgres | `sql_select` | single `SELECT`/`WITH`, READ ONLY transaction, auto `LIMIT 50` |
+| *every* agent | `knowledge_lookup` | in-process catalog read, no cluster call and no domain boundary crossed |
+
+`knowledge_lookup` answers "what is already known about this?" mid-loop, so an
+agent that forms a hypothesis three queries in is not stuck with the knowledge
+the plan stage happened to fetch. It reads the same merged map the ranker uses —
+the version-controlled catalog plus operator-approved runtime knowledge — so
+knowledge approved after the plan was written is still reachable. Every entry
+names its source (`curated` / `learned` / `novel`) and carries `matcher_only`,
+because a novel family is guidance to test, not a root cause to report. Its
+answers deliberately produce **no artifact**: the agent sees them in its loop and
+the run keeps a receipt in `details.knowledge_lookups`, but curated wording must
+never reach the observed-evidence text, where the signature matchers would read
+our own catalog back as something the cluster reported.
 
 The postgres agent queries the **Run:ai control-plane database itself** when
 `RUNAI_DB_DSN` is set (workloads/audit/authorization/… schemas) — not just the

@@ -41,7 +41,7 @@ Backend:
 
 - `POST /webhook/alertmanager`
 - `GET /api/v1/openapi.json`
-- `GET /api/v1/incidents?view=active|archived|trash` (also filterable by `status`, `severity`, `final_decision`, `q`)
+- `GET /api/v1/incidents?view=active|archived|trash` (also filterable by `status`, `severity`, `final_decision`, `q`; sortable with `sort=activity|started` and `order=asc|desc`)
 - `GET /api/v1/incidents/{id}`
 - `POST /api/v1/incidents/{id}/analyze`
 - `POST /api/v1/incidents/{id}/cancel`
@@ -77,6 +77,7 @@ Backend:
 - `GET /api/v1/knowledge-candidates?status=...`
 - `GET /api/v1/knowledge-candidates/{id}`
 - `POST /api/v1/knowledge-candidates/{id}/decision`
+- `DELETE /api/v1/knowledge-candidates/{id}`
 - `GET /api/v1/knowledge-packages?include_retired=true|false`
 - `GET /api/v1/knowledge-packages/{id}`
 - `POST /api/v1/knowledge-packages/{id}/retire`
@@ -103,6 +104,14 @@ incidents that are still inside the trash retention window. The list also
 accepts `status`, `severity`, `final_decision`, and `q` (free-text) filters.
 Invalid view values return HTTP 400. List pagination keeps `total` scoped to the
 selected view.
+
+Ordering is server-side because the list is paged: `sort=activity` (default)
+orders by `last_activity_at`, `sort=started` by `fired_at`, each with
+`order=desc` (default) or `order=asc`. `last_activity_at` is the latest of
+firing, alert resolution, and analysis start — an analysis that has just begun
+floats its incident to the top on its own timestamp, with no special-case
+branch. The stored flapping-window anchor is a different field and is not
+re-dated by analysis.
 
 Incident lifecycle actions:
 
@@ -183,6 +192,14 @@ hash. A still-invalid candidate keeps `validation_failed` but refreshes its
 `ready_for_review` and still requires an explicit candidate decision before
 activation.
 
+`DELETE /api/v1/knowledge-candidates/{id}` clears a dead row from the review
+queue. It is housekeeping only: allowed on `validation_failed` and `rejected`
+candidates, and rejected with 409 on any live status or when the candidate still
+owns a package that has not been retired, so the runtime snapshot can never lose
+the row it is serving. The case links and audit events go with it in the same
+transaction. Candidate ids are content-derived, so an evaluation that reproduces
+the same knowledge regenerates the row.
+
 ## Bulk incident lifecycle actions
 
 To apply one lifecycle action to several incidents, send:
@@ -238,7 +255,11 @@ Content-Type: application/json
 
 `GET /api/v1/stats/llm-spend?days=N` aggregates analysis-run `metadata.llm_usage`
 into tokens, calls, failed calls, estimated USD cost, daily buckets, and per-model
-breakdowns for the selected 1..90 day window.
+breakdowns for the selected 1..90 day window. It also returns `hosted_estimates`
+— what the same measured token volume would have cost at Anthropic, OpenAI, and
+Google list rates, priced input and output separately — and `fx` with the
+USD/KRW rate, its timestamp, and `usd_krw_is_fallback` when the rate feed was
+unreachable and the configured fallback is in use.
 
 `GET /api/v1/stats/kpi?days=N` returns mean/p50/p90 time-to-RCA and
 time-to-resolve metrics plus daily buckets. Time-to-RCA uses the first successful

@@ -52,12 +52,18 @@ flowchart LR
 |---|---|---|
 | `incidents` | 상관된 알림 그룹 — RCA와 Slack 스레드의 단위 | `incident_id` (PK), `correlation_key`, `status`, `fired_at`, `resolved_at`, `alert_count`, `analysis_seq`, `user_approved_at` |
 | `alerts` | 개별 알림. 같은 알림의 재발은 여기 누적 | `alert_id` (PK), `incident_id`, `fingerprint`, `occurrence_count`, `occurrence_pods` (JSONB), `labels`/`annotations` (JSONB), `thread_ts` |
-| `analysis_runs` | **RCA 신뢰의 원천** — 매 분석 실행의 전체 산출물 | `run_id` (PK), `source` (`auto`/`manual`/`chat`/`feedback`), `status`, `target_type`/`target_id`, `analysis_summary`/`analysis_detail`, `analysis_quality`, `root_cause_family`, `capabilities`/`missing_data`/`warnings`/`artifacts` (JSONB) |
+| `analysis_runs` | **RCA 신뢰의 원천** — 매 분석 실행의 전체 산출물 | `run_id` (PK), `source` (`auto`/`backfill`/`manual`/`chat`/`feedback`), `status`, `target_type`/`target_id`, `analysis_summary`/`analysis_detail`, `analysis_quality`, `root_cause_family`, `capabilities`/`missing_data`/`warnings`/`artifacts` (JSONB) |
 | `incident_embeddings` | 유사도 메모리 — 과거의 닮은 인시던트 검색. 승인된 인시던트당 한 행(`alert_id`는 유지되지만 항상 빈 값) | `incident_id`, `alert_id`(`''`), `analysis_summary`/`analysis_detail`, `vector_json` (JSONB), `embedding vector(N)`(N = `EMBEDDING_DIM`, 기본 384) + HNSW cosine index |
 
 > `alerts`의 알림별 RCA 컬럼(`analysis_*`, `capabilities`, …)은 **제거되었습니다** — RCA는
 > `analysis_runs`에 있습니다. 백엔드는 더 이상 이 컬럼들을 생성하거나 읽지 않으며, 기존
 > DB에 남은 컬럼은 수동으로 DROP하십시오(`store_postgres.go`에 명시).
+
+> **트리거당 한 행이 아니라 알림당 한 행입니다.** `auto` 실행은 (쿨다운 이후) 그 알림의
+> 기존 `auto` 행을 재사용하며, `backfill` 행도 이어받습니다 — backfill은 `auto`가 그
+> 알림에 대해 수행했어야 할 분석을 시스템이 스스로 재시도한 것이라, 별도 행을 만들면
+> artifact 페이로드 전체(실 배포 기준 약 600 KB)가 그대로 중복됩니다. 운영자가 만든
+> 행(`manual`, `chat`)은 절대 이어받지 않습니다.
 
 **운영자 피드백 & 평가**
 
@@ -122,6 +128,7 @@ flowchart TD
 | **링크** | 동일 `knowledge_fingerprint` 후보가 이미 존재 | `knowledge_candidate_cases`, `supporting_case_count` 증가 | 교차 인시던트 dedup — 중복 후보 생성 안 함 |
 | **발행** | 운영자가 후보 승인(`POST /api/v1/knowledge-candidates/…`) | `knowledge_packages` (`active`, `mirror_status=pending`); 동일 fingerprint의 이전 package → `retired` | content-hash **재검증** — 후보가 여전히 `ready_for_review`이고 hash가 안정적이어야 함 |
 | **미러** | `typedb-package-mirror-job` CronJob(`ontology/mirror_packages.py`) | TypeDB upsert; `knowledge_packages.mirror_status` → `current`/`failed` | **Advisory** — 미러 실패는 활성화를 막지 않음 |
+| **삭제** | 운영자가 리뷰 큐의 죽은 행을 정리(`DELETE /api/v1/knowledge-candidates/{id}`) | candidate와 그 `knowledge_candidate_cases` 링크·`knowledge_events`를 한 트랜잭션에서 제거 | `validation_failed` / `rejected`에서만 가능. 아직 은퇴하지 않은 package를 소유하면 거부 |
 | **감사** | 위 모든 전이 | `knowledge_events` (append-only) | — |
 
 **shadow** 발행(`ShadowKnowledgeCandidate`)은 패키지를 리뷰용으로 스테이징하되 활성 런타임

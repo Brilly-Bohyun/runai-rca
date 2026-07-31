@@ -57,6 +57,18 @@ Setting `0` or less disables auto re-analysis, so the existing run is always
 reused. Re-activated incidents move to the top of the incident list by recent
 activity.
 
+The cooldown is not the only gate: auto re-analysis also requires the webhook to
+carry **new information**. An alert whose pod is never deleted never resolves, so
+Alertmanager resends it every `repeat_interval` with the same fingerprint and
+`StartsAt`; that is the same episode, and it is not re-analyzed however long the
+cooldown has lapsed. First sight, resolve→firing, a new `StartsAt`, a severity
+escalation, and an occurrence increase all still count as new information. This
+matters beyond wasted runs: a completed re-analysis whose hash differs revokes
+the operator's approval and drops the evaluation reviews and knowledge derived
+from it, so an undeleted test pod would otherwise erase approved RCA on a timer.
+Retrying a genuinely *failed* analysis is unaffected — the backfill loop covers
+alerts left without a completed RCA on its own cooldown.
+
 ## Runtime Status Semantics
 
 Kubernetes `Running` and Agent `/healthz` confirm that processes are alive, but

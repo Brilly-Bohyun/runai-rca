@@ -128,6 +128,20 @@ active와 shadow 패키지가 실제로 실시간 분석에 어떻게 반영되�
 (`DYNAMIC_KNOWLEDGE_MODE`: off/shadow/assist/authoritative)가 결정합니다 —
 [지식 베이스](KNOWLEDGE-BASE.md#3-분석-중-지식이-사용되는-방법) 참조.
 
+**활성화가 실제로 움직이는 것** — 흔히 "그래프에 쓰는 것"으로 오해되므로 명시합니다.
+패키지를 활성화하면 symptom 매칭, 확인된 조치, 그리고 앞으로의 plan에 등록되는 진단
+단계가 켜집니다. 그래프는 위의 시간별 미러가 별도로 갱신합니다.
+
+**matcher-only 지식이 반복될 때.** `novel_*` family는 설계상 결코 RCA를 대표하지
+못합니다. 다만 같은 메커니즘이 서로 다른 케이스 3건을 뒷받침하면 `supporting_case_count`가
+그 사실을 알려 주고, candidate 상세가 카탈로그 검토를 요청합니다. `families.yaml`로의
+승격은 닫힌 카탈로그에 대한 **사람의 편집**으로 남습니다 — 자동 승격은 어휘를 다시 LLM에
+넘기는 일이고, 그것이야말로 닫힌 카탈로그가 막으려는 것이기 때문입니다.
+
+승인된 패키지는 probe를 *가리킬* 뿐이고 내용은 runbook 트리가 소유합니다. 트리에서
+이름이 바뀌거나 삭제되어 운영자가 승인한 template이 빠지면, 이제 plan이 아무 설명 없이
+probe 하나 적은 채로 돌아오는 대신 그 사실을 알립니다.
+
 Candidate 생성은 완전한 trace-v3 ledger 경로를 우선합니다. Ledger가 불완전해도 approved
 snapshot과 family가 일치하고 supporting evidence가 canonical하며 반증이 없고 비어 있지
 않은 supported harness claim이면 두 번째 승격 경로를 사용할 수 있습니다. harness-claim

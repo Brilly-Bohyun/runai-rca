@@ -103,7 +103,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `LLM_MODEL` | OpenAI-compatible model name, for example `auto-router` |
 | `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` / `LLM_MODEL_INSIGHT` | Optional stage-specific model overrides. Empty values fall back to `LLM_MODEL` |
 | `LLM_API_KEY` | OpenAI-compatible API key secret; enables conversational chat answers when all three LLM vars are set |
-| `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat and direct fallback reasoning), default `300`, `0` = unlimited |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat, and the direct HTTP transport used for stage model overrides), default `300`, `0` = unlimited |
 | `LLM_PRICING_JSON` | Optional JSON map for estimated LLM cost, keyed by model with `prompt_per_mtok` and `completion_per_mtok` values |
 | `ENABLE_NAT_RUNTIME` | Run analysis through the in-process NeMo Agent Toolkit engine; default `true` |
 | `NAT_CONFIG_FILE` | Internal NeMo engine workflow config path, default `configs/runai_rca_engine.yml` |
@@ -128,6 +128,8 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `ANALYSIS_BACKFILL_INTERVAL_SECONDS` | Backend: how often to re-drive alerts left without a completed RCA, default `300` (`0` disables) |
 | `ANALYSIS_BACKFILL_BATCH` | Backend: alerts re-driven per backfill tick, default `10` |
 | `ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS` | Backend: cooldown before retrying a failed alert, default `900` |
+| `FX_RATE_URL` | Backend: USD→KRW feed for the LLM cost panel, refreshed at startup and daily at 09:00 KST. Empty or unreachable keeps the fallback, and the panel labels the figure as one |
+| `FX_USD_KRW_FALLBACK` | Backend: rate used when the feed is unreachable, default `1452`. Set it to something current on a cluster without egress |
 | `EMBEDDING_URL` | Backend: OpenAI-compatible `/embeddings` endpoint for similar-incident search. Empty = offline feature-hash fallback (default, lexical) |
 | `EMBEDDING_MODEL` | Backend: embedding model name (with `EMBEDDING_URL`) |
 | `EMBEDDING_DIM` | Backend: embedding vector dimension, default `384`. Must match the model; changing it requires re-embedding existing rows |
@@ -155,6 +157,12 @@ NeMo Agent Toolkit workflow:
   transport during analysis.
 - `NAT_CONFIG_FILE` is an internal fixed path baked into the agent image.
   Overriding it in deployments is unsupported.
+- NAT owns the default model, and an unusable NAT reply is **not** retried over
+  the direct HTTP transport: repeating the same generation only burned the shared
+  analysis deadline and produced a composite error describing the retry rather
+  than the cause. NAT's own error is the answer. Direct HTTP still serves the
+  calls NAT is not wired for — a stage model override, or no NAT client — and
+  keeps its own length retry.
 
 Example Helm override for a LiteLLM/OpenAI-compatible endpoint:
 
@@ -180,6 +188,7 @@ Frequently tuned Helm values:
 | `backend.env.knowledgeValidatorUrl` | Override the approval-time Agent validator base URL; empty uses the in-cluster Agent service and the backend appends `/knowledge/validate` |
 | `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
 | `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` / `manualAgentRequestTimeoutSeconds` | Backend startup DB timeout, automatic/chat Agent timeout, and operator-triggered analysis timeout |
+| `backend.env.fxRateUrl` / `backend.env.fxUsdKrwFallback` | USD→KRW feed and offline fallback for the LLM cost panel; a cluster without egress keeps the fallback for the life of the deployment |
 | `secrets.keys.*` | Existing Secret key names for DB, Run:ai, Grafana, NVIDIA, and LLM credentials |
 | `secrets.existingSecret` | Existing Secret for Run:ai/NVIDIA/LLM credentials and, by default, DB keys |
 | `secrets.databaseExistingSecret` | Existing Secret used only for `DATABASE_URL` / `POSTGRES_DSN` |

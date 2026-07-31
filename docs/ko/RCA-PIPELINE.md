@@ -166,6 +166,17 @@ PromQL을 끌어옵니다. 이는 LLM이 없을 때에도 수집을 반복적으
 | loki | `logql_query` | range query 전용 |
 | runai | `runai_api_search` + `runai_api_get` | GET 전용, 경로는 `/api/`로 시작해야 함(메서드 하드코딩) |
 | postgres | `sql_select` | 단일 `SELECT`/`WITH`, READ ONLY 트랜잭션, 자동 `LIMIT 50` |
+| *모든* 에이전트 | `knowledge_lookup` | 프로세스 내 카탈로그 조회. 클러스터 호출 없음, 도메인 경계 넘지 않음 |
+
+`knowledge_lookup`은 루프 도중 "이것에 대해 이미 알려진 것이 무엇인가"에 답하므로, 쿼리를
+세 번 돌린 뒤에 새 가설을 세운 에이전트가 plan 단계에서 가져온 지식에만 묶이지 않습니다.
+랭커가 쓰는 것과 동일한 병합 맵 — 버전 관리되는 카탈로그 + 운영자 승인 런타임 지식 — 을
+읽으므로, plan 작성 이후에 승인된 지식에도 도달합니다. 각 항목은 출처(`curated` /
+`learned` / `novel`)와 `matcher_only`를 함께 실어 보냅니다. novel family는 보고할 root
+cause가 아니라 검증할 안내이기 때문입니다. 이 도구의 답변은 의도적으로 **artifact를 만들지
+않습니다** — 에이전트는 루프 안에서 답을 보고 실행 기록은 `details.knowledge_lookups`에
+남지만, 큐레이션 문구가 관측 증거 텍스트에 들어가면 시그니처 매처가 우리 카탈로그를
+클러스터가 보고한 내용으로 되읽기 때문입니다.
 
 postgres 에이전트는 `RUNAI_DB_DSN`이 설정되면 RCA 스토어뿐 아니라 **Run:ai 컨트롤 플레인
 데이터베이스 자체**에 질의합니다(workloads/audit/authorization/… 스키마). 도구 설명은

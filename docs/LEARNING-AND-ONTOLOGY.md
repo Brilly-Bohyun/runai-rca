@@ -140,6 +140,23 @@ How active and shadow packages actually feed a live analysis is governed by the
 runtime activation ladder (`DYNAMIC_KNOWLEDGE_MODE`: off/shadow/assist/
 authoritative) — see [Knowledge Base](KNOWLEDGE-BASE.md#3-how-knowledge-is-used-during-an-analysis).
 
+**What activation actually moves**, since it is routinely read as writing the
+graph: activating a package turns on symptom matching, its confirmed
+remediation, and the diagnostic steps it registers into future plans. The graph
+is updated separately, by the hourly mirror above.
+
+**When matcher-only knowledge recurs.** A `novel_*` family can never headline an
+RCA — by design. Once the same mechanism has backed three separate cases,
+`supporting_case_count` says so and the candidate detail asks for a catalog look:
+promotion into `families.yaml` stays a **human edit** of the closed catalog, because
+an automatic one would hand the vocabulary back to the LLM, which is the thing
+the closed catalog exists to prevent.
+
+An approved package only *points* at probes; the runbook tree owns their
+contents. If a rename or removal in the tree drops a template an operator
+approved, the plan now says so instead of coming back one probe shorter with
+nothing to explain it.
+
 Candidate compilation prefers the complete trace-v3 ledger path. A supported
 harness claim can provide a second promotion path when the ledger is incomplete,
 but only when its family matches the approved snapshot and its supporting
