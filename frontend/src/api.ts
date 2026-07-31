@@ -318,6 +318,12 @@ export async function decideKnowledgeCandidate(id: string, action: 'approve' | '
   });
 }
 
+// Housekeeping for dead rows only: the backend refuses anything that is not
+// validation_failed or rejected.
+export async function deleteKnowledgeCandidate(id: string): Promise<void> {
+  await mutate<Envelope<{ candidate_id: string }>>('DELETE', `/api/v1/knowledge-candidates/${encodeURIComponent(id)}`);
+}
+
 // Only the remediation wording is writable during review; evidence, keywords,
 // mechanism, and identity stay immutable on the backend.
 export async function editKnowledgeCandidateActions(id: string, actions: string[]): Promise<void> {

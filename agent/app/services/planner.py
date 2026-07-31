@@ -408,6 +408,7 @@ def _registered_tree_probes(tree: object, template_ids: tuple[str, ...]) -> list
         return []
     requested = set(template_ids)
     matched: list[dict] = []
+    seen: set[str] = set()
     for step_id in sorted(tree["nodes"]):
         node = tree["nodes"].get(step_id)
         if not isinstance(node, dict):
@@ -422,6 +423,16 @@ def _registered_tree_probes(tree: object, template_ids: tuple[str, ...]) -> list
             probe["id"] = template_id
             probe["template_id"] = template_id
             matched.append(probe)
+            seen.add(template_id)
+    # An approved package can only POINT at probes; the runbook tree owns their
+    # contents. A rename or removal in the tree therefore silently drops the
+    # diagnostic step an operator approved — say so, since nothing else will.
+    if missing := sorted(requested - seen):
+        _log.warning(
+            "approved knowledge requested %d probe template(s) absent from the runbook tree: %s",
+            len(missing),
+            ", ".join(missing),
+        )
     return matched
 
 

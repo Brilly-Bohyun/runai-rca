@@ -1600,6 +1600,41 @@ func (s *Store) RejectShadowKnowledgeCandidate(id string, request KnowledgeDecis
 	return cloneKnowledgeCandidate(candidate), cloneKnowledgePackage(pkg), nil
 }
 
+// DeleteKnowledgeCandidate removes a dead candidate and its audit trail for
+// good. Only the two terminal states an operator can never act on again are
+// deletable; every live status keeps its history. A candidate id is
+// content-derived, so this is housekeeping, not censorship: an evaluation that
+// reproduces the same knowledge regenerates the row.
+func (s *Store) DeleteKnowledgeCandidate(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := s.knowledgeCandidates[id]
+	if candidate == nil {
+		return errors.New("knowledge candidate not found")
+	}
+	if candidate.Status != knowledgeCandidateValidationFailed && candidate.Status != knowledgeCandidateRejected {
+		return errors.New("only a validation_failed or rejected candidate can be deleted")
+	}
+	// Match by the package's own candidate reference rather than the candidate's
+	// PackageID: a withdrawn candidate keeps a stale/empty id while the package
+	// row is what the runtime snapshot actually serves.
+	for _, pkg := range s.knowledgePackages {
+		if pkg != nil && pkg.CandidateID == id && pkg.Status != knowledgePackageRetired {
+			return errors.New("candidate still owns a live knowledge package; retire it first")
+		}
+	}
+	if !s.deleteKnowledgeCandidateLocked(id) {
+		return errors.New("could not persist knowledge candidate deletion")
+	}
+	delete(s.knowledgeCandidates, id)
+	for eventID, event := range s.knowledgeEvents {
+		if event != nil && event.CandidateID == id {
+			delete(s.knowledgeEvents, eventID)
+		}
+	}
+	return nil
+}
+
 func (s *Store) RejectKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

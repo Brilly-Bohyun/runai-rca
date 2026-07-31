@@ -41,6 +41,7 @@ from ontology.load_knowledge import (
     _ensure_symptom,
     _relate_indicates,
     _relate_resolved_by,
+    _selected_values,
 )
 from ontology.normalization import confidence_score, workload_uid
 
@@ -1209,6 +1210,7 @@ def _write_workload_topology(tx: Any, inc: OntologyIncident) -> None:
 # actions an operator marked resolved/mitigated. The hash-bound evaluation must
 # explicitly confirm the persisted family; analysis prose is never a label.
 
+_PROMOTED_PREFIX = "confirmed:"
 _ACTION_CAP = 3
 _ACTION_MAXLEN = 200
 
@@ -1316,13 +1318,66 @@ def _promotion_from_row(row: dict[str, Any]) -> tuple[str, str, list[str]] | Non
 
 def _promote_one(tx: Any, alert_name: str, family: str, actions: list[str]) -> None:
     """Idempotent knowledge insert (reuses load_knowledge's _exists helpers)."""
-    name = f"confirmed:{alert_name}"
+    name = f"{_PROMOTED_PREFIX}{alert_name}"
     _ensure_cause(tx, family)
     _ensure_symptom(tx, name, [alert_name.strip().lower()])
     _relate_indicates(tx, name, family)
     for statement in actions[:_ACTION_CAP]:
         _ensure_action(tx, statement)
         _relate_resolved_by(tx, name, statement)
+
+
+def _purge_promoted_one(tx: Any, name: str) -> None:
+    """Retract one promoted symptom: its edges first, then the symptom itself.
+
+    Only ``confirmed:`` names are ever passed here — that prefix is written by
+    _promote_one and by nothing else, so a curated symptom can never be caught
+    by this. Actions are left in place: an action statement is shared, and an
+    orphan action is inert without a resolved_by edge.
+    """
+    for relation, role in (("indicates", "symptom"), ("resolved_by", "symptom")):
+        tx.query(
+            f"match $rel isa {relation}, links ({role}: $s); "
+            f'$s isa symptom, has name "{esc(name)}"; delete $rel;'
+        ).resolve()
+    tx.query(f'match $s isa symptom, has name "{esc(name)}"; delete $s;').resolve()
+
+
+def _purge_promoted_knowledge() -> int:
+    """Remove every alertname-keyed promotion from the graph.
+
+    The promotion taught the graph "this alert name means this family" from a
+    single approved incident, with no retraction path — a second incident with
+    the same alert and a different cause silently overwrote the first, and a
+    knowledge candidate rejected later could not take it back. Graph knowledge
+    now comes only from operator-reviewed knowledge packages.
+    """
+    from typedb.driver import TransactionType
+
+    from app.ontology.typedb_client import open_driver
+
+    settings = load_settings()
+    with open_driver(settings) as driver:
+        with driver.transaction(settings.typedb_database, TransactionType.READ) as tx:
+            names = sorted(
+                name
+                for name in _selected_values(tx, "$s isa symptom, has name $n;", "n")
+                if name.startswith(_PROMOTED_PREFIX)
+            )
+        if not names:
+            print("purge: no promoted alertname symptoms found")
+            return 0
+        purged = 0
+        for name in names:
+            try:
+                with driver.transaction(settings.typedb_database, TransactionType.WRITE) as tx:
+                    _purge_promoted_one(tx, name)
+                    tx.commit()
+                purged += 1
+            except Exception as exc:  # noqa: BLE001 - report and continue the batch
+                print(f"  ! purge {name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    print(f"purge: removed {purged} of {len(names)} promoted alertname symptom(s)")
+    return purged
 
 
 def _promote(rows: list[dict[str, Any]]) -> tuple[int, int]:
@@ -1393,10 +1448,21 @@ def main() -> int:
     parser.add_argument(
         "--promote-knowledge",
         action="store_true",
-        help="also promote resolved, operator-family-confirmed RCAs "
-        "into the knowledge layer (symptom -> root_cause -> action); default off",
+        help="DEPRECATED: teach the graph 'this alert name means this family' from "
+        "one approved incident. Off by default and left only for recovery: it has "
+        "no retraction path, and reviewed knowledge packages are the supported way "
+        "to add graph knowledge",
+    )
+    parser.add_argument(
+        "--purge-promoted-knowledge",
+        action="store_true",
+        help="remove every alertname-keyed promotion (confirmed:*) from the graph "
+        "and exit; curated and package-derived knowledge are untouched",
     )
     args = parser.parse_args()
+    if args.purge_promoted_knowledge:
+        _purge_promoted_knowledge()
+        return 0
 
     rows = asyncio.run(_fetch(args.limit, args.resolved_grace_hours))
     incidents = [_to_incident(r) for r in rows]

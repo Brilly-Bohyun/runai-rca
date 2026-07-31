@@ -2021,3 +2021,26 @@ func TestIncidentDetailKeepsTraceMetadataForChatEvidence(t *testing.T) {
 		t.Fatalf("unexpected chat trace projection: %+v", detail.EvidenceTrace)
 	}
 }
+
+// Auto must take over the backfill row for the same alert: backfill is this
+// system's own retry of the analysis auto owes that alert, so keeping both left
+// two full artifact payloads per alert. Operator-authored rows stay protected —
+// see TestCreateAutoAnalysisRunDoesNotReuseManualRun.
+func TestAutoRunReusesBackfillRowForSameAlert(t *testing.T) {
+	store := NewStore()
+	first, ok := store.CreateAnalysisRunIfAllowed("backfill", "alert", "ALR-1", "INC-1", "ALR-1", "backfill", "")
+	if !ok {
+		t.Fatal("backfill run was not created")
+	}
+	store.analysisRuns[first.RunID].Status = "complete"
+	second, ok := store.CreateAnalysisRunIfAllowed("auto", "alert", "ALR-1", "INC-1", "ALR-1", "auto", "")
+	if !ok {
+		t.Fatal("auto run was not created")
+	}
+	if second.RunID != first.RunID {
+		t.Fatalf("auto must reuse the alert's backfill row, got %s after %s", second.RunID, first.RunID)
+	}
+	if len(store.analysisRuns) != 1 {
+		t.Fatalf("expected one run row per alert, got %d", len(store.analysisRuns))
+	}
+}

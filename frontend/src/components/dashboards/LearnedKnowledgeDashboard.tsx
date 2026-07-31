@@ -1,8 +1,9 @@
-import { CheckCircle2, FileSearch, ListChecks, PackageCheck, Pencil, RotateCcw, ShieldCheck, Tag, XCircle, Zap } from 'lucide-react';
+import { CheckCircle2, ExternalLink, FileSearch, ListChecks, PackageCheck, Pencil, RotateCcw, ShieldCheck, Tag, Trash2, XCircle, Zap } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import {
   decideKnowledgeCandidate,
+  deleteKnowledgeCandidate,
   editKnowledgeCandidateActions,
   fetchKnowledgeCandidates,
   fetchKnowledgePackages,
@@ -12,6 +13,8 @@ import {
 } from '../../api';
 import { KnowledgeCandidate, KnowledgePackage, KnowledgeRuntimeSnapshot, ProbeMetricsSnapshot } from '../../types';
 import { formatTime, Status } from '../../utils/formatters';
+import { knowledgeMessageKo } from '../../utils/knowledgeMessages';
+import { hashForDetail } from '../../utils/routing';
 import { Metric } from '../common/UiParts';
 
 type CandidateFilter = 'all' | 'generated' | 'validation_failed' | 'ready_for_review' | 'shadow' | 'active' | 'rejected' | 'superseded' | 'retired';
@@ -114,13 +117,27 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
 
   const decide = async (candidate: KnowledgeCandidate, action: CandidateAction) => {
     const label = decisionConfirmLabel(action);
-    if (!window.confirm(`${label} this incident-derived knowledge candidate?`)) return;
+    if (!window.confirm(`이 인시던트에서 학습한 지식 후보를 ${label}하시겠습니까?`)) return;
     setBusyID(candidate.candidate_id);
     try {
       await decideKnowledgeCandidate(candidate.candidate_id, action);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : `Could not ${label.toLowerCase()} candidate.`);
+      setError(err instanceof Error ? err.message : `후보를 ${label}하지 못했습니다.`);
+    } finally {
+      setBusyID('');
+    }
+  };
+
+  const remove = async (candidate: KnowledgeCandidate) => {
+    if (!window.confirm('이 후보를 영구 삭제할까요? 검토 이력도 함께 사라집니다.')) return;
+    setBusyID(candidate.candidate_id);
+    try {
+      await deleteKnowledgeCandidate(candidate.candidate_id);
+      setSelectedID('');
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '후보를 삭제하지 못했습니다.');
     } finally {
       setBusyID('');
     }
@@ -132,7 +149,7 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
       await editKnowledgeCandidateActions(candidate.candidate_id, actions);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not save candidate actions.');
+      setError(err instanceof Error ? err.message : '조치를 저장하지 못했습니다.');
       throw err;
     } finally {
       setBusyID('');
@@ -140,13 +157,13 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
   };
 
   const retire = async (item: KnowledgePackage) => {
-    if (!window.confirm(`Retire ${item.title}? It will no longer be active at runtime.`)) return;
+    if (!window.confirm(`${item.title}을(를) 은퇴시킬까요? 런타임에서 더 이상 사용되지 않습니다.`)) return;
     setBusyID(item.package_id);
     try {
       await retireKnowledgePackage(item.package_id);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not retire package.');
+      setError(err instanceof Error ? err.message : '패키지를 은퇴시키지 못했습니다.');
     } finally {
       setBusyID('');
     }
@@ -162,7 +179,7 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
         <Metric label="Probe templates observed" value={probeMetrics.metrics.length} />
       </section>
 
-      {error && <div className="error-banner">{error}</div>}
+      {error && <div className="error-banner">{knowledgeMessageKo(error)}</div>}
 
       <section className="knowledge-status-strip" aria-label="Knowledge runtime status">
         <div>
@@ -240,7 +257,7 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
 
         <section className="knowledge-panel candidate-detail-panel">
           {selected ? (
-            <CandidateDetail key={selected.candidate_id} candidate={selected} matchingPackage={matchingPackage} busy={busyID === selected.candidate_id} onDecide={decide} onEditActions={editActions} />
+            <CandidateDetail key={selected.candidate_id} candidate={selected} matchingPackage={matchingPackage} busy={busyID === selected.candidate_id} onDecide={decide} onDelete={remove} onEditActions={editActions} />
           ) : (
             <EmptyState text="Select a candidate to inspect its evidence and provenance." />
           )}
@@ -307,8 +324,10 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
 
 // Confirm-dialog verb per decision. 'approve' publishes an active package, so
 // it confirms as Activate — and shadow/activate must never read as Reject.
+// The confirm dialog and the failure that may follow it are one interaction —
+// a Korean warning after an English question reads as a half-translated screen.
 export function decisionConfirmLabel(action: CandidateAction): string {
-  return { approve: 'Activate', shadow: 'Shadow', activate: 'Activate', reject: 'Reject' }[action];
+  return { approve: '활성화', shadow: 'shadow로 등록', activate: '활성화', reject: '거부' }[action];
 }
 
 export function CandidateDetail({
@@ -316,12 +335,14 @@ export function CandidateDetail({
   matchingPackage,
   busy,
   onDecide,
+  onDelete,
   onEditActions,
 }: {
   candidate: KnowledgeCandidate;
   matchingPackage?: KnowledgePackage;
   busy: boolean;
   onDecide: (candidate: KnowledgeCandidate, action: CandidateAction) => Promise<void>;
+  onDelete?: (candidate: KnowledgeCandidate) => Promise<void>;
   onEditActions?: (candidate: KnowledgeCandidate, actions: string[]) => Promise<void>;
 }) {
   const evidence = candidate.evidence_summaries ?? [];
@@ -335,6 +356,9 @@ export function CandidateDetail({
     candidate.status === 'validation_failed' &&
     ((candidate.validation_error ?? '').startsWith('knowledge validator rejected candidate') ||
       candidate.validation_error === 'agent semantic validation rejected compiled package');
+  // Housekeeping for rows no decision can ever revive; the backend enforces the
+  // same two statuses.
+  const canDelete = candidate.status === 'validation_failed' || candidate.status === 'rejected';
   const [editingActions, setEditingActions] = useState(false);
   const [draftActions, setDraftActions] = useState('');
   // Reviewers judge the knowledge CHAIN (symptoms → cause → family, plus the
@@ -374,6 +398,16 @@ export function CandidateDetail({
       </div>
       <div className="knowledge-detail-content">
         <p className="knowledge-summary">{candidate.summary || 'No candidate summary was reported.'}</p>
+        {catalogReviewDue(candidate) && (
+          // A novel family can never headline an RCA, by design. Once the same
+          // mechanism keeps recurring that ceiling starts costing accuracy, and
+          // nothing else in the product says so. Promotion stays a human edit of
+          // the closed catalog — this only asks for the look.
+          <p className="knowledge-catalog-review">
+            Seen in {candidate.supporting_case_count} cases and still matcher-only — worth
+            reviewing for the root-cause catalog so it can name a root cause.
+          </p>
+        )}
         <dl className="knowledge-causal-chain">
           <div className="knowledge-causal-step">
             <span className="knowledge-causal-icon" aria-hidden="true"><Tag size={15} /></span>
@@ -458,7 +492,19 @@ export function CandidateDetail({
         </dl>
 
         <div className="knowledge-meta-line">
-          <span>Incident {candidate.incident_id || 'not reported'}</span>
+          {candidate.incident_id ? (
+            // The candidate is only reviewable against the incident it came
+            // from, and finding it by id in the incident list is a chore.
+            <a
+              aria-label={`인시던트 ${candidate.incident_id} 열기`}
+              className="knowledge-incident-link"
+              href={hashForDetail('incident', candidate.incident_id, 'incidents')}
+            >
+              <ExternalLink size={13} /> 인시던트 {candidate.incident_id}
+            </a>
+          ) : (
+            <span>Incident not reported</span>
+          )}
           <span>Observed {candidate.created_at ? formatTime(candidate.created_at) : 'not reported'}</span>
           {candidate.decided_at && <span>Decided {formatTime(candidate.decided_at)}</span>}
           {candidate.decided_by && <span>by {candidate.decided_by}</span>}
@@ -467,7 +513,9 @@ export function CandidateDetail({
           ))}
         </div>
 
-        {candidate.validation_error && <p className="knowledge-validation-error">Validation: {candidate.validation_error}</p>}
+        {candidate.validation_error && (
+          <p className="knowledge-validation-error">검증 실패: {knowledgeMessageKo(candidate.validation_error)}</p>
+        )}
 
         <IngestionPreview candidate={candidate} />
 
@@ -511,6 +559,13 @@ export function CandidateDetail({
           </button>
         </div>
       )}
+      {canDelete && onDelete && (
+        <div className="knowledge-review-actions">
+          <button className="ghost-button danger-button" disabled={busy} onClick={() => void onDelete(candidate)} type="button">
+            <Trash2 size={16} /> {busy ? 'Deleting…' : 'Delete candidate'}
+          </button>
+        </div>
+      )}
     </>
   );
 }
@@ -525,10 +580,19 @@ export function IngestionPreview({ candidate }: { candidate: KnowledgeCandidate 
     (mode.symptoms ?? []).map((symptom) => ({ family: mode.family, ...symptom })),
   );
   if (symptoms.length === 0) return null;
+  const novel = candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world';
   return (
     <section className="knowledge-ingestion-preview">
       <strong>Ingestion preview — what activation writes</strong>
-      {candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world' && <small>Activation matches future incidents but never names the headline family.</small>}
+      {/* Approving here is not the same act as approving the incident, and the
+          two were routinely confused. Name the three things this button moves. */}
+      <small>
+        Activating reaches the analysis engine within ~30s: these keywords join symptom
+        matching, the confirmed actions become its remediation, and this candidate’s
+        diagnostic steps are registered into future investigation plans. The knowledge
+        graph is updated separately by the hourly mirror.
+      </small>
+      {novel && <small>Activation matches future incidents but never names the headline family.</small>}
       {symptoms.map((symptom, index) => (
         <div className="knowledge-ingestion-symptom" key={symptom.name || index}>
           <span>
@@ -590,6 +654,17 @@ function safeProvenanceEntries(provenance?: Record<string, unknown>): Array<[str
 function evidenceSourceLabel(item: { source?: string; source_group?: string }) {
   const sources = [item.source_group, item.source].filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index);
   return sources.length > 0 ? sources.join(' · ') : 'source not reported';
+}
+
+// Three independent incidents is the point where "one operator's one-off" stops
+// being a fair reading of a novel mechanism.
+const CATALOG_REVIEW_CASES = 3;
+
+export function catalogReviewDue(candidate: KnowledgeCandidate): boolean {
+  return (
+    candidate.payload?.matcher_only === true &&
+    (candidate.supporting_case_count ?? 1) >= CATALOG_REVIEW_CASES
+  );
 }
 
 function supportingCaseLabel(candidate: KnowledgeCandidate) {

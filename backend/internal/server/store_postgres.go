@@ -2249,6 +2249,44 @@ func (s *Store) persistKnowledgePackageRetirementLocked(pkg *KnowledgePackage, e
 	return true
 }
 
+// deleteKnowledgeCandidateLocked drops one dead candidate with its case links
+// and events. There are no foreign keys in this schema, so the child rows are
+// removed explicitly in the same transaction.
+func (s *Store) deleteKnowledgeCandidateLocked(id string) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge candidate delete transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, statement := range []string{
+		`DELETE FROM knowledge_candidate_cases WHERE candidate_id = $1`,
+		`DELETE FROM knowledge_events WHERE candidate_id = $1`,
+		`DELETE FROM knowledge_candidates WHERE candidate_id = $1`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement, id); err != nil {
+			log.Printf("Failed to delete knowledge candidate %s: %v", id, err)
+			return false
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge candidate deletion %s: %v", id, err)
+		return false
+	}
+	committed = true
+	return true
+}
+
 func persistKnowledgeCandidateTx(ctx context.Context, tx *sql.Tx, candidate *KnowledgeCandidate) bool {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge_candidates (candidate_id, case_id, knowledge_fingerprint, supporting_case_count, incident_id, run_id, status, package_id, content_hash, validation_error, trace, payload, decided_at, decided_by, decision_note, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) ON CONFLICT (candidate_id) DO NOTHING`, candidate.CandidateID, candidate.CaseID, candidate.KnowledgeFingerprint, candidate.SupportingCaseCount, candidate.IncidentID, candidate.RunID, candidate.Status, candidate.PackageID, candidate.ContentHash, candidate.ValidationError, mustJSON(candidate.Trace), mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.CreatedAt, candidate.UpdatedAt); err != nil {
 		log.Printf("Failed to persist knowledge candidate %s: %v", candidate.CandidateID, err)

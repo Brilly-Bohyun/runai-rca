@@ -162,7 +162,10 @@ pgvector 유사도와 레이블 중첩으로는 표현할 수 없는 관계형 �
   16개의 근본 원인(root cause) 패밀리.
 - **수집(Ingestion)**(`agent/ontology/ingest.py`, CronJob): Dashboard 승인을 받고 유예 기간 이후
   해결된 `incidents`/`alerts`를 그래프로 결정론적으로 투영합니다(`requireApproval=true`가 기본값).
-  운영자가 확인한 RCA를 재사용 가능한 지식으로 승격할 수 있습니다(`--promote-knowledge`).
+  케이스 사실만 투영합니다. 인시던트 한 건으로 "알림 이름 X = 패밀리 Y"를 그래프에 가르치던
+  `--promote-knowledge`는 폐기되었고 기본 비활성입니다 — 키워드 하나로 헤드라인 패밀리를
+  승격시키면서 철회 경로가 없었습니다. 그래프 지식은 검토를 거친 지식 패키지로만 추가하며,
+  기존 승격분은 `python -m ontology.ingest --purge-promoted-knowledge`로 제거합니다.
 - **강화(Enrichment)**(`agent/app/services/kg_enrichment.py`): 오케스트레이터는 평면
   수집기가 놓치는 사실을 그래프에 질의합니다 — 노드 blast radius, 저장된 RCA를 가진 동일 알림의
   이전 인시던트(`enrich`), 근본 원인 체인을 동반한 그래프 도출 패밀리/XID 교정

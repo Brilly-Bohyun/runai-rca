@@ -123,8 +123,18 @@ at alert time.
 Backend Postgres is the authority for package approval, activation, and
 retirement. A `shadow` package is observed but not active; `activate` explicitly
 enables it; `approve` validates and activates it; `reject`/`retired` keep it out
-of runtime use. The TypeDB package-mirror CronJob copies summaries and approved
-template bindings for graph queries; it never changes activation.
+of runtime use. The TypeDB package-mirror CronJob projects an ACTIVE package's
+compiled knowledge into the graph as ordinary `symptom` / `indicates` /
+`resolved_by` — the same shapes curated knowledge uses, so every existing graph
+consumer picks it up with no second query — alongside the package summary and
+approved template bindings. It never changes activation.
+
+Each mirrored symptom carries `learned_package_id`, which is the retraction key:
+retiring the package removes exactly those rows and nothing else, and a curated
+symptom that happens to share a name is left alone (the curated one wins, and the
+skip is counted in the job output). `novel_*` families are deliberately not
+mirrored: they are matcher-only and the pipeline drops non-catalog families from
+graph knowledge, so writing them would add a root cause the graph can never use.
 
 How active and shadow packages actually feed a live analysis is governed by the
 runtime activation ladder (`DYNAMIC_KNOWLEDGE_MODE`: off/shadow/assist/

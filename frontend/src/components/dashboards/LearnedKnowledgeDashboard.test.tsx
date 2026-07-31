@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
 import type { KnowledgeCandidate } from '../../types';
-import { CandidateDetail, decisionConfirmLabel, IngestionPreview } from './LearnedKnowledgeDashboard';
+import { CandidateDetail, catalogReviewDue, decisionConfirmLabel, IngestionPreview } from './LearnedKnowledgeDashboard';
 
 function candidate(overrides: Partial<KnowledgeCandidate> = {}): KnowledgeCandidate {
   return {
@@ -125,9 +125,60 @@ describe('CandidateDetail', () => {
 
 describe('decisionConfirmLabel', () => {
   it('never confirms shadow or activate as a rejection', () => {
-    expect(decisionConfirmLabel('approve')).toBe('Activate');
-    expect(decisionConfirmLabel('shadow')).toBe('Shadow');
-    expect(decisionConfirmLabel('activate')).toBe('Activate');
-    expect(decisionConfirmLabel('reject')).toBe('Reject');
+    expect(decisionConfirmLabel('approve')).toBe('활성화');
+    expect(decisionConfirmLabel('shadow')).toBe('shadow로 등록');
+    expect(decisionConfirmLabel('activate')).toBe('활성화');
+    expect(decisionConfirmLabel('reject')).toBe('거부');
+    for (const action of ['approve', 'shadow', 'activate'] as const) {
+      expect(decisionConfirmLabel(action)).not.toBe(decisionConfirmLabel('reject'));
+    }
+  });
+});
+
+describe('catalogReviewDue', () => {
+  it('asks for a catalog look once a matcher-only mechanism keeps recurring', () => {
+    expect(catalogReviewDue(candidate({ payload: { matcher_only: true }, supporting_case_count: 3 }))).toBe(true);
+  });
+
+  it('stays quiet below the threshold and for families that can already headline', () => {
+    expect(catalogReviewDue(candidate({ payload: { matcher_only: true }, supporting_case_count: 2 }))).toBe(false);
+    expect(catalogReviewDue(candidate({ supporting_case_count: 9 }))).toBe(false);
+  });
+});
+
+describe('IngestionPreview', () => {
+  it('says what activating actually turns on, so it is not read as a graph write', () => {
+    const markup = renderToStaticMarkup(<IngestionPreview candidate={candidate()} />);
+    expect(markup).toContain('symptom matching');
+    expect(markup).toContain('investigation plans');
+    expect(markup).toContain('hourly mirror');
+  });
+});
+
+describe('CandidateDetail operator affordances', () => {
+  it('links straight to the incident the knowledge came from', () => {
+    const markup = renderToStaticMarkup(
+      <CandidateDetail
+        busy={false}
+        candidate={candidate({ incident_id: 'INC-42' })}
+        onDecide={async () => {}}
+      />,
+    );
+    expect(markup).toContain('href="#/incidents/incidents/INC-42"');
+  });
+
+  it('shows the validation refusal in Korean', () => {
+    const markup = renderToStaticMarkup(
+      <CandidateDetail
+        busy={false}
+        candidate={candidate({
+          status: 'validation_failed',
+          validation_error: 'operator evaluation no longer qualifies this analysis for runtime knowledge',
+        })}
+        onDecide={async () => {}}
+      />,
+    );
+    expect(markup).toContain('검증 실패');
+    expect(markup).toContain('운영자 평가가 더 이상');
   });
 });

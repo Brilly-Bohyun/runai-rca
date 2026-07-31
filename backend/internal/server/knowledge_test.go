@@ -1520,3 +1520,47 @@ func TestStillRejectedCandidateRerecordsTheValidatorReason(t *testing.T) {
 		t.Fatalf("operator must see the current validator reason, got %q", updated.ValidationError)
 	}
 }
+
+// Deleting is housekeeping for rows no decision can revive. It must refuse
+// anything still reviewable and anything still serving a live package, and it
+// must take the candidate's case links and events with it.
+func TestDeleteKnowledgeCandidateOnlyRemovesDeadRows(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.ApprovalState = "active"
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	candidate := knowledgeCandidateForSnapshotWithOutcome(snapshot, true, false)
+	if candidate == nil {
+		t.Fatal("fixture must produce a candidate")
+	}
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+	event := store.newKnowledgeEventLocked(candidate.CandidateID, "", "candidate_generated", "system", "", time.Now().UTC())
+	store.knowledgeEvents[event.EventID] = event
+
+	if err := store.DeleteKnowledgeCandidate(candidate.CandidateID); err == nil {
+		t.Fatal("a reviewable candidate must not be deletable")
+	}
+
+	candidate.Status = knowledgeCandidateValidationFailed
+	candidate.PackageID = "KPKG-1"
+	store.knowledgePackages["KPKG-1"] = &KnowledgePackage{
+		PackageID: "KPKG-1", CandidateID: candidate.CandidateID, Status: knowledgePackageActive,
+	}
+	if err := store.DeleteKnowledgeCandidate(candidate.CandidateID); err == nil {
+		t.Fatal("a candidate owning a live package must not be deletable")
+	}
+
+	store.knowledgePackages["KPKG-1"].Status = knowledgePackageRetired
+	if err := store.DeleteKnowledgeCandidate(candidate.CandidateID); err != nil {
+		t.Fatalf("deleting a withdrawn candidate failed: %v", err)
+	}
+	if _, ok := store.knowledgeCandidates[candidate.CandidateID]; ok {
+		t.Fatal("candidate row must be gone")
+	}
+	if _, ok := store.knowledgeEvents[event.EventID]; ok {
+		t.Fatal("candidate events must be gone")
+	}
+	if err := store.DeleteKnowledgeCandidate(candidate.CandidateID); err == nil {
+		t.Fatal("deleting a missing candidate must fail")
+	}
+}

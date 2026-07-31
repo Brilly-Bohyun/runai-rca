@@ -926,7 +926,12 @@ class KnowledgeRegistry:
                     self._mark_sync_success()
                     return False
                 response.raise_for_status()
-                snapshot = _validate_approved_snapshot(response.json())
+                # Serving path: keep every usable package even when one is not.
+                # Approval-time validation (validate_runtime_knowledge) stays
+                # strict, so a bad package is still refused where it is authored.
+                snapshot = _validate_approved_snapshot(
+                    response.json(), isolate_failures=True
+                )
             except Exception as exc:  # noqa: BLE001 - a sync must never stop RCA
                 self._last_sync_error = _sync_error(exc)
                 _log.warning("runtime knowledge refresh failed: %s", self._last_sync_error)
@@ -1188,7 +1193,9 @@ def load_runai_known_issues(path: str) -> list[dict[str, Any]]:
     return registry.known_issues(baseline) if registry else baseline
 
 
-def _validate_approved_snapshot(payload: Any) -> _ApprovedKnowledgeSnapshot:
+def _validate_approved_snapshot(
+    payload: Any, *, isolate_failures: bool = False
+) -> _ApprovedKnowledgeSnapshot:
     """Validate the entire backend snapshot before it is eligible for a swap.
 
     Snapshot packages are intentionally read-only and already validated. Each
@@ -1213,64 +1220,49 @@ def _validate_approved_snapshot(payload: Any) -> _ApprovedKnowledgeSnapshot:
     active_known_issues: list[dict[str, Any]] = []
     shadow_known_issues: list[dict[str, Any]] = []
     probe_template_ids: dict[str, dict[str, tuple[str, ...]]] = {}
+    rejected: list[str] = []
     active_package_ids: list[str] = []
     shadow_package_ids: list[str] = []
     for index, package in enumerate(packages):
-        if not isinstance(package, dict):
-            raise ValueError(f"package {index} must be an object")
-        package_id = package.get("package_id", package.get("id"))
-        if not isinstance(package_id, str) or not package_id.strip():
-            raise ValueError(f"package {index} requires package_id")
-        runtime_status = package.get(
-            "runtime_status", package.get("state", package.get("status"))
-        )
-        if runtime_status not in {"active", "shadow"}:
-            raise ValueError(f"package {package_id} has invalid runtime status")
+        try:
+            parsed = _validated_package(index, package)
+        except (TypeError, ValueError) as exc:
+            # One unusable package must not cost the operator every other
+            # approved package: a single bad row used to freeze the whole runtime
+            # revision, leaving the agent on stale knowledge with nothing but a
+            # sync warning to explain it. The strict path stays strict —
+            # validate_runtime_knowledge gates approval one package at a time and
+            # must still fail loudly there.
+            if not isolate_failures:
+                raise
+            _log.warning("dropping unusable knowledge package: %s", exc)
+            rejected.append(str(exc))
+            continue
+        package_id, runtime_status = parsed.package_id, parsed.runtime_status
         if runtime_status == "active":
-            active_package_ids.append(package_id.strip())
+            active_package_ids.append(package_id)
         else:
-            shadow_package_ids.append(package_id.strip())
-        contents = package.get("compiled", package.get("knowledge", package.get("payload")))
-        # The backend preserves package provenance in ``payload`` and places the
-        # safe, compiled subset under payload.compiled. Never inspect the rest of
-        # that payload (which may contain immutable case-snapshot metadata).
-        if isinstance(contents, dict) and isinstance(contents.get("compiled"), dict):
-            contents = contents["compiled"]
-        if not isinstance(contents, dict):
-            raise ValueError(f"package {package_id} compiled content must be an object")
-        kind = str(package.get("kind") or "").strip().lower()
-        entries = package.get("entries")
-        if not kind and not (
-            {"failure_modes", "known_issues", "probe_template_ids"} & contents.keys()
-        ):
-            raise ValueError(f"package {package_id} has no compiled knowledge")
-        raw_failure_modes = contents.get("failure_modes", [])
-        raw_known_issues = contents.get("known_issues", [])
-        if kind in {"failure_mode", "failure_modes"}:
-            raw_failure_modes = entries
-        elif kind in {"known_issue", "known_issues"}:
-            raw_known_issues = entries
-        validated_modes = _validate_runtime_failure_modes(
-            raw_failure_modes, package_id, runtime_status
-        )
-        for family, symptoms in validated_modes.items():
+            shadow_package_ids.append(package_id)
+        for family, symptoms in parsed.failure_modes.items():
             failure_modes.setdefault(family, []).extend(symptoms)
             if runtime_status == "active":
                 active_failure_modes.setdefault(family, []).extend(symptoms)
             else:
                 shadow_failure_modes.setdefault(family, []).extend(symptoms)
-        validated_issues = _validate_runtime_known_issues(
-            raw_known_issues, package_id, runtime_status
-        )
-        known_issues.extend(validated_issues)
+        known_issues.extend(parsed.known_issues)
         if runtime_status == "active":
-            active_known_issues.extend(validated_issues)
+            active_known_issues.extend(parsed.known_issues)
         else:
-            shadow_known_issues.extend(validated_issues)
-        for family, ids in _validate_runtime_probe_template_ids(
-            contents.get("probe_template_ids"), package_id
-        ).items():
-            probe_template_ids.setdefault(family, {})[package_id.strip()] = ids
+            shadow_known_issues.extend(parsed.known_issues)
+        for family, ids in parsed.probe_template_ids.items():
+            probe_template_ids.setdefault(family, {})[package_id] = ids
+    if packages and not (active_package_ids or shadow_package_ids):
+        # Every package was unusable: that is a bad snapshot, not a partial one.
+        # Raising keeps the last good revision instead of installing an empty
+        # catalog that silently answers "no learned knowledge" forever. Carry the
+        # per-package reasons — last_sync_error is where an operator reads WHY,
+        # and a bare "no usable package" sends them to the pod log to find out.
+        raise ValueError("no usable package in the snapshot: " + "; ".join(rejected))
 
     return _ApprovedKnowledgeSnapshot(
         revision=revision.strip(),
@@ -1307,6 +1299,69 @@ def _normalized_snapshot(snapshot: _ApprovedKnowledgeSnapshot) -> dict[str, Any]
     }
 
 
+@dataclass(frozen=True)
+class _ValidatedPackage:
+    """One package's compiled knowledge, fully validated and ready to merge."""
+
+    package_id: str
+    runtime_status: str
+    failure_modes: dict[str, list[dict[str, Any]]]
+    known_issues: list[dict[str, Any]]
+    probe_template_ids: dict[str, tuple[str, ...]]
+
+
+def _validated_package(index: int, package: Any) -> _ValidatedPackage:
+    if not isinstance(package, dict):
+        raise ValueError(f"package {index} must be an object")
+    package_id = package.get("package_id", package.get("id"))
+    if not isinstance(package_id, str) or not package_id.strip():
+        raise ValueError(f"package {index} requires package_id")
+    package_id = package_id.strip()
+    runtime_status = package.get("runtime_status", package.get("state", package.get("status")))
+    if runtime_status not in {"active", "shadow"}:
+        raise ValueError(f"package {package_id} has invalid runtime status")
+    contents = package.get("compiled", package.get("knowledge", package.get("payload")))
+    # The backend preserves package provenance in ``payload`` and places the
+    # safe, compiled subset under payload.compiled. Never inspect the rest of
+    # that payload (which may contain immutable case-snapshot metadata).
+    if isinstance(contents, dict) and isinstance(contents.get("compiled"), dict):
+        contents = contents["compiled"]
+    if not isinstance(contents, dict):
+        raise ValueError(f"package {package_id} compiled content must be an object")
+    kind = str(package.get("kind") or "").strip().lower()
+    entries = package.get("entries")
+    if not kind and not (
+        {"failure_modes", "known_issues", "probe_template_ids"} & contents.keys()
+    ):
+        raise ValueError(f"package {package_id} has no compiled knowledge")
+    raw_failure_modes = contents.get("failure_modes", [])
+    raw_known_issues = contents.get("known_issues", [])
+    if kind in {"failure_mode", "failure_modes"}:
+        raw_failure_modes = entries
+    elif kind in {"known_issue", "known_issues"}:
+        raw_known_issues = entries
+    # Shadow is observe-only: its symptoms already stay out of matching, and its
+    # probes must stay out of the PLAN for the same reason. Registering them made
+    # a shadow package change what the next analysis investigates, which is
+    # exactly the effect an operator postponed by choosing shadow.
+    probes = (
+        _validate_runtime_probe_template_ids(contents.get("probe_template_ids"), package_id)
+        if runtime_status == "active"
+        else {}
+    )
+    return _ValidatedPackage(
+        package_id=package_id,
+        runtime_status=runtime_status,
+        failure_modes=_validate_runtime_failure_modes(
+            raw_failure_modes, package_id, runtime_status
+        ),
+        known_issues=_validate_runtime_known_issues(
+            raw_known_issues, package_id, runtime_status
+        ),
+        probe_template_ids=probes,
+    )
+
+
 @lru_cache(maxsize=1)
 def _closed_family_set() -> frozenset[str]:
     import os
@@ -1339,7 +1394,17 @@ def _validate_runtime_failure_modes(
         # ranker vocabulary). A legacy or LLM-authored name must fail the
         # package here, not surface later as an ungroundable headline
         # (2026-07-24 audit, static defect 4).
-        if family.strip() not in _closed_family_set():
+        #
+        # ``novel_*`` is the one deliberate exception. The closed catalog is the
+        # HEADLINE vocabulary, and a novel family can never headline: it is
+        # matcher-only by construction (is_matcher_only_family), so it surfaces
+        # its mechanism and confirmed remediation as guidance without being able
+        # to name the root cause. Rejecting it here made the whole open-world
+        # path — mint family, review as novel, compile matcher-only — dead-end at
+        # approval, which is not what the matcher_only flag was built for.
+        if family.strip() not in _closed_family_set() and not is_matcher_only_family(
+            family.strip()
+        ):
             raise ValueError(
                 f"package {package_id} failure mode family {family.strip()!r} "
                 "is outside the closed catalog"

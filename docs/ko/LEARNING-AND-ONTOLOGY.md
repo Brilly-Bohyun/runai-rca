@@ -113,8 +113,16 @@ placeholder만 해결됩니다. Kubernetes, Loki, Prometheus, Run:ai, Postgres A
 
 Backend Postgres가 패키지 승인, 활성화, 은퇴의 권위자입니다. `shadow` 패키지는 관찰만 하고
 활성화되지 않으며, `activate`는 명시적으로 켭니다. `approve`는 검증 후 바로 활성화하고,
-`reject`/`retired`는 런타임 사용에서 제외합니다. TypeDB package-mirror CronJob은 그래프 질의를
-위해 요약과 승인된 template binding을 복사할 뿐 활성화 상태를 바꾸지 않습니다.
+`reject`/`retired`는 런타임 사용에서 제외합니다. TypeDB package-mirror CronJob은 **active**
+패키지의 compiled 지식을 큐레이션 지식과 동일한 형태(`symptom` / `indicates` / `resolved_by`)로
+그래프에 투영하며 — 그래서 기존 그래프 소비자가 별도 질의 없이 그대로 집어갑니다 — 패키지 요약과
+승인된 template binding도 함께 복사합니다. 활성화 상태는 바꾸지 않습니다.
+
+미러가 쓴 symptom에는 `learned_package_id`가 붙으며 이것이 철회 키입니다. 패키지가 은퇴하면
+정확히 그 행만 제거되고, 이름이 겹치는 큐레이션 symptom은 건드리지 않습니다(큐레이션이 이기며,
+건너뛴 수는 잡 출력에 집계됩니다). `novel_*` family는 의도적으로 미러링하지 않습니다 —
+matcher-only인 데다 파이프라인이 비카탈로그 family를 그래프 지식에서 버리므로, 써봐야 그래프가
+쓸 수 없는 root cause만 늘어납니다.
 
 active와 shadow 패키지가 실제로 실시간 분석에 어떻게 반영되는지는 런타임 활성화 사다리
 (`DYNAMIC_KNOWLEDGE_MODE`: off/shadow/assist/authoritative)가 결정합니다 —

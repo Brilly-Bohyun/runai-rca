@@ -93,6 +93,13 @@ from app.services.query_memory import QueryMemory, domain_query_key
 _log = logging.getLogger(__name__)
 
 _RESULT_CHARS = 1500  # per-query result excerpt fed back into the loop
+# Knowledge this agent may CONSULT, never evidence it observed. Its answers are
+# deliberately kept out of result.artifacts (see _run_query): curated wording in
+# the evidence text would be re-matched by the signature matchers as if the
+# cluster had reported it, which is how query strings once produced a
+# control-plane misdiagnosis on a run that observed nothing.
+_KNOWLEDGE_TOOL = "knowledge_lookup"
+_KNOWLEDGE_MATCH_CAP = 5
 _RUNAI_CLUSTER_ID_CACHE: dict[tuple[str, str], str] = {}
 _RUNAI_PROJECT_ID_CACHE: dict[tuple[str, str], str] = {}
 _USER_PROMPT_CHARS = 6000
@@ -725,6 +732,20 @@ async def _run_query(
             "outcome": json.dumps(history_outcome, default=str)[:_RESULT_CHARS],
         }
     )
+    if name == _KNOWLEDGE_TOOL:
+        # The agent gets the answer (history, above) and the run keeps a receipt
+        # (details, below) — but NO artifact. An artifact would put curated
+        # wording into _observed_text, where the signature matchers would read
+        # our own catalog back as something the cluster reported.
+        lookups = result.details.setdefault("knowledge_lookups", [])
+        if isinstance(lookups, list):
+            lookups.append(
+                {
+                    "query": str(args.get("hypothesis") or "")[:200],
+                    "summary": str(outcome.get("summary") or error or ""),
+                }
+            )
+        return False
     # Transport notes surface as collector warnings (Diagnostics panel), never
     # inside evidence summaries which feed the ranker/signature matchers.
     note = str(outcome.get("mcp_fallback") or "")
@@ -1818,6 +1839,71 @@ def _loki_label_reference(catalog: dict[str, list[str]]) -> str:
     return "; ".join(parts)[:1500]
 
 
+async def _tool_knowledge_lookup(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    """Answer 'what is known about this?' from the catalogs — no cluster call.
+
+    Reads the same merged map the ranker uses: the version-controlled catalog
+    PLUS operator-approved runtime knowledge (including matcher-only novel
+    families), so an agent mid-investigation can reach knowledge that landed
+    after its plan was written. Every entry is labelled with where it came from.
+    """
+    from app.knowledge import (
+        is_matcher_only_family,
+        load_failure_modes,
+        load_runai_known_issues,
+        match_failure_mode_symptoms,
+        match_runai_known_issues,
+    )
+
+    text = str(args.get("hypothesis") or args.get("text") or args.get("query") or "").strip()
+    if not text:
+        return {"error": "hypothesis text is required"}
+    lowered = text.lower()
+    symptoms: list[dict[str, Any]] = []
+    for family, symptom in match_failure_mode_symptoms(
+        load_failure_modes(settings.failure_modes_file), lowered
+    )[:_KNOWLEDGE_MATCH_CAP]:
+        if symptom.get("runtime_package_id"):
+            source = "novel" if is_matcher_only_family(family) else "learned"
+        else:
+            source = "curated"
+        symptoms.append(
+            {
+                "symptom": symptom.get("symptom"),
+                "family": family,
+                "source": source,
+                "matched_keywords": symptom.get("matched_keywords") or [],
+                "actions": list(symptom.get("actions") or [])[:3],
+                # A novel family is guidance only — it can never headline an RCA,
+                # and the agent should not treat it as a settled root cause.
+                "matcher_only": is_matcher_only_family(family),
+            }
+        )
+    issues = [
+        {
+            "issue": entry.get("issue"),
+            "family": entry.get("family"),
+            "fixed_version": entry.get("fixed_version") or "",
+            "actions": list(entry.get("actions") or [])[:3],
+        }
+        for entry in match_runai_known_issues(
+            load_runai_known_issues(settings.runai_known_issues_file), lowered
+        )[:_KNOWLEDGE_MATCH_CAP]
+    ]
+    if not symptoms and not issues:
+        return {
+            "summary": "no catalog or approved knowledge matches that text",
+            "result": {"symptoms": [], "known_issues": []},
+        }
+    return {
+        "summary": (
+            f"{len(symptoms)} known symptom(s), {len(issues)} known issue(s) "
+            "— guidance to test, not evidence"
+        ),
+        "result": {"symptoms": symptoms, "known_issues": issues},
+    }
+
+
 def _domain_tools(
     settings: Settings, loki_labels: dict[str, list[str]] | None = None
 ) -> dict[str, dict[str, dict[str, Any]]]:
@@ -2079,6 +2165,22 @@ def _domain_tools(
                 ),
                 "call": _tool_sql_select,
             }
+        }
+    # Every domain gets it: knowledge is not a domain, and the plan is written
+    # before the evidence exists — an agent that forms a new hypothesis mid-loop
+    # must be able to ask what is already known about it. It reads catalogs
+    # in-process, so it crosses no domain boundary and makes no cluster call.
+    for agent_tools in registry.values():
+        agent_tools[_KNOWLEDGE_TOOL] = {
+            "description": (
+                "Look up what is ALREADY KNOWN about a symptom or hypothesis: matching "
+                "catalog symptoms and operator-approved knowledge, each with its root-cause "
+                "family and confirmed remediation, plus matching Run:ai known issues. This "
+                "is guidance to TEST with your own domain tools — it is never evidence, and "
+                "an entry marked matcher_only must not be reported as the root cause. "
+                "args: hypothesis (the text you want to look up)"
+            ),
+            "call": _tool_knowledge_lookup,
         }
     return registry
 
