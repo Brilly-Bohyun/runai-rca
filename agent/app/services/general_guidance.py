@@ -114,6 +114,21 @@ def general_guidance_lines(
             )
             lines.extend(f"  - {_safe(check, active_masker, 360)}" for check in checks[:4])
 
+    # External support cases lead, under a heading of their own. They are the
+    # densest thing this block can offer — a real deployment that hit this exact
+    # signature, what was tried, and what actually helped — and as one bullet
+    # among a dozen generic checks they were read as filler.
+    external_lines = _external_case_lines(case_cards or [], language, active_masker)
+    if external_lines:
+        lines.extend(
+            [
+                "",
+                "**유사 지원 사례 (과거 기록)**" if language == "ko" else "**Related support cases (history)**",
+            ]
+        )
+        lines.extend(external_lines)
+        lines.append("")
+
     alert_actions = [str(a) for a in (matched_alert or {}).get("actions", [])][:3]
     if alert_actions:
         alert_name = _safe(
@@ -129,8 +144,6 @@ def general_guidance_lines(
             "not a confirmed cause for the current run:"
         )
         lines.extend(f"  - {_safe(action, active_masker, 360)}" for action in alert_actions)
-
-    lines.extend(_external_case_lines(case_cards or [], language, active_masker))
 
     for issue in match_runai_known_issues(known_issues, text)[:2]:
         name = _safe(issue.get("issue"), active_masker, 180)
