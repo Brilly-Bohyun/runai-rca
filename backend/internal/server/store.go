@@ -1864,6 +1864,13 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 				return cloneAnalysisRun(existing), false
 			}
 			reuseInPlace = true
+		} else if existing := s.latestReusableAnalysisRunLocked(targetType, targetID); existing != nil && existing.Source == "backfill" {
+			// A backfill row is this system's own retry of the analysis auto owes
+			// this alert, not operator work worth preserving (that is what the
+			// manual/chat rows are, and auto still leaves those alone). Without
+			// this, every alert first analyzed by backfill kept a second full
+			// row — artifact payload and all — the moment auto ran.
+			reuseInPlace = true
 		}
 	}
 	if reuseInPlace {
