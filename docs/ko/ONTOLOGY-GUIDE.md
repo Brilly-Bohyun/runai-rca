@@ -153,7 +153,7 @@ flowchart LR
 | `dependencies_for_component` / `checks_for_component_path` | 의존성 인식 점검 | 장애 주장 아님 |
 | `_BLAST_QUERY` | blast-radius 문맥 | 인과 증명 아님 |
 | `_PRIOR_QUERY` → `_CASE_CARD_QUERY` | 레이블된 과거 CaseCard 문맥 | evidence gate 통과 불가 |
-| `_KNOWLEDGE_QUERY`(승격된 `confirmed:{alert_name}` symptom 포함) | symptom별 remediation | 여전히 live 매치 필요 |
+| `_KNOWLEDGE_QUERY`(큐레이션 symptom. alertname 승격은 폐기·비활성) | symptom별 remediation | 여전히 live 매치 필요 |
 | `_FN_DIAGNOSTIC_TRANSITIONS` | diagnostic tree 전이 | 읽기 전용 planner 안내 |
 
 정밀 시그니처 매치가 검색의 시작점입니다. failure-mode symptom, NVIDIA XID 코드, alert text,
@@ -196,7 +196,7 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 | `dependencies_for_component` / `checks_for_component_path` | 이 컴포넌트는 무엇에 의존하며 무엇을 점검해야 하는가? |
 | `_BLAST_QUERY` | 노드의 blast radius는 무엇인가? |
 | `_PRIOR_QUERY` → `_CASE_CARD_QUERY` | 이전 동일-alert 인시던트의 CaseCard는 무엇인가? |
-| `_KNOWLEDGE_QUERY`(승격된 `confirmed:{alert_name}` symptom 포함) | live symptom에 맞는 조치는 무엇인가? |
+| `_KNOWLEDGE_QUERY`(큐레이션 symptom. alertname 승격은 폐기·비활성) | live symptom에 맞는 조치는 무엇인가? |
 | `_FN_DIAGNOSTIC_TRANSITIONS` | 이 diagnostic tree를 이어 가는 전이는 무엇인가? |
 
 ```typeql

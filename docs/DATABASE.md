@@ -200,7 +200,7 @@ the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
 |---|---|
 | ✅ Populated (`ontology/ingest.py`) | infra + incident layer + topology/`grouped_into` |
 | ✅ Knowledge (`load_knowledge` / `load_troubleshooting` / other `load_*`) | symptom/cause/action plus executable runbook steps, transitions, outcomes, recommendations, XIDs, and component dependencies |
-| 🟦 Promoted (`ingest.py --promote-knowledge`) | `confirmed:<alert>` symptom → family → action, from operator-confirmed RCAs |
+| ⛔ Retired (`ingest.py --promote-knowledge`) | `confirmed:<alert>` symptom → family → action. Deprecated and off: one alert-name keyword promoted a headline family with no retraction path. Purge leftovers with `ingest.py --purge-promoted-knowledge` |
 | ⬜ Modeled, not yet fed | GPU attrs |
 
 ---
@@ -212,7 +212,7 @@ the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
 | Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade hook (`typedb-schema-job.yaml`) |
 | Curated knowledge | `load_knowledge`, `load_troubleshooting`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | the `knowledge/` catalogs | Version-controlled files, run in the schema job |
 | Topology + incidents | `ontology/ingest.py` (CronJob) | Postgres `incidents`/`alerts` | Dashboard-approved (`user_approved_at`) and resolved ≥ `resolvedGraceHours` ago; `requireReview` is deprecated |
-| Knowledge promotion | `ingest.py --promote-knowledge` | operator-confirmed RCAs | Resolved + net-positive feedback |
+| ~~Knowledge promotion~~ | `ingest.py --promote-knowledge` | operator-confirmed RCAs | Deprecated, off by default — graph knowledge comes from reviewed knowledge packages |
 
 The **orchestrator** consults TypeDB during analysis
 (`agent/app/services/kg_enrichment.py`): node blast radius, prior same-alert

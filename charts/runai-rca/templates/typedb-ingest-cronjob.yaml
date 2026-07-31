@@ -1,7 +1,7 @@
 {{- if and .Values.typedb.enabled .Values.typedb.ingest.enabled }}
 {{- /* requireApproval=true -> ingest only Dashboard-approved incidents. */ -}}
 {{- $allFlag := ternary "" "--all " .Values.typedb.ingest.requireApproval }}
-{{- /* promoteKnowledge -> also learn confirmed RCAs into reusable knowledge (closes the loop) */ -}}
+{{- /* promoteKnowledge -> DEPRECATED alertname->family promotion; off by default. See values.yaml. */ -}}
 {{- $promoteFlag := ternary "--promote-knowledge " "" .Values.typedb.ingest.promoteKnowledge }}
 {{- /* generateDataset -> after ingest, accumulate confirmed/pending incident rows into the
        rca_dataset store (approve status from incidents.user_approved_at). Same job so it shares

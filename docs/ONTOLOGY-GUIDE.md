@@ -156,7 +156,7 @@ flowchart LR
 | `dependencies_for_component` / `checks_for_component_path` | Dependency-aware checks | Not an outage assertion |
 | `_BLAST_QUERY` | Blast-radius context | Not causal proof |
 | `_PRIOR_QUERY` → `_CASE_CARD_QUERY` | Labelled historical CaseCard context | Cannot satisfy evidence gate |
-| `_KNOWLEDGE_QUERY` (including promoted `confirmed:{alert_name}` symptoms) | Symptom-specific remediation | Live match still required |
+| `_KNOWLEDGE_QUERY` (curated symptoms; alertname promotions are deprecated and off) | Symptom-specific remediation | Live match still required |
 | `_FN_DIAGNOSTIC_TRANSITIONS` | Diagnostic-tree transitions | Read-only planner guidance |
 
 Fine-grained signature matching is the retrieval entry point. It searches
@@ -201,7 +201,7 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 | `dependencies_for_component` / `checks_for_component_path` | What does this component depend on and what should be checked? |
 | `_BLAST_QUERY` | What is the node blast radius? |
 | `_PRIOR_QUERY` → `_CASE_CARD_QUERY` | What CaseCard belongs to a prior same-alert incident? |
-| `_KNOWLEDGE_QUERY` (including promoted `confirmed:{alert_name}` symptoms) | Which action matches a live symptom? |
+| `_KNOWLEDGE_QUERY` (curated symptoms; alertname promotions are deprecated and off) | Which action matches a live symptom? |
 | `_FN_DIAGNOSTIC_TRANSITIONS` | Which transitions continue this diagnostic tree? |
 
 ```typeql

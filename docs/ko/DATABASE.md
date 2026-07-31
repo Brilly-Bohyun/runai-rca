@@ -196,7 +196,7 @@ GPU는 속성으로 모델링됩니다. `gpu_allocated`는 `node`만 소유하�
 |---|---|
 | ✅ 채워짐 (`ontology/ingest.py`) | 인프라 + 인시던트 계층 + 토폴로지/`grouped_into` |
 | ✅ 지식 (`load_knowledge` / `load_troubleshooting` / 기타 `load_*`) | symptom/cause/action과 실행형 runbook 단계·전이·결론·조치, XID, component 의존성 |
-| 🟦 승격됨 (`ingest.py --promote-knowledge`) | 운영자가 확인한 RCA로부터 `confirmed:<alert>` 증상 → 패밀리 → 조치 |
+| ⛔ 폐기됨 (`ingest.py --promote-knowledge`) | `confirmed:<alert>` 증상 → 패밀리 → 조치. 기본 비활성 — 알림 이름 키워드 하나가 헤드라인 패밀리를 승격시켰고 철회 경로가 없었습니다. 잔여분은 `ingest.py --purge-promoted-knowledge`로 제거 |
 | ⬜ 모델링됨, 아직 미공급 | GPU 속성 |
 
 ---
@@ -208,7 +208,7 @@ GPU는 속성으로 모델링됩니다. `gpu_allocated`는 `node`만 소유하�
 | Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade 훅 (`typedb-schema-job.yaml`) |
 | Curated knowledge | `load_knowledge`, `load_troubleshooting`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | `knowledge/` 카탈로그들 | 버전 관리되는 파일, 스키마 잡에서 실행 |
 | Topology + incidents | `ontology/ingest.py` (CronJob) | Postgres `incidents`/`alerts` | Dashboard 승인(`user_approved_at`) 후 resolved 상태로 `resolvedGraceHours` 이상 경과. `requireReview`는 deprecated |
-| Knowledge promotion | `ingest.py --promote-knowledge` | 운영자가 확인한 RCA | resolved + 순긍정 피드백 |
+| ~~Knowledge promotion~~ | `ingest.py --promote-knowledge` | 운영자가 확인한 RCA | 폐기·기본 비활성 — 그래프 지식은 검토를 거친 지식 패키지에서만 |
 
 **오케스트레이터**는 분석 중에 TypeDB를 참조합니다
 (`agent/app/services/kg_enrichment.py`): 노드 blast radius(영향 범위), 동일 알림의 이전

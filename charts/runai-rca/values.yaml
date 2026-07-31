@@ -127,10 +127,17 @@ typedb:
     requireApproval: true
     # Deprecated compatibility setting. It is not consulted by new chart logic.
     requireReview: null
-    # Promote only approved, non-abstained RCA knowledge. Recommended actions are
-    # still curated guidance; an action becomes verified only after an operator
-    # records an effective resolution outcome.
-    promoteKnowledge: true
+    # DEPRECATED, off by default. This taught the graph "alert name X means family
+    # Y" from a single approved incident: one keyword (the alert name), long enough
+    # to promote the headline family on its own, while alerts like CrashLoopBackOff
+    # have dozens of causes. It also had no retraction path — a symptom name holds
+    # exactly one family, so the newest approval silently replaced the previous
+    # one, and rejecting the knowledge later could not take it back.
+    # Graph knowledge belongs to the reviewed knowledge packages instead.
+    # Already promoted? Remove them with
+    #   python -m ontology.ingest --purge-promoted-knowledge
+    # Incident/workload/node facts and trace-v3 projection are unaffected.
+    promoteKnowledge: false
     # Also accumulate confirmed/pending incident rows into the rca_dataset store
     # (durable answer-key for eval), chained onto this same job so it runs right
     # after the KG refresh. Approval status comes from incidents.user_approved_at;

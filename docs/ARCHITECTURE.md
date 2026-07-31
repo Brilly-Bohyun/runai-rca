@@ -170,8 +170,12 @@ separate agent. Full detail: [Knowledge Base](KNOWLEDGE-BASE.md).
   with 16 root-cause families modeled as `sub` types.
 - **Ingestion** (`agent/ontology/ingest.py`, CronJob): a deterministic projection
   of Dashboard-approved, resolved `incidents`/`alerts` into the graph after a grace
-  window (`requireApproval=true` by default). It can promote operator-confirmed RCAs
-  into reusable knowledge (`--promote-knowledge`).
+  window (`requireApproval=true` by default). It projects case facts only. The old
+  `--promote-knowledge` flag, which taught the graph "alert name X means family Y"
+  from one incident, is deprecated and off: it promoted a headline family from a
+  single keyword and could never be retracted. Reviewed knowledge packages are the
+  supported way to add graph knowledge; purge past promotions with
+  `python -m ontology.ingest --purge-promoted-knowledge`.
 - **Enrichment** (`agent/app/services/kg_enrichment.py`): the orchestrator queries
   the graph for facts the flat collectors miss — node blast radius, prior
   same-alert incidents with their stored RCA (`enrich`), and graph-derived
