@@ -273,7 +273,7 @@ type HostedCostEstimate struct {
 //	OpenAI     developers.openai.com/api/docs/pricing
 //	Google     ai.google.dev/gemini-api/docs/pricing
 //
-// Prices below were read from those pages on 2026-07-30. Google's Pro tier
+// Prices below were read from those pages on 2026-07-31. Google's Pro tier
 // charges more above a 200k-token prompt; the cheaper band is used here because
 // a single RCA call never reaches it.
 var hostedRates = []struct {
@@ -286,8 +286,8 @@ var hostedRates = []struct {
 	{"Anthropic", "Claude Sonnet 5", 3.00, 15.00},
 	{"Anthropic", "Claude Haiku 4.5", 1.00, 5.00},
 	{"OpenAI", "GPT-5.6 Sol", 5.00, 30.00},
-	{"OpenAI", "GPT-5.6 Terra", 2.50, 15.00},
-	{"OpenAI", "GPT-5.6 Luna", 1.00, 6.00},
+	{"OpenAI", "GPT-5.6 Terra", 2.00, 12.00},
+	{"OpenAI", "GPT-5.6 Luna", 0.20, 1.20},
 	{"Google", "Gemini 3.1 Pro", 2.00, 12.00},
 	{"Google", "Gemini 3.6 Flash", 1.50, 7.50},
 	{"Google", "Gemini 3.5 Flash-Lite", 0.30, 2.50},
