@@ -1006,7 +1006,12 @@ async def _llm_refine(
         "node/system level first. "
         "If operator guidance is present it is a direct instruction from the human "
         "operator — honor it when ordering hypotheses and writing the narrative "
-        "(e.g. if it says this is a GPU problem, lead with the GPU/hardware path)."
+        "(e.g. if it says this is a GPU problem, lead with the GPU/hardware path). "
+        "Operator guidance often reports what they ALREADY DID (\"I raised the memory "
+        "limit and it still dies\"). Return those as attempted_actions (list of short "
+        "English statements, [] when none). An attempted fix that did not hold is a "
+        "CLUE, not a refutation: keep the family it targeted in play, but plan to "
+        "explain why the fix did not hold rather than repeating it."
     )
     if getattr(settings, "language", "en") == "ko":
         system += " Write the focus, reason, and narrative values in Korean."
@@ -1031,6 +1036,11 @@ async def _llm_refine(
     masker = _planner_masker(settings)
     focus = data.get("focus")
     strategy = data.get("strategy")
+    attempted = [
+        masker.mask_text(str(item).strip())[:200]
+        for item in (data.get("attempted_actions") or [])
+        if isinstance(item, str) and str(item).strip()
+    ][:5]
     narrative = data.get("narrative")
     hypotheses = _coerce_hypotheses(data.get("hypotheses"), masker)
     component_entry = (
@@ -1091,6 +1101,7 @@ async def _llm_refine(
         component_source="llm" if component_entry else plan.component_source,
         diagnostic_directive=plan.diagnostic_directive,
         case_cards=plan.case_cards,
+        attempted_actions=attempted or plan.attempted_actions,
     )
 
 

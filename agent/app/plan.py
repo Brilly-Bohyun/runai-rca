@@ -54,6 +54,13 @@ class InvestigationPlan:
     # Approved historical cases are priors only; collectors receive them to
     # choose discriminating tests, never as current-incident evidence.
     case_cards: list[dict[str, Any]] = field(default_factory=list)
+    # Remediations the operator says they ALREADY applied, read out of their own
+    # request ("I already raised the memory and it still dies"). They are the
+    # operator's claim, never an observation: they must not enter evidence text,
+    # and they do not refute a hypothesis on their own — "the fix did not hold"
+    # is itself a finding. What they must do is stop the investigation from
+    # handing the same failed step back as the answer.
+    attempted_actions: list[str] = field(default_factory=list)
     # Non-fatal planning anomalies (for example an unknown operator seed).
     warnings: list[str] = field(default_factory=list)
 
@@ -94,5 +101,6 @@ class InvestigationPlan:
             "component_source": self.component_source,
             "diagnostic_directive": self.diagnostic_directive,
             "case_cards": self.case_cards,
+            "attempted_actions": self.attempted_actions,
             "warnings": self.warnings,
         }

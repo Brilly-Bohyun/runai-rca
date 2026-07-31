@@ -1357,6 +1357,11 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         "registry and resolve their placeholders from the incident scope. External-case "
         "investigation leads are also unverified hypotheses, not evidence or fixes; use them "
         "only to choose a narrow query available in your registry.\n"
+        "- operator_already_attempted lists fixes the operator says they ALREADY applied "
+        "without resolving the problem. Treat each as a fact about the system, not as "
+        "evidence and not as a refutation: verify it actually took effect (the live spec, "
+        "the restart that followed), and prefer queries that explain why the problem "
+        "survived it. Never propose one of them as the next step.\n"
         "- Stay strictly read-only and inside your tools, and avoid blind sweeps — every "
         "query must test a specific idea. Batch all independent checks you can run now "
         "into the same queries array; query count is not the scarce resource, reasoning "
@@ -1398,6 +1403,10 @@ def _user_prompt(
         "plan_focus": plan_dict.get("focus"),
         "hypotheses": (plan_dict.get("hypotheses") or [])[:4],
         "historical_case_cards": (plan_dict.get("case_cards") or [])[:3],
+        # The operator's own report of what they already did. Not evidence and
+        # not a refutation — an investigator that ignores it spends the run
+        # re-proposing the step that already failed.
+        "operator_already_attempted": (plan_dict.get("attempted_actions") or [])[:5],
         "ontology_guidance": _ontology_guidance(plan, external_case_hints=external_case_hints),
     }
     if architecture:
