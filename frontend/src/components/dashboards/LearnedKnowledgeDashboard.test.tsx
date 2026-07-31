@@ -125,10 +125,13 @@ describe('CandidateDetail', () => {
 
 describe('decisionConfirmLabel', () => {
   it('never confirms shadow or activate as a rejection', () => {
-    expect(decisionConfirmLabel('approve')).toBe('Activate');
-    expect(decisionConfirmLabel('shadow')).toBe('Shadow');
-    expect(decisionConfirmLabel('activate')).toBe('Activate');
-    expect(decisionConfirmLabel('reject')).toBe('Reject');
+    expect(decisionConfirmLabel('approve')).toBe('활성화');
+    expect(decisionConfirmLabel('shadow')).toBe('shadow로 등록');
+    expect(decisionConfirmLabel('activate')).toBe('활성화');
+    expect(decisionConfirmLabel('reject')).toBe('거부');
+    for (const action of ['approve', 'shadow', 'activate'] as const) {
+      expect(decisionConfirmLabel(action)).not.toBe(decisionConfirmLabel('reject'));
+    }
   });
 });
 
@@ -149,5 +152,33 @@ describe('IngestionPreview', () => {
     expect(markup).toContain('symptom matching');
     expect(markup).toContain('investigation plans');
     expect(markup).toContain('hourly mirror');
+  });
+});
+
+describe('CandidateDetail operator affordances', () => {
+  it('links straight to the incident the knowledge came from', () => {
+    const markup = renderToStaticMarkup(
+      <CandidateDetail
+        busy={false}
+        candidate={candidate({ incident_id: 'INC-42' })}
+        onDecide={async () => {}}
+      />,
+    );
+    expect(markup).toContain('href="#/incidents/incidents/INC-42"');
+  });
+
+  it('shows the validation refusal in Korean', () => {
+    const markup = renderToStaticMarkup(
+      <CandidateDetail
+        busy={false}
+        candidate={candidate({
+          status: 'validation_failed',
+          validation_error: 'operator evaluation no longer qualifies this analysis for runtime knowledge',
+        })}
+        onDecide={async () => {}}
+      />,
+    );
+    expect(markup).toContain('검증 실패');
+    expect(markup).toContain('운영자 평가가 더 이상');
   });
 });

@@ -772,6 +772,26 @@ tbody tr:active td {
   color: var(--line);
 }
 
+.knowledge-incident-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  color: var(--accent, #2f6feb);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.knowledge-incident-link:hover,
+.knowledge-incident-link:focus-visible {
+  text-decoration: underline;
+}
+
+.knowledge-incident-link::after {
+  content: "·";
+  margin-left: 0.6rem;
+  color: var(--line);
+}
+
 .knowledge-action-edit {
   display: inline-flex;
   align-items: center;
