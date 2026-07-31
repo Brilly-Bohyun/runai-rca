@@ -452,3 +452,107 @@ def test_null_actions_and_probe_ids_validate_as_empty() -> None:
     compiled = result["normalized"]["failure_modes"]["workload_runtime_error"][0]
     assert compiled["actions"] == []
     assert compiled["actions_ko"] == []
+
+
+def test_shadow_package_probes_stay_out_of_the_plan():
+    """Shadow is observe-only: its probes must not steer the next investigation."""
+    from app.knowledge import KnowledgeRegistry, _validate_approved_snapshot
+
+    snapshot = _validate_approved_snapshot(
+        {
+            "revision": "rev-shadow-probe",
+            "packages": [
+                {
+                    "package_id": "KPKG-shadow",
+                    "state": "shadow",
+                    "compiled": {"probe_template_ids": {"workload_runtime_error": ["k8s_troubleshooting:admission_webhook_failure:p01"]}},
+                },
+                {
+                    "package_id": "KPKG-active",
+                    "state": "active",
+                    "compiled": {"probe_template_ids": {"workload_runtime_error": ["k8s_troubleshooting:api_server_failure:p01"]}},
+                },
+            ],
+        }
+    )
+    registry = KnowledgeRegistry(mode="assist")
+    registry._snapshot = snapshot
+    assert registry.probe_template_ids_for_family("workload_runtime_error") == ["k8s_troubleshooting:api_server_failure:p01"]
+
+
+def test_novel_family_package_is_accepted_as_matcher_only():
+    """Open-world knowledge may match; is_matcher_only_family keeps it off the headline."""
+    from app.knowledge import _validate_approved_snapshot, is_matcher_only_family
+
+    snapshot = _validate_approved_snapshot(
+        {
+            "revision": "rev-novel",
+            "packages": [
+                {
+                    "package_id": "KPKG-novel",
+                    "state": "active",
+                    "compiled": {
+                        "failure_modes": [
+                            {
+                                "family": "novel_gpu_fabric_flap_ab12cd34",
+                                "symptoms": [
+                                    {
+                                        "name": "fabric link flaps under sustained load",
+                                        "keywords": ["nvlink", "fabricmanager"],
+                                        "actions": ["reseat the affected link"],
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+    )
+    assert list(snapshot.failure_modes) == ["novel_gpu_fabric_flap_ab12cd34"]
+    assert is_matcher_only_family("novel_gpu_fabric_flap_ab12cd34")
+
+
+def test_one_unusable_package_does_not_sink_the_snapshot():
+    """A single bad row used to freeze the whole runtime revision."""
+    from app.knowledge import _validate_approved_snapshot
+
+    good = {
+        "package_id": "KPKG-good",
+        "state": "active",
+        "compiled": {
+            "failure_modes": [
+                {
+                    "family": "workload_runtime_error",
+                    "symptoms": [{"name": "oom", "keywords": ["oomkilled"], "actions": []}],
+                }
+            ]
+        },
+    }
+    bad = {
+        "package_id": "KPKG-legacy",
+        "state": "active",
+        "compiled": {
+            "failure_modes": [
+                {
+                    "family": "storage_io_error_legacy",
+                    "symptoms": [{"name": "x", "keywords": ["y"], "actions": []}],
+                }
+            ]
+        },
+    }
+    snapshot = _validate_approved_snapshot(
+        {"revision": "rev-mixed", "packages": [good, bad]}, isolate_failures=True
+    )
+    assert snapshot.active_package_ids == ("KPKG-good",)
+    assert list(snapshot.failure_modes) == ["workload_runtime_error"]
+
+    # Every package unusable is a bad snapshot, not a partial one: the caller
+    # must keep the last good revision rather than install an empty catalog.
+    with pytest.raises(ValueError):
+        _validate_approved_snapshot(
+            {"revision": "rev-bad", "packages": [bad]}, isolate_failures=True
+        )
+    # Approval-time validation stays strict.
+    with pytest.raises(ValueError):
+        _validate_approved_snapshot({"revision": "rev-bad", "packages": [bad]})
