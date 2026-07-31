@@ -394,6 +394,16 @@ export function CandidateDetail({
       </div>
       <div className="knowledge-detail-content">
         <p className="knowledge-summary">{candidate.summary || 'No candidate summary was reported.'}</p>
+        {catalogReviewDue(candidate) && (
+          // A novel family can never headline an RCA, by design. Once the same
+          // mechanism keeps recurring that ceiling starts costing accuracy, and
+          // nothing else in the product says so. Promotion stays a human edit of
+          // the closed catalog — this only asks for the look.
+          <p className="knowledge-catalog-review">
+            Seen in {candidate.supporting_case_count} cases and still matcher-only — worth
+            reviewing for the root-cause catalog so it can name a root cause.
+          </p>
+        )}
         <dl className="knowledge-causal-chain">
           <div className="knowledge-causal-step">
             <span className="knowledge-causal-icon" aria-hidden="true"><Tag size={15} /></span>
@@ -552,10 +562,19 @@ export function IngestionPreview({ candidate }: { candidate: KnowledgeCandidate 
     (mode.symptoms ?? []).map((symptom) => ({ family: mode.family, ...symptom })),
   );
   if (symptoms.length === 0) return null;
+  const novel = candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world';
   return (
     <section className="knowledge-ingestion-preview">
       <strong>Ingestion preview — what activation writes</strong>
-      {candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world' && <small>Activation matches future incidents but never names the headline family.</small>}
+      {/* Approving here is not the same act as approving the incident, and the
+          two were routinely confused. Name the three things this button moves. */}
+      <small>
+        Activating reaches the analysis engine within ~30s: these keywords join symptom
+        matching, the confirmed actions become its remediation, and this candidate’s
+        diagnostic steps are registered into future investigation plans. The knowledge
+        graph is updated separately by the hourly mirror.
+      </small>
+      {novel && <small>Activation matches future incidents but never names the headline family.</small>}
       {symptoms.map((symptom, index) => (
         <div className="knowledge-ingestion-symptom" key={symptom.name || index}>
           <span>
@@ -617,6 +636,17 @@ function safeProvenanceEntries(provenance?: Record<string, unknown>): Array<[str
 function evidenceSourceLabel(item: { source?: string; source_group?: string }) {
   const sources = [item.source_group, item.source].filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index);
   return sources.length > 0 ? sources.join(' · ') : 'source not reported';
+}
+
+// Three independent incidents is the point where "one operator's one-off" stops
+// being a fair reading of a novel mechanism.
+const CATALOG_REVIEW_CASES = 3;
+
+export function catalogReviewDue(candidate: KnowledgeCandidate): boolean {
+  return (
+    candidate.payload?.matcher_only === true &&
+    (candidate.supporting_case_count ?? 1) >= CATALOG_REVIEW_CASES
+  );
 }
 
 function supportingCaseLabel(candidate: KnowledgeCandidate) {

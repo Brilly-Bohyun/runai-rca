@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
 import type { KnowledgeCandidate } from '../../types';
-import { CandidateDetail, decisionConfirmLabel, IngestionPreview } from './LearnedKnowledgeDashboard';
+import { CandidateDetail, catalogReviewDue, decisionConfirmLabel, IngestionPreview } from './LearnedKnowledgeDashboard';
 
 function candidate(overrides: Partial<KnowledgeCandidate> = {}): KnowledgeCandidate {
   return {
@@ -129,5 +129,25 @@ describe('decisionConfirmLabel', () => {
     expect(decisionConfirmLabel('shadow')).toBe('Shadow');
     expect(decisionConfirmLabel('activate')).toBe('Activate');
     expect(decisionConfirmLabel('reject')).toBe('Reject');
+  });
+});
+
+describe('catalogReviewDue', () => {
+  it('asks for a catalog look once a matcher-only mechanism keeps recurring', () => {
+    expect(catalogReviewDue(candidate({ payload: { matcher_only: true }, supporting_case_count: 3 }))).toBe(true);
+  });
+
+  it('stays quiet below the threshold and for families that can already headline', () => {
+    expect(catalogReviewDue(candidate({ payload: { matcher_only: true }, supporting_case_count: 2 }))).toBe(false);
+    expect(catalogReviewDue(candidate({ supporting_case_count: 9 }))).toBe(false);
+  });
+});
+
+describe('IngestionPreview', () => {
+  it('says what activating actually turns on, so it is not read as a graph write', () => {
+    const markup = renderToStaticMarkup(<IngestionPreview candidate={candidate()} />);
+    expect(markup).toContain('symptom matching');
+    expect(markup).toContain('investigation plans');
+    expect(markup).toContain('hourly mirror');
   });
 });
