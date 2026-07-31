@@ -6798,3 +6798,115 @@ async def k8s_followup(
             )
         )
     return results
+
+
+# --- free-text target resolution ---------------------------------------------
+# An operator who opens a chat analysis names the subject in prose ("Thanos
+# Receive keeps OOMKilling"). resolve_target() only reads structured labels, so
+# such a request arrived with no namespace/pod/workload at all and every scoped
+# collector skipped itself — the run then abstained for lack of evidence it was
+# never allowed to look for.
+
+# Words that appear in problem descriptions and would match half a cluster.
+_TEXT_TARGET_STOPWORDS = frozenset(
+    {
+        "pod", "pods", "node", "nodes", "job", "jobs", "container", "containers",
+        "cluster", "namespace", "error", "errors", "issue", "failed", "failing",
+        "restart", "restarts", "memory", "cpu", "disk", "log", "logs", "help",
+        "crash", "crashing", "oomkilled", "crashloopbackoff", "please", "what",
+        "why", "how", "the", "and", "with", "from", "runai", "run", "kubernetes",
+    }
+)
+# Kinds whose metadata.name is the name a human actually types. Pods carry
+# controller-generated suffixes, and listing them cluster-wide is far heavier.
+_TEXT_TARGET_KINDS = ("deployments", "statefulsets", "daemonsets")
+
+
+def workload_name_candidates(text: str) -> list[str]:
+    """Resource-name candidates from free prose, longest first.
+
+    "Thanos Receive 가 OOMKilled 반복되어" -> ["thanos-receive", "thanos", "receive"]
+    Non-ASCII is dropped rather than transliterated: a Korean sentence names its
+    subject in ASCII anyway, and guessing at the rest invents targets.
+    """
+    words = [
+        word
+        for word in re.findall(r"[a-z][a-z0-9]+", (text or "").lower())
+        if word not in _TEXT_TARGET_STOPWORDS
+    ]
+    candidates: list[str] = []
+    for size in (3, 2):
+        for index in range(len(words) - size + 1):
+            candidates.append("-".join(words[index : index + size]))
+    # A single word must be distinctive on its own; short ones match everything.
+    candidates.extend(word for word in words if len(word) >= 6)
+    # Already-hyphenated names survive the split above, so add them back whole.
+    candidates.extend(
+        token
+        for token in re.findall(r"[a-z][a-z0-9-]{4,}", (text or "").lower())
+        if "-" in token
+    )
+    return list(dict.fromkeys(candidates))
+
+
+def _text_target_matches(name: str, candidates: list[str]) -> bool:
+    """Whether a resource name contains a candidate on hyphen boundaries.
+
+    Boundary-anchored so "thanos-receive" matches runai-backend-thanos-receive
+    but "receive" alone never matches receiver-gateway.
+    """
+    segments = [segment for segment in name.split("-") if segment]
+    for candidate in candidates:
+        parts = [part for part in candidate.split("-") if part]
+        if not parts:
+            continue
+        span = len(parts)
+        if any(segments[i : i + span] == parts for i in range(len(segments) - span + 1)):
+            return True
+    return False
+
+
+async def resolve_target_from_text(settings: Settings, text: str) -> tuple[str, str]:
+    """(namespace, workload) named in free prose, or ('', '') when unsure.
+
+    Verified against the live cluster: a name is only adopted when exactly one
+    workload matches, so a typo, a nickname, or a busy word resolves to nothing
+    rather than pointing the whole investigation at the wrong service.
+    """
+    candidates = workload_name_candidates(text)
+    if not candidates:
+        return "", ""
+    workloads: list[tuple[str, str]] = []
+    for kind in _TEXT_TARGET_KINDS:
+        listing = await k8s_read(settings, kind, full_object=True)
+        payload = _normalize_k8s_payload(listing.get("data"))
+        items = payload.get("items") if isinstance(payload, dict) else None
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            name = str(meta.get("name") or "")
+            namespace = str(meta.get("namespace") or "")
+            if name and namespace:
+                workloads.append((namespace, name))
+    # Most specific candidate first: "thanos-receive" must still resolve on a
+    # cluster that also runs thanos-query, where the bare word "thanos" is
+    # ambiguous and correctly resolves to nothing.
+    for candidate in candidates:
+        matches = list(
+            dict.fromkeys(
+                (namespace, name)
+                for namespace, name in workloads
+                if _text_target_matches(name, [candidate])
+            )
+        )
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            _log.warning(
+                "operator text '%s' matched %d workloads (%s); trying a narrower name",
+                candidate,
+                len(matches),
+                ", ".join(f"{ns}/{name}" for ns, name in matches[:4]),
+            )
+    return "", ""

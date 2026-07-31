@@ -377,6 +377,45 @@ def _pin_resolved_target_identity(state: PipelineState) -> None:
     plan.workload = target.workload_name
 
 
+async def _resolve_free_text_target(state: PipelineState) -> None:
+    """Adopt a live workload named in the operator's request, when unambiguous.
+
+    Only for a request that carries no target at all: an alert with labels is
+    already scoped, and prose must never override structured identity. Silent
+    when nothing resolves — a wrong target is worse than none, since every
+    collector would then investigate the wrong service with full confidence.
+    """
+    target = state.target
+    if target.namespace or target.pod or target.workload_name or state.plan is None:
+        return
+    text = " ".join(
+        part
+        for part in (
+            state.request.alert.annotations.get("operator_prompt"),
+            state.request.alert.annotations.get("summary"),
+            state.request.alert.annotations.get("description"),
+        )
+        if part
+    ).strip()
+    if not text:
+        return
+    from app.collectors.kubernetes import resolve_target_from_text
+
+    try:
+        namespace, workload = await resolve_target_from_text(state.settings, text)
+    except Exception:  # noqa: BLE001 - an unscoped run is the status quo, not a failure
+        _log.warning("free-text target resolution failed", exc_info=True)
+        return
+    if not namespace or not workload:
+        return
+    _log.info("plan: operator request resolved to workload %s/%s", namespace, workload)
+    state.plan.workload = workload
+    state.plan.namespaces = [namespace, *[ns for ns in state.plan.namespaces if ns != namespace]]
+    state.extra_warnings.append(
+        f"target read from the operator's request and confirmed live: {namespace}/{workload}"
+    )
+
+
 def _apply_effective_target(state: PipelineState) -> AnalysisTarget:
     """Persist the one target identity used after planning.
 
@@ -811,6 +850,11 @@ async def plan_stage(state: PipelineState) -> PipelineState:
     # CrashLoop occurrences) and carry no node label — so kubernetes GETs 404 and
     # the system agent skips node/kernel evidence entirely. Re-resolve a LIVE pod
     # and its node ONCE here; every collector then scopes off the plan.
+    # A chat-initiated request names its subject in prose, not in labels, so it
+    # arrives with no namespace/pod/workload and every scoped collector skips
+    # itself. Read the subject out of the operator's own sentence and verify it
+    # against the live cluster before adopting it.
+    await _resolve_free_text_target(state)
     seed_pod = state.plan.pod or state.target.pod
     if state.target.namespace and seed_pod and not _is_resolved_reanalysis(state.request):
         from app.collectors.kubernetes import resolve_live_pod_node
