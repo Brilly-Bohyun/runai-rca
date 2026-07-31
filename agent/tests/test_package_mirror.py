@@ -58,3 +58,39 @@ def test_package_bindings_use_only_compiled_template_identifiers() -> None:
     assert mirror_packages._compiled_template_ids(
         {"compiled": {"probe_template_ids": {"scheduling_capacity": [123]}}}
     ) == []
+
+
+def test_compiled_symptoms_excludes_novel_families():
+    """novel_* is matcher-only and the pipeline drops it from graph knowledge:
+    writing it would add a root_cause subtype the graph can never use."""
+    from ontology.mirror_packages import _compiled_symptoms
+
+    payload = {
+        "compiled": {
+            "failure_modes": [
+                {
+                    "family": "workload_runtime_error",
+                    "symptoms": [
+                        {
+                            "name": "kernel OOM killer terminates the container",
+                            "keywords": ["OOMKilled", " "],
+                            "actions": ["raise the memory limit", ""],
+                        }
+                    ],
+                },
+                {
+                    "family": "novel_fabric_flap_ab12cd34",
+                    "symptoms": [{"name": "fabric flaps", "keywords": ["nvlink"]}],
+                },
+                {"family": "workload_runtime_error", "symptoms": [{"name": "no keywords"}]},
+            ]
+        }
+    }
+    assert _compiled_symptoms(payload) == [
+        (
+            "workload_runtime_error",
+            "kernel OOM killer terminates the container",
+            ["oomkilled"],
+            ["raise the memory limit"],
+        )
+    ]

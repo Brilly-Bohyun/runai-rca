@@ -47,6 +47,11 @@ attribute subtype, value string;
 attribute statement, value string;
 attribute statement_ko, value string;
 attribute exclusive_actions, value boolean;
+# Stamped ONLY on symptoms the package mirror wrote from an approved knowledge
+# package. It is the retraction key: when the package is retired the mirror
+# removes exactly what it created, and an untagged (curated) symptom of the
+# same name is never touched.
+attribute learned_package_id, value string;
 attribute created_at, value datetime;
 # --- XID GPU-error catalog attributes ---
 attribute xid_code, value integer;
@@ -250,6 +255,7 @@ entity symptom sub signal,
     # clarity alongside the multi-valued keyword above.
     owns affected_version @card(0..1),
     owns fixed_version @card(0..1),
+    owns learned_package_id @card(0..1),
     plays has_symptom:symptom,
     plays indicates:symptom,
     plays resolved_by:symptom,
