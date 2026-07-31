@@ -85,6 +85,14 @@ func (s *Server) handleKnowledge(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		if len(parts) == 1 && r.Method == http.MethodDelete {
+			if err := s.store.DeleteKnowledgeCandidate(parts[0]); err != nil {
+				knowledgeError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, envelope(map[string]string{"candidate_id": parts[0]}))
+			return
+		}
 		if len(parts) == 2 && parts[1] == "decision" && r.Method == http.MethodPost {
 			s.handleKnowledgeCandidateDecision(w, r, parts[0])
 			return

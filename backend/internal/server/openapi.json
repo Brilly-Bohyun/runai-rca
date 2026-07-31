@@ -475,6 +475,20 @@
           },
           "404": { "$ref": "#/components/responses/Error" }
         }
+      },
+      "delete": {
+        "tags": ["Knowledge"],
+        "summary": "Delete a validation_failed or rejected candidate",
+        "description": "Housekeeping only. Any other status is a conflict, and a candidate owning a live package must have it retired first.",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "200": {
+            "description": "Candidate removed with its case links and events",
+            "content": { "application/json": { "example": { "status": "ok", "data": { "candidate_id": "kc_44ab19" } } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
       }
     },
     "/api/v1/knowledge-candidates/{id}/decision": {

@@ -1,8 +1,9 @@
-import { CheckCircle2, FileSearch, ListChecks, PackageCheck, Pencil, RotateCcw, ShieldCheck, Tag, XCircle, Zap } from 'lucide-react';
+import { CheckCircle2, FileSearch, ListChecks, PackageCheck, Pencil, RotateCcw, ShieldCheck, Tag, Trash2, XCircle, Zap } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import {
   decideKnowledgeCandidate,
+  deleteKnowledgeCandidate,
   editKnowledgeCandidateActions,
   fetchKnowledgeCandidates,
   fetchKnowledgePackages,
@@ -126,6 +127,20 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
     }
   };
 
+  const remove = async (candidate: KnowledgeCandidate) => {
+    if (!window.confirm('Delete this dead candidate permanently? Its review history goes with it.')) return;
+    setBusyID(candidate.candidate_id);
+    try {
+      await deleteKnowledgeCandidate(candidate.candidate_id);
+      setSelectedID('');
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not delete candidate.');
+    } finally {
+      setBusyID('');
+    }
+  };
+
   const editActions = async (candidate: KnowledgeCandidate, actions: string[]) => {
     setBusyID(candidate.candidate_id);
     try {
@@ -240,7 +255,7 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
 
         <section className="knowledge-panel candidate-detail-panel">
           {selected ? (
-            <CandidateDetail key={selected.candidate_id} candidate={selected} matchingPackage={matchingPackage} busy={busyID === selected.candidate_id} onDecide={decide} onEditActions={editActions} />
+            <CandidateDetail key={selected.candidate_id} candidate={selected} matchingPackage={matchingPackage} busy={busyID === selected.candidate_id} onDecide={decide} onDelete={remove} onEditActions={editActions} />
           ) : (
             <EmptyState text="Select a candidate to inspect its evidence and provenance." />
           )}
@@ -316,12 +331,14 @@ export function CandidateDetail({
   matchingPackage,
   busy,
   onDecide,
+  onDelete,
   onEditActions,
 }: {
   candidate: KnowledgeCandidate;
   matchingPackage?: KnowledgePackage;
   busy: boolean;
   onDecide: (candidate: KnowledgeCandidate, action: CandidateAction) => Promise<void>;
+  onDelete?: (candidate: KnowledgeCandidate) => Promise<void>;
   onEditActions?: (candidate: KnowledgeCandidate, actions: string[]) => Promise<void>;
 }) {
   const evidence = candidate.evidence_summaries ?? [];
@@ -335,6 +352,9 @@ export function CandidateDetail({
     candidate.status === 'validation_failed' &&
     ((candidate.validation_error ?? '').startsWith('knowledge validator rejected candidate') ||
       candidate.validation_error === 'agent semantic validation rejected compiled package');
+  // Housekeeping for rows no decision can ever revive; the backend enforces the
+  // same two statuses.
+  const canDelete = candidate.status === 'validation_failed' || candidate.status === 'rejected';
   const [editingActions, setEditingActions] = useState(false);
   const [draftActions, setDraftActions] = useState('');
   // Reviewers judge the knowledge CHAIN (symptoms → cause → family, plus the
@@ -508,6 +528,13 @@ export function CandidateDetail({
         <div className="knowledge-review-actions">
           <button className="primary-button" disabled={busy} onClick={() => void onDecide(candidate, 'activate')} type="button">
             <CheckCircle2 size={16} /> {busy ? 'Saving…' : 'Activate shadow package'}
+          </button>
+        </div>
+      )}
+      {canDelete && onDelete && (
+        <div className="knowledge-review-actions">
+          <button className="ghost-button danger-button" disabled={busy} onClick={() => void onDelete(candidate)} type="button">
+            <Trash2 size={16} /> {busy ? 'Deleting…' : 'Delete candidate'}
           </button>
         </div>
       )}
