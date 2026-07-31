@@ -102,6 +102,25 @@ control plane (the #1 accuracy complaint).
   Run:ai scheduler subsystem.
 - **Optional LLM refine**: sharpens focus/hypotheses/strategy when an LLM is
   configured. Any failure → the deterministic plan stands.
+- **Free-text target** (chat requests only): a chat-initiated analysis names its
+  subject in prose and arrives with no namespace/pod/workload, so every scoped
+  collector used to skip itself and the run abstained for lack of evidence it was
+  never allowed to look for. When — and only when — a request carries no target
+  at all, the plan stage reads candidate names out of the operator's sentence and
+  verifies them against live deployments/statefulsets/daemonsets (their
+  `metadata.name` is the name a human types; pod names carry generated suffixes).
+  Matching is anchored on hyphen boundaries, so `thanos-receive` matches
+  `runai-backend-thanos-receive` but never `receiver-gateway`, and candidates are
+  tried most-specific-first. A name that matches two workloads, or none, resolves
+  to nothing: an unscoped run is the status quo, while a wrong target sends every
+  collector after the wrong service with full confidence. Structured identity
+  always wins.
+- **Already-attempted actions**: the planner LLM also returns `attempted_actions`
+  from the operator's own sentence ("…even after I raised the memory"), and the
+  plan carries them. An attempted fix that did not hold is a **clue, not a
+  refutation** — the family it targeted stays in play and the plan is told to
+  explain why it did not hold. The claims stay out of evidence text: they are what
+  the operator says, not what the cluster reported.
 
 ## 2. Parallel evidence collectors (7)
 
@@ -179,6 +198,10 @@ vice versa:
 | runai | `runai_api_search` + `runai_api_get` | GET-only, path must start `/api/` (method hardcoded) |
 | postgres | `sql_select` | single `SELECT`/`WITH`, READ ONLY transaction, auto `LIMIT 50` |
 | *every* agent | `knowledge_lookup` | in-process catalog read, no cluster call and no domain boundary crossed |
+
+Each loop also receives the plan's `operator_already_attempted` list, with the
+instruction to verify the fix actually took effect and to prefer queries that
+explain why the problem survived it — never to propose it as the next step.
 
 `knowledge_lookup` answers "what is already known about this?" mid-loop, so an
 agent that forms a hypothesis three queries in is not stuck with the knowledge
@@ -337,6 +360,20 @@ gets the old limit as its new request (its demonstrated working set), twice the
 old limit as the new ceiling, and a ready-to-run command — `kubectl set
 resources` only for kinds kubectl can patch, `kubectl edit` on the owner for a
 CRD-owned Pod such as a Run:ai or Grove workload.
+
+**The operator's own request** gets its own block, and what they say they already
+tried is listed right under it — above the recommendations, so a reader who
+scrolls to the actions first already knows which step is off the table. A
+recommended action that restates an attempted one is **marked, not dropped**:
+"I raised the memory" does not make the memory path wrong (it may have been
+applied to the wrong container, or undone by a restart), and dropping the step
+would hide that.
+
+**Matching support cases lead the general-guidance block**, under their own
+heading. A signature-matched vendor case is the densest thing an evidence-free
+run can offer — a real deployment that hit this exact signature, what was tried,
+and what actually helped — and as one bullet among a dozen generic checks it read
+as filler. Still labelled history, never a confirmed cause for this run.
 
 When `language=ko` and an LLM is configured, `_translate_report_lines_ko` runs
 **last** — after the Self-Check, operator-question and general-guidance blocks
