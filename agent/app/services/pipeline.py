@@ -377,6 +377,45 @@ def _pin_resolved_target_identity(state: PipelineState) -> None:
     plan.workload = target.workload_name
 
 
+async def _resolve_free_text_target(state: PipelineState) -> None:
+    """Adopt a live workload named in the operator's request, when unambiguous.
+
+    Only for a request that carries no target at all: an alert with labels is
+    already scoped, and prose must never override structured identity. Silent
+    when nothing resolves — a wrong target is worse than none, since every
+    collector would then investigate the wrong service with full confidence.
+    """
+    target = state.target
+    if target.namespace or target.pod or target.workload_name or state.plan is None:
+        return
+    text = " ".join(
+        part
+        for part in (
+            state.request.alert.annotations.get("operator_prompt"),
+            state.request.alert.annotations.get("summary"),
+            state.request.alert.annotations.get("description"),
+        )
+        if part
+    ).strip()
+    if not text:
+        return
+    from app.collectors.kubernetes import resolve_target_from_text
+
+    try:
+        namespace, workload = await resolve_target_from_text(state.settings, text)
+    except Exception:  # noqa: BLE001 - an unscoped run is the status quo, not a failure
+        _log.warning("free-text target resolution failed", exc_info=True)
+        return
+    if not namespace or not workload:
+        return
+    _log.info("plan: operator request resolved to workload %s/%s", namespace, workload)
+    state.plan.workload = workload
+    state.plan.namespaces = [namespace, *[ns for ns in state.plan.namespaces if ns != namespace]]
+    state.extra_warnings.append(
+        f"target read from the operator's request and confirmed live: {namespace}/{workload}"
+    )
+
+
 def _apply_effective_target(state: PipelineState) -> AnalysisTarget:
     """Persist the one target identity used after planning.
 
@@ -811,6 +850,11 @@ async def plan_stage(state: PipelineState) -> PipelineState:
     # CrashLoop occurrences) and carry no node label — so kubernetes GETs 404 and
     # the system agent skips node/kernel evidence entirely. Re-resolve a LIVE pod
     # and its node ONCE here; every collector then scopes off the plan.
+    # A chat-initiated request names its subject in prose, not in labels, so it
+    # arrives with no namespace/pod/workload and every scoped collector skips
+    # itself. Read the subject out of the operator's own sentence and verify it
+    # against the live cluster before adopting it.
+    await _resolve_free_text_target(state)
     seed_pod = state.plan.pod or state.target.pod
     if state.target.namespace and seed_pod and not _is_resolved_reanalysis(state.request):
         from app.collectors.kubernetes import resolve_live_pod_node
@@ -4480,11 +4524,26 @@ def _detail_from(
         lines.extend(
             [
                 "",
-                "### Operator Guidance",
+                "### Operator Guidance" if language != "ko" else "### 운영자 요청",
                 "",
                 _short_sentence(active_masker.mask_text(str(operator_prompt)), limit=500),
             ]
         )
+        # What the operator already tried belongs next to their request, above the
+        # recommendations — a reader who scrolls to the actions first should
+        # already know which step is off the table.
+        attempted = list(getattr(plan, "attempted_actions", None) or [])
+        if attempted:
+            lines.extend(
+                [
+                    "",
+                    "이미 시도한 조치 (효과 없음)" if language == "ko" else "Already attempted (did not resolve it)",
+                    "",
+                ]
+            )
+            lines.extend(
+                f"- {_safe_line(item, limit=300, masker=active_masker)}" for item in attempted[:5]
+            )
     # ponytail: no "Agent Role Coverage" section — it was the same static
     # collector-catalog text in every report, telling the operator nothing about
     # THIS incident. (Kept in prompts.py for the NAT workflow's system prompt.)
@@ -5690,6 +5749,7 @@ def _numbered_actions(
     seen: set[str] = set()
     numbered: list[str] = []
     action_masker = build_masker(())
+    attempted = list(getattr(plan, "attempted_actions", None) or [])
     for action in ordered:
         action = _safe_line(
             fill_placeholders(str(action), observed), limit=420, masker=action_masker
@@ -5697,10 +5757,62 @@ def _numbered_actions(
         if not action or action in seen:
             continue
         seen.add(action)
+        # Marked, not removed. The operator saying "I raised the memory" does not
+        # make the memory path wrong — it may have been applied to the wrong
+        # container, or undone by a restart. Dropping the step would hide that;
+        # labelling it stops the report from reading as "do the thing you said
+        # you already did".
+        if _matches_attempted_action(action, attempted):
+            action = f"{action} {_already_attempted_note(language)}"
         numbered.append(f"{len(numbered) + 1}. {action}")
         if len(numbered) >= 8:
             break
     return numbered
+
+
+# Short, content-bearing tokens only: "the", "and", "memory" in both strings is
+# not a match, "resources.limits.memory" is.
+_ATTEMPTED_STOPWORDS = frozenset(
+    {"the", "and", "for", "with", "that", "this", "from", "into", "your", "its", "already"}
+)
+
+
+def _attempted_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9._-]{4,}", str(text).lower())
+        if token not in _ATTEMPTED_STOPWORDS
+    }
+
+
+def _matches_attempted_action(action: str, attempted: list[str]) -> bool:
+    """Whether a recommended action restates something the operator already did.
+
+    Deliberately a blunt token overlap. The operator writes free prose in any
+    language and the catalogue writes English imperatives, so there is no exact
+    key to join on; the planner LLM normalises the claim to a short English
+    statement first, which is what makes even this much possible.
+    # ponytail: token overlap, not embeddings — a missed mark costs a redundant
+    # line, and the report states the attempt separately either way.
+    """
+    if not attempted:
+        return False
+    action_tokens = _attempted_tokens(action)
+    if not action_tokens:
+        return False
+    for claim in attempted:
+        claim_tokens = _attempted_tokens(claim)
+        if len(claim_tokens) >= 2 and len(claim_tokens & action_tokens) >= 2:
+            return True
+    return False
+
+
+def _already_attempted_note(language: str) -> str:
+    return (
+        "(운영자가 이미 시도했다고 보고한 조치입니다 — 실제로 반영되었는지, 왜 효과가 없었는지 먼저 확인하세요.)"
+        if language == "ko"
+        else "(the operator reports already doing this — verify it took effect and why it did not hold)"
+    )
 
 
 def _root_cause_statement(request: AlertAnalysisRequest, *, language: str = "en") -> str:
