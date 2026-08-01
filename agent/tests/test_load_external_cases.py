@@ -134,6 +134,34 @@ def test_payload_maps_identity_actions_and_harness() -> None:
     assert ev["E002"]["confidence"] == "low"
 
 
+def test_family_candidates_reach_the_case_card() -> None:
+    """knowledge_links.family_candidates (curated differential diagnosis: other
+    plausible families the curator weighed) must survive into case_card,
+    bounded to the closed family catalog -- load_external_cases.py used to
+    read none of knowledge_links, so every payload authored it for nothing."""
+    p = _payload(knowledge_links={
+        "known_issue_matches": [],
+        "failure_mode_matches": [],
+        "family_candidates": [
+            {"family": "network_fabric_error", "confidence": "high"},
+            {"family": "platform_lifecycle_change", "confidence": "low"},
+            {"family": "not_a_real_family", "confidence": "high"},  # off-catalog: dropped
+        ],
+    })
+
+    inc = lx._to_incident(p, "op", "t")
+
+    assert inc.case_card["family_candidates"] == [
+        {"family": "network_fabric_error", "confidence": "high"},
+        {"family": "platform_lifecycle_change", "confidence": "low"},
+    ]
+
+
+def test_family_candidates_default_to_empty_list_without_knowledge_links() -> None:
+    inc = lx._to_incident(_payload(), "op", "t")
+    assert inc.case_card["family_candidates"] == []
+
+
 def test_unconfirmed_mechanism_is_prefixed_and_fingerprinted() -> None:
     p = _payload()
     p["incident"] = {**p["incident"], "confirmed_mechanism": None}

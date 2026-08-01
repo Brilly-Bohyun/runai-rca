@@ -767,7 +767,13 @@ def test_confidence_tier_precedes_raw_score_in_candidate_order() -> None:
     assert ranked[0] is corroborated
 
 
-def test_typed_fact_counts_once_and_scoped_contradiction_blocks_conclusion() -> None:
+def test_typed_fact_counts_once_and_scoped_contradiction_reaches_the_ranked_top() -> None:
+    """G4: a contradicted candidate stays low confidence (never a confident
+    headline) but must still land at ``ranked[0]`` -- that is the only slot
+    harness.evaluate inspects, and its ``unresolved_contradiction`` gate is
+    what turns this into a visible abstain. Silently substituting
+    ``insufficient_evidence`` here would erase the contradiction instead of
+    surfacing it."""
     support = artifact(
         agent="kubernetes",
         source="kubernetes",
@@ -803,7 +809,7 @@ def test_typed_fact_counts_once_and_scoped_contradiction_blocks_conclusion() -> 
     assert image.confidence == "low"
     assert image.support_evidence_ids == ["E01"]
     assert image.contradiction_evidence_ids == ["E02"]
-    assert ranked[0].family == "insufficient_evidence"
+    assert ranked[0] is image
 
 
 def test_postgres_prior_history_cannot_create_current_catalog_cause() -> None:

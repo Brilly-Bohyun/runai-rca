@@ -369,7 +369,7 @@ def merge_open_world_candidates(
         contradict = _fact_ids(
             item.get("contradiction_evidence_ids") or item.get("evidence_against")
         )
-        if not mechanism or not support or contradict:
+        if not mechanism or not support:
             continue
         # Evidence IDs are labels, not provenance.  Treating an unknown E-id as
         # its own independent source would let a hallucinated pair (E01, E02)
@@ -381,7 +381,15 @@ def merge_open_world_candidates(
         if len(independent) < 2:
             continue
         slug, fingerprint = novel_family_slug(mechanism)
-        confidence = "high" if len(independent) >= 3 else "medium"
+        # Mirror the catalog ranker's _confidence: a scoped contradiction keeps
+        # the hypothesis provisional, never a confident headline. This entry
+        # used to be dropped above (the `continue` this replaced fired on any
+        # non-empty ``contradict`), so ``contradiction_evidence_ids=contradict``
+        # below was dead -- always ``[]``. Letting it through at "low" lets the
+        # same harness.evaluate unresolved_contradiction gate that already
+        # handles the catalog path see this one too, instead of silently
+        # discarding the disagreement.
+        confidence = "low" if contradict else ("high" if len(independent) >= 3 else "medium")
         novel.append(
             RankedCause(
                 family=slug,
@@ -708,7 +716,19 @@ def rank_root_cause_candidates(
         candidate
         for candidate in ranked
         if candidate.score >= _FLOOR
-        and candidate.confidence in {"medium", "high"}
+        and (
+            candidate.confidence in {"medium", "high"}
+            # _confidence forces "low" the instant a candidate carries a
+            # contradiction -- correctly so, a contradicted cause must not
+            # read as confident. But "low" must not ALSO erase the
+            # contradiction: harness.evaluate's unresolved_contradiction gate
+            # is what turns "we found something that argues against this"
+            # into a visible abstain, and it only ever inspects candidates[0].
+            # A candidate that would otherwise have led must still reach that
+            # slot, carrying contradiction_evidence_ids, rather than being
+            # silently swapped for a contradiction-blind insufficient_evidence.
+            or candidate.contradiction_evidence_ids
+        )
         and bool(set(candidate.evidence_agents) - _SYNTHETIC_AGENTS)
     ]
     context_only = [candidate for candidate in ranked if candidate not in live_ranked]

@@ -48,6 +48,37 @@ def test_loader_projects_every_yaml_step_transition_and_action() -> None:
     assert "isa diagnostic_recommendation" in joined
 
 
+def test_loader_projects_authored_alternatives() -> None:
+    """The YAML's authored differential diagnosis (``alternatives``: competing
+    family + reason + discriminator) must reach TypeDB. Before this, the loader
+    silently dropped every one of them, so the primary (TypeDB) path surfaced
+    NO competing hypotheses while the degraded YAML-fallback path did."""
+    raw = _document(TREE)
+    assert raw is not None
+    authored = [
+        node
+        for node in raw["nodes"]
+        if isinstance(node.get("alternatives"), list) and node["alternatives"]
+    ]
+    assert len(authored) > 40  # 55 nodes carry authored alternatives as of writing
+
+    tx = _Tx()
+    _load(tx, raw)
+    joined = "\n".join(tx.queries)
+    assert "isa diagnostic_alternative" in joined
+
+    sample = next(node for node in raw["nodes"] if node["id"] == "scheduling_capacity")
+    first = sample["alternatives"][0]
+    assert first["family"] == "runai_scheduling_quota"
+    match_line = next(
+        q
+        for q in tx.queries
+        if 'has diagnostic_id "scheduling_capacity"' in q and "diagnostic_alternative" in q
+    )
+    assert f'has reason "{first["reason"]}"' in match_line
+    assert f'has discriminator "{first["discriminator"]}"' in match_line
+
+
 def test_domain_runbooks_cover_every_step_and_name_the_real_coverage() -> None:
     # Browsing the ontology used to show ONE runbook ("k8s only") even though
     # the tree covers Run:ai scheduling, the GPU stack, NCCL and more. Every
@@ -164,6 +195,16 @@ def test_typedb_projection_reconstructs_executable_tree() -> None:
             return [{"id": "leaf", "st": "Cordon the node", "seq": 0}]
         if "diagnostic_disconfirmations_for_runbook" in query:
             return [{"id": "leaf", "d": "DiskPressure is False"}]
+        if "diagnostic_alternatives_for_runbook" in query:
+            return [
+                {
+                    "id": "root",
+                    "family": "runai_scheduling_quota",
+                    "reason": "Run:ai policy can produce an indistinguishable Pending workload.",
+                    "disc": "Check whether runai-scheduler-default emitted the first event.",
+                    "seq": 0,
+                }
+            ]
         if "has principle" in query:
             return [{"p": "Preserve evidence"}]
         if "has source_url" in query:
@@ -177,3 +218,13 @@ def test_typedb_projection_reconstructs_executable_tree() -> None:
     assert walked["conclusion"]["family"] == "node_kubelet_pressure"
     assert walked["conclusion"]["next_steps"] == ["Cordon the node"]
     assert walked["conclusion"]["disconfirm"] == ["DiskPressure is False"]
+    # The graph-projected alternative must reach the SAME step["alternatives"]
+    # shape planner._diagnostic_directive turns into competing_hypotheses —
+    # previously always empty on the TypeDB path (see load_troubleshooting.py).
+    assert walked["steps"][0]["alternatives"] == [
+        {
+            "family": "runai_scheduling_quota",
+            "reason": "Run:ai policy can produce an indistinguishable Pending workload.",
+            "discriminator": "Check whether runai-scheduler-default emitted the first event.",
+        }
+    ]

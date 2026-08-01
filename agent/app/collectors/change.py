@@ -1239,6 +1239,12 @@ def _collector_change_observation(
         observation["observed_entity"] = observed_entity
     if target_scope_verified is not None:
         observation["target_scope_verified"] = target_scope_verified
+        # investigator._attach_typed_artifacts only auto-attaches a present+
+        # scoped artifact when the collector itself confirms this specific
+        # target identity -- kubernetes.py has stamped this for a while;
+        # change.py never did, so a genuinely scoped change artifact could
+        # never auto-attach to a ledger hypothesis. Same boolean, same meaning.
+        observation["target_identity_verified"] = target_scope_verified
     return observation
 
 

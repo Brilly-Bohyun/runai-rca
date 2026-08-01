@@ -15,6 +15,7 @@ def test_functions_tql_defines_the_expected_functions() -> None:
     for name in (
         "fixes_for_xid",
         "trigger_for_xid",
+        "detail_for_xid",
         "xids_for_gpu_model",
         "root_xids_for",
         "_root_xid_ancestors",
@@ -27,6 +28,7 @@ def test_functions_tql_defines_the_expected_functions() -> None:
         "diagnostic_outcomes_for_runbook",
         "diagnostic_actions_for_runbook",
         "diagnostic_disconfirmations_for_runbook",
+        "diagnostic_alternatives_for_runbook",
     ):
         assert f"fun {name}(" in text
         assert "return {" in text

@@ -223,6 +223,23 @@ def _symptom_keywords(payload: dict[str, Any]) -> list[str]:
     return out
 
 
+def _family_candidates(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Curated differential diagnosis (``knowledge_links.family_candidates``):
+    other plausible families the curator weighed against the one asserted
+    ``indicates`` edge, each with a confidence bucket. Bounded to the closed
+    family catalog so an unrecognized name never reaches a consumer."""
+    links = payload.get("knowledge_links") or {}
+    out: list[dict[str, str]] = []
+    for item in links.get("family_candidates") or []:
+        if not isinstance(item, dict):
+            continue
+        family = str(item.get("family") or "").strip()
+        if family not in FAMILIES:
+            continue
+        out.append({"family": family, "confidence": _confidence_bucket(item.get("confidence"))})
+    return out[:5]
+
+
 def _to_incident(
     payload: dict[str, Any], approved_by: str, approved_at: str
 ) -> OntologyIncident:
@@ -282,6 +299,7 @@ def _to_incident(
         "searchable_context": payload.get("searchable_context") or {},
         "historical_actions": payload.get("historical_actions") or [],
         "context": {"incident_status_at_approval": status},
+        "family_candidates": _family_candidates(payload),
     }
 
     return OntologyIncident(

@@ -1144,6 +1144,12 @@ def _prometheus_query_observation(
         observation["observed_entity"] = observed_entity
     if target_scope_verified is not None:
         observation["target_scope_verified"] = target_scope_verified
+        # investigator._attach_typed_artifacts only auto-attaches a present+
+        # scoped artifact when the collector itself confirms this specific
+        # target identity -- kubernetes.py has stamped this for a while;
+        # prometheus.py never did, so a genuinely scoped PromQL artifact could
+        # never auto-attach to a ledger hypothesis. Same boolean, same meaning.
+        observation["target_identity_verified"] = target_scope_verified
     if polarity == "present":
         evidence_window = _prometheus_evidence_window(summary, time_range)
         if evidence_window:

@@ -230,6 +230,36 @@ def test_query_remediation_projects_xid_trigger_and_renders_guidance() -> None:
     assert _xid_diagnostic_guidance_lines(out, "ko") == []
 
 
+def test_query_remediation_projects_xid_mnemonic_and_description() -> None:
+    """load_xids.py ingests mnemonic/description/severity for all 109 XIDs, but
+    no function surfaced them: the graph's name for a GPU fault ("GPU has
+    fallen off the bus") was unreachable while its remediation text was not."""
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "detail_for_xid(79)" in query:
+                    return [
+                        {
+                            "m": "ROBUST_CHANNEL_GPU_HAS_FALLEN_OFF_THE_BUS",
+                            "d": "GPU has fallen off the bus",
+                            "s": "fatal",
+                        }
+                    ]
+                return []
+
+            yield run
+
+    out = _query_remediation(FakeClient(), "", [79], "")  # type: ignore[arg-type]
+
+    assert out.xid_mnemonics == {79: "ROBUST_CHANNEL_GPU_HAS_FALLEN_OFF_THE_BUS"}
+    assert out.xid_descriptions == {79: "GPU has fallen off the bus"}
+    assert out.xid_severities == {79: "fatal"}
+    assert out.as_dict()["xid_mnemonics"] == {"79": "ROBUST_CHANNEL_GPU_HAS_FALLEN_OFF_THE_BUS"}
+    assert not out.is_empty()
+
+
 def test_enrich_disabled_returns_empty_context() -> None:
     # load_settings() defaults ENABLE_TYPEDB off -> no query, empty context.
     ctx = asyncio.run(enrich(load_settings(), _target()))
@@ -555,10 +585,13 @@ def test_query_kg_projects_typedb_symptom_metadata() -> None:
                 "actions": ["Raise the memory limit."],
                 "reason": "Memory limit exceeded.",
                 "exclusive_actions": True,
+                "requires_lifecycle_signal": False,
                 "component": "cluster-sync",
                 "symptom_ko": "메모리 부족 종료",
                 "reason_ko": "메모리 제한을 초과했습니다.",
                 "actions_ko": ["누수를 수정하세요.", "메모리 제한을 높이세요."],
+                "affected_version": "",
+                "fixed_version": "",
             }
         ]
     }
@@ -660,10 +693,13 @@ def test_typedb_failure_mode_symptom_delivery_chain_contract() -> None:
         "actions": ["Inspect memory limit.", "Raise memory limit."],
         "reason": "Memory limit exceeded.",
         "exclusive_actions": True,
+        "requires_lifecycle_signal": True,
         "reason_ko": "메모리 제한을 초과했습니다.",
         "actions_ko": ["메모리 제한을 높이세요.", "메모리 제한을 점검하세요."],
         "component": "cluster-sync",
         "symptom_ko": "메모리 부족 종료",
+        "affected_version": "<=2.20",
+        "fixed_version": "2.21",
     }
 
     class FakeClient:
@@ -686,6 +722,8 @@ def test_typedb_failure_mode_symptom_delivery_chain_contract() -> None:
                     return [{"sn": contract["symptom"], "reason": contract["reason"]}]
                 if "has exclusive_actions $exclusive_actions" in query:
                     return [{"sn": contract["symptom"], "exclusive_actions": True}]
+                if "has requires_lifecycle_signal $requires_lifecycle_signal" in query:
+                    return [{"sn": contract["symptom"], "requires_lifecycle_signal": True}]
                 if "has reason_ko $reason_ko" in query:
                     return [{"sn": contract["symptom"], "reason_ko": contract["reason_ko"]}]
                 if "has component $component" in query:
@@ -697,6 +735,10 @@ def test_typedb_failure_mode_symptom_delivery_chain_contract() -> None:
                         {"sn": contract["symptom"], "statement_ko": action}
                         for action in contract["actions_ko"]
                     ]
+                if "has affected_version $affected_version" in query:
+                    return [{"sn": contract["symptom"], "affected_version": contract["affected_version"]}]
+                if "has fixed_version $fixed_version" in query:
+                    return [{"sn": contract["symptom"], "fixed_version": contract["fixed_version"]}]
                 return []
 
             yield run
@@ -711,7 +753,9 @@ def test_typedb_failure_mode_symptom_delivery_chain_contract() -> None:
     assert isinstance(symptom["actions"], list)
     assert isinstance(symptom["actions_ko"], list)
     assert isinstance(symptom["exclusive_actions"], bool)
-    for field in set(contract) - {"keywords", "actions", "actions_ko", "exclusive_actions"}:
+    assert isinstance(symptom["requires_lifecycle_signal"], bool)
+    bool_fields = {"keywords", "actions", "actions_ko", "exclusive_actions", "requires_lifecycle_signal"}
+    for field in set(contract) - bool_fields:
         assert isinstance(symptom[field], str)
 
 
@@ -1119,6 +1163,30 @@ def test_safe_case_card_keeps_context_class_and_case_origin_but_strips_the_rest(
     assert card["context"] == {"incident_status_at_approval": "resolved", "cluster": "prod"}
     for stripped in ("prohibited_uses", "searchable_context", "unexpected"):
         assert stripped not in card
+
+
+def test_safe_case_card_passes_through_curated_family_candidates() -> None:
+    """External-case knowledge_links.family_candidates (curated differential
+    diagnosis) must reach the case card an LLM prompt/report actually reads —
+    before this, load_external_cases.py read the field from nowhere and
+    _safe_case_card had no allowlist entry for it, so it never arrived."""
+    card = _safe_case_card({
+        "case_origin": "enterprise_support",
+        "family_candidates": [
+            {"family": "observability_accuracy", "confidence": "high", "unexpected": "drop"},
+            {"family": "platform_lifecycle_change", "confidence": "low"},
+            {"not_a_family": "x"},  # malformed entries are dropped, not passed through
+        ],
+    })
+
+    assert card["family_candidates"] == [
+        {"family": "observability_accuracy", "confidence": "high"},
+        {"family": "platform_lifecycle_change", "confidence": "low"},
+    ]
+
+
+def test_safe_case_card_omits_family_candidates_key_when_absent() -> None:
+    assert "family_candidates" not in _safe_case_card({"case_origin": "enterprise_support"})
 
 
 def test_case_card_projection_keeps_graph_links_and_strips_untrusted_fields() -> None:

@@ -164,6 +164,7 @@ def _ensure_symptom(
     actions_ko: list[str] | None = None,
     component: str = "",
     name_ko: str = "",
+    requires_lifecycle_signal: bool = False,
 ) -> None:
     if not _exists(tx, f'$x isa symptom, has name "{esc(name)}";'):
         tx.query(f'insert $x isa symptom, has name "{esc(name)}";').resolve()
@@ -208,6 +209,13 @@ def _ensure_symptom(
         tx.query(
             f'match $s isa symptom, has name "{esc(name)}"; '
             "insert $s has exclusive_actions true;"
+        ).resolve()
+    if requires_lifecycle_signal and not _exists(
+        tx, f'$x isa symptom, has name "{esc(name)}", has requires_lifecycle_signal true;'
+    ):
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}"; '
+            "insert $s has requires_lifecycle_signal true;"
         ).resolve()
     _replace_attribute(tx, name, "statement_ko", actions_ko or [])
 
@@ -306,6 +314,7 @@ def main() -> int:
                         ],
                         str(sym.get("component") or "").strip(),
                         str(sym.get("name_ko") or "").strip(),
+                        sym.get("requires_lifecycle_signal") is True,
                     )
                     _relate_indicates(tx, name, family)
                     symptoms += 1

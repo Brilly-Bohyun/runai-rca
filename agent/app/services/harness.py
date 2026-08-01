@@ -385,27 +385,18 @@ def evaluate(
         # gate to high let contradicted medium conclusions retain remediation
         # authority.
         #
-        # G4: this mechanism is correct and covered (see
-        # test_typed_evidence_links_preserve_contradicting_evidence), but in
-        # the live pipeline ``contradiction_ids`` can only ever be non-empty
-        # via ``top.contradiction_evidence_ids`` -- pipeline.harness_stage
-        # never passes ``evidence_links=`` explicitly, ``RankedCause`` has no
-        # ``evidence_links`` attribute, and nothing writes
-        # ``response.context["evidence_links"]`` before this call (G5). Both
-        # producers of ``top`` structurally prevent that field from ever
-        # being non-empty on a candidate that reaches here as ``top``:
-        # root_cause_ranking._confidence forces confidence to "low" the
-        # moment a candidate has any contradiction_evidence_ids, live_ranked
-        # then requires medium/high, so that candidate is never
-        # candidates[0]; and merge_open_world_candidates skips (``continue``)
-        # any open-world ledger entry with a non-empty contradiction list
-        # before it can ever be constructed with one. This gate therefore
-        # cannot fire today except for a caller that bypasses the ranker and
-        # supplies ``evidence_links`` directly -- see
-        # test_unresolved_contradiction_gate_unreachable.py, which pins both
-        # halves of that chain so a future change to either one is forced to
-        # revisit this comment instead of silently reactivating (or further
-        # burying) a safety gate.
+        # This gate was inert for a long time and is no longer: the ranker used
+        # to force confidence to "low" the moment a candidate carried any
+        # contradiction, and ``live_ranked`` then required medium/high, so a
+        # contradicted candidate could never BE ``candidates[0]`` -- the only
+        # slot this function inspects. "Not confident enough to headline" and
+        # "not allowed to reach the harness at all" had been collapsed into one
+        # test. They are separate now: the contradiction still forces "low", and
+        # a low candidate that carries one is admitted anyway so the
+        # contradiction can travel here and be reported instead of quietly
+        # sinking the candidate. See
+        # test_unresolved_contradiction_gate_reaches_harness.py for the
+        # end-to-end path.
         "unresolved_contradiction": bool(not insufficient and contradiction_ids),
         # Generic state alerts (non-ready / waiting / replicas-mismatch class)
         # describe a symptom shared by many causes. Naming a specific family

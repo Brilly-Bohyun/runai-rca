@@ -341,6 +341,13 @@ def _system_log_observation(
         # empty response cannot prove host-wide absence.
         "polarity": polarity,
         "coverage": coverage,
+        # Unconditional, not a re-verification: `node` here is always
+        # target.node -- system_log_query() (the only caller) already
+        # rejected any request whose node arg didn't match the alert's node
+        # scope before this function ever runs. investigator
+        # ._attach_typed_artifacts needs this stamp to auto-attach a
+        # present+scoped artifact the model forgot to cite.
+        "target_identity_verified": True,
         "lookback_seconds": lookback_seconds,
         "result_limit": limit,
         "status": "ok",
@@ -1088,6 +1095,11 @@ def _system_observation(
         "polarity": polarity,
         "coverage": coverage,
         "observation_window": time_range or {},
+        # Same stamp as _system_log_observation, reusing the param that
+        # already gates this function's own "scoped" branches above: a
+        # cluster-wide scan (historical_node_scope_verified=False) must NOT
+        # claim proven identity just because a source matched.
+        "target_identity_verified": historical_node_scope_verified,
     }
     if time_range and isinstance(journal, dict):
         timestamps = journal.get("matching_timestamps")
