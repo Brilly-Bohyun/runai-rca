@@ -281,12 +281,29 @@ def _finalization_reserve_seconds(total_seconds: int) -> float:
     """Automatically reserve time for rank/self-check/synthesis/harness.
 
     At the default 900s deadline, evidence gathering (investigation plus every
-    drill-down) shares 540s and finalization keeps 360s. Short test/operator
-    deadlines reserve at most half so evidence still gets a useful window.
+    drill-down) now shares 750s and finalization keeps a 150s floor. Deadlines
+    under ~375s are unaffected -- 40% of them was already below this floor, so
+    short test/operator deadlines still reserve at most half, same as before.
+
+    The floor used to be a flat 360s (40% of 900s) grounded in the
+    ``llm_synthesis_max_tokens`` comment in config.py: one call legally
+    spending 300-450s on a 16384-token completion. That call no longer
+    exists. Since 2026-07-22 Korean "synthesis" only translates the
+    already-decided deterministic report (owner directive: never re-analyze),
+    in concurrency-4 batches of ~2000 source chars each
+    (``_TRANSLATION_BATCH_CHARS`` / ``_TRANSLATION_BATCH_CONCURRENCY``), so one
+    batch's own cap is ~3072 tokens (``_translate_line_batch``), not 16384. A
+    real run measured the whole finalization phase (rank + self-check +
+    synthesis + harness) at 67.5s against the old 360s floor -- 292.5s
+    reserved but never spent, while evidence gathering was cut off early with
+    real drill-downs still queued (stop_reason ``analysis_budget_exhausted``
+    at 605s of a 900s deadline). 150s is a bit over 2x that measurement: room
+    for a genuinely slow batch/self-check round plus a retry, without pinning
+    the 16k-token budget the translate-only path no longer spends.
     """
     if total_seconds <= 0:
         return 0.0
-    return min(360.0, max(30.0, total_seconds * 0.40), total_seconds * 0.50)
+    return min(150.0, max(30.0, total_seconds * 0.40), total_seconds * 0.50)
 
 
 def _evidence_deadline_monotonic(state: PipelineState) -> float | None:
@@ -2009,6 +2026,28 @@ def _merge_open_world_candidates(
     return merged
 
 
+def _evidence_gap_report_line(dominant: str, count: int, total: int, language: str) -> str:
+    """One line telling the operator WHY there is no cause, not just THAT there
+    isn't one.
+
+    ``analysis_summary`` already says insufficient evidence; without this an
+    operator reading the report cannot tell a quiet cluster from a
+    misconfigured agent. Only reached from the single call site inside
+    ``_warn_on_starved_evidence`` that fires while ``final_family ==
+    "insufficient_evidence"``, so a run that concluded a cause never carries
+    it.
+    """
+    if language == "ko":
+        return (
+            f"- **증거가 부족한 이유**: 수집된 관측 {total}건 중 {count}건이 유효한 증거로 "
+            f"이어지지 못했습니다 (가장 흔한 사유: {dominant})."
+        )
+    return (
+        f"- **Why evidence is insufficient**: {count} of {total} observation(s) "
+        f"never became usable evidence (most common reason: {dominant})."
+    )
+
+
 def _warn_on_starved_evidence(state: PipelineState, response: AlertAnalysisResponse) -> None:
     """Zero eligible support beside scoped positive facts is a TARGET bug.
 
@@ -2018,22 +2057,45 @@ def _warn_on_starved_evidence(state: PipelineState, response: AlertAnalysisRespo
     against (INC-…-000001: 94 facts, 0 eligible, because the plan had moved the
     target to the ``runai`` namespace). That is invisible to
     ``rejected_evidence_links``, which only records links somebody tried to cite.
-    Diagnose by absence: a board with nothing scoped to say stays silent, because
-    that is an honest evidence gap.
+
+    A board that never produced a single present+scoped fact is the more common
+    shape (a real run: 121 artifacts, 3 usable) and used to stay silent as an
+    "honest evidence gap" even when every fact carried a ``demotion_reason``
+    (see ``evidence_blackboard.EvidenceFact``) explaining exactly why it never
+    became evidence. Diagnose by absence only when there is truly nothing to
+    explain -- no facts at all, or facts with no identifiable reason.
     """
     facts_method = getattr(state.blackboard, "facts", None)
     if not callable(facts_method):
         return
     try:
-        usable = [
-            fact
-            for fact in facts_method()
-            if str(getattr(fact, "polarity", "")) == "present"
-            and str(getattr(fact, "coverage", "")) == "scoped"
-        ]
+        all_facts = list(facts_method())
     except Exception:  # noqa: BLE001 - a diagnostic signal is never fatal
         return
+    usable = [
+        fact
+        for fact in all_facts
+        if str(getattr(fact, "polarity", "")) == "present"
+        and str(getattr(fact, "coverage", "")) == "scoped"
+    ]
     if not usable:
+        demoted = [fact for fact in all_facts if getattr(fact, "demotion_reason", "")]
+        if not demoted:
+            return  # honest gap: nothing to explain
+        reasons = Counter(getattr(fact, "demotion_reason", "") for fact in demoted)
+        dominant, count = reasons.most_common(1)[0]
+        message = (
+            f"no observation ever reached present+scoped: {count} of {len(all_facts)} "
+            f"fact(s) were demoted, most commonly ({dominant})"
+        )
+        _log.warning("evidence: %s", message)
+        response.warnings = sorted(set(response.warnings) | {message})
+        response.analysis_detail = _insert_before_appendix(
+            response.analysis_detail,
+            _evidence_gap_report_line(
+                dominant, count, len(all_facts), getattr(state.settings, "language", "en")
+            ),
+        )
         return
     eligibility = _blackboard_eligibility(state)
     if any(getattr(item, "support", False) for item in eligibility.values()):
