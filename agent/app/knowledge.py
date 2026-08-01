@@ -1880,6 +1880,15 @@ def _keyword_hits(text: str, keywords: list[str]) -> tuple[list[str], bool]:
                 token_start - 1
             ].isalnum():
                 token_start -= 1
+            # Purely-numeric keywords (NVSwitch SXid codes) need a strict LEFT
+            # boundary too. The left-lenient walk above exists so a keyword that
+            # is the suffix of a concatenated alert name (KubePodImagePullBackOff)
+            # still matches; a digit run has no such compound-identifier meaning
+            # and instead collides by coincidence — a resourceVersion or port
+            # number that merely ends in the same five digits as an SXid code.
+            if keyword.isdigit() and token_start != idx:
+                start = end
+                continue
             token_end = end
             while token_end < len(text) and text[token_end].isascii() and text[
                 token_end

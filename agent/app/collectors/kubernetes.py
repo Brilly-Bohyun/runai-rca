@@ -6527,7 +6527,14 @@ def _runai_crd_health_artifacts(
         namespace = str(finding.get("namespace") or "").strip()
         # A cluster-scoped CRD cannot stand in for a namespaced incident target.
         # Keep it as context even when its transition falls inside the window.
-        scoped = bool(namespace and transition and start and end and start <= transition <= end)
+        # lastTransitionTime is when the condition STARTED, not when it stopped
+        # being true — findings only ever carry a CURRENTLY-bad condition (see
+        # _crd_not_ready), so one that began before the window and is still bad
+        # was bad THROUGHOUT it too. Requiring the transition to also fall after
+        # `start` rejected exactly that steady-state case. Only reject a
+        # transition that lands after the window closed — that one came later
+        # (or is a resolution artifact) and cannot explain this incident.
+        scoped = bool(namespace and transition and start and end and transition <= end)
         polarity, coverage = ("present", "scoped") if scoped else ("unknown", "partial")
         kind = str(finding.get("kind") or "Run:ai resource")
         name = str(finding.get("name") or "unknown")
