@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { markdownToBlocks, markdownToDocxElements } from './exportDocx';
+import { alertRows, artifactRows, markdownToBlocks, markdownToDocxElements, similarRows, summaryParagraphText } from './exportDocx';
+import type { AlertRecord, Artifact, SimilarIncident } from './types';
 
 describe('markdownToBlocks', () => {
   it('preserves inline formatting in the remark AST', () => {
@@ -57,5 +58,36 @@ describe('markdownToBlocks', () => {
 
     expect(elements).toHaveLength(1);
     expect(elements[0]).toBeInstanceOf(docx.Table);
+  });
+});
+
+// The exported Word document's own content is Korean by chart default; an
+// English "No summary captured." placeholder in the same slot as the report
+// content is what the product owner flagged reading the export (a
+// mixed-language document). These placeholders must match the report, not
+// stay hardcoded English with no language context.
+describe('exported-document placeholders match the report language', () => {
+  it('falls back to a Korean placeholder when analysis_summary is empty', () => {
+    expect(summaryParagraphText('실제 요약입니다.')).toBe('실제 요약입니다.');
+    expect(summaryParagraphText('')).toBe('요약이 생성되지 않았습니다.');
+    expect(summaryParagraphText(undefined)).toBe('요약이 생성되지 않았습니다.');
+  });
+
+  it('artifactRows falls back to a Korean empty-state row, not an English one', () => {
+    expect(artifactRows([])).toEqual([['-', '-', '수집된 증거 카드가 없습니다.']]);
+    const artifact: Artifact = { agent: 'kubernetes', source: 'kubernetes', type: 'pod_status', confidence: 'medium', status: 'ok', summary: 'Pod is Running.' };
+    expect(artifactRows([artifact])).toEqual([['kubernetes', 'ok', 'Pod is Running.']]);
+  });
+
+  it('alertRows falls back to a Korean empty-state row, not an English one', () => {
+    expect(alertRows([])).toEqual([['-', '-', '수집된 알림이 없습니다.']]);
+    const alert = { alert_id: 'ALT-1', status: 'firing', alarm_title: 'KubePodNotReady' } as AlertRecord;
+    expect(alertRows([alert])).toEqual([['ALT-1', 'firing', 'KubePodNotReady']]);
+  });
+
+  it('similarRows falls back to a Korean empty-state row, not an English one', () => {
+    expect(similarRows([])).toEqual([['-', '-', '유사한 과거 인시던트가 없습니다.']]);
+    const similar = { incident_id: 'INC-1', similarity: 0.9, title: 'fallback title', analysis_summary: '' } as SimilarIncident;
+    expect(similarRows([similar])).toEqual([['INC-1', '90%', 'fallback title']]);
   });
 });

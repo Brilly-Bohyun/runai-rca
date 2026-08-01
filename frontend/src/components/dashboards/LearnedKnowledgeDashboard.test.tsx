@@ -87,6 +87,16 @@ describe('CandidateDetail', () => {
     expect(markup).not.toContain('harness_claim');
   });
 
+  it('falls back to a Korean placeholder when the candidate has no summary', () => {
+    // candidate.summary is filled from the same learned-package pipeline as
+    // analysis_summary elsewhere (Korean by chart default); an English
+    // "No candidate summary was reported." placeholder in the same slot
+    // reads as an untranslated fragment of an otherwise-Korean review screen.
+    const markup = render(candidate({ summary: undefined }));
+    expect(markup).toContain('후보 요약이 보고되지 않았습니다.');
+    expect(markup).not.toContain('No candidate summary was reported.');
+  });
+
   it('renders linked diagnostic probes with their tool and verdict', () => {
     const markup = render(candidate({
       probe_template_ids: ['k8s_troubleshooting:incident_scope:p01'],

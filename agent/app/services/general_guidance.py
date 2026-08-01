@@ -7,6 +7,8 @@ symptom or its cause is present in the current environment.
 
 from __future__ import annotations
 
+import re
+import textwrap
 from typing import Any
 
 from app.knowledge import (
@@ -14,10 +16,29 @@ from app.knowledge import (
     component_for_text,
     family_label,
     localized_failure_mode_actions,
+    localized_failure_mode_name,
     match_failure_mode_symptoms,
     match_runai_known_issues,
 )
 from app.masking import Masker, build_masker
+
+_HANGUL_RE = re.compile(r"[가-힣]")
+
+
+def _foreign_language_note(text: str, language: str) -> str:
+    """An honest marker for imported text this function cannot translate.
+
+    External case text (vendor/support records) is copied verbatim in
+    whatever language it was written in -- unlike every generated sentence
+    around it, it does not follow the deployment `language` setting. Labelling
+    it plainly stops a Korean heading ("당시 경과: <English paragraph>") from
+    looking like a translation that silently didn't happen (confirmed in a
+    real report: "당시 경과: Run:ai 2.22.27 repeatedly panicked in the KAI
+    scheduler proportion plugin ...")."""
+    if language == "ko" and text and not _HANGUL_RE.search(text):
+        return " (원문 미번역)"
+    return ""
+
 
 _BASE_LINES = {
     "en": [
@@ -159,7 +180,7 @@ def general_guidance_lines(
 
     symptom_matches = match_failure_mode_symptoms(failure_modes, text)[:2]
     for _family, symptom in symptom_matches:
-        name = _safe(symptom.get("symptom"), active_masker, 180)
+        name = _safe(localized_failure_mode_name(symptom, language), active_masker, 180)
         actions = localized_failure_mode_actions(symptom, language)
         if not actions:
             continue
@@ -208,18 +229,21 @@ def _external_case_lines(
             else f"- An external support case matches this target's signature "
             f"(**{ref}**{suffix}). Historical record — not a confirmed cause for this run:"
         )
-        lines.append(f"  - {'당시 경과' if language == 'ko' else 'What happened'}: {summary}")
+        happened_label = "당시 경과" if language == "ko" else "What happened"
+        lines.append(f"  - {happened_label}{_foreign_language_note(summary, language)}: {summary}")
         for action in list(card.get("successful_actions") or [])[:2]:
             statement = _safe(action.get("statement"), masker, 300)
             outcome = _safe(action.get("outcome"), masker, 20)
             if statement:
                 label = "당시 효과 있었던 조치" if language == "ko" else "Action that helped then"
-                lines.append(f"  - {label} ({outcome}): {statement}")
+                note = _foreign_language_note(statement, language)
+                lines.append(f"  - {label}{note} ({outcome}): {statement}")
         for action in list(card.get("failed_actions") or [])[:2]:
             statement = _safe(action.get("statement"), masker, 300)
             if statement:
                 label = "당시 효과 없었던 조치" if language == "ko" else "Action that did NOT help then"
-                lines.append(f"  - {label}: {statement}")
+                note = _foreign_language_note(statement, language)
+                lines.append(f"  - {label}{note}: {statement}")
     return lines
 
 
@@ -253,7 +277,7 @@ def _family_candidate_lines(
             "actually present:"
         )
         for symptom in symptoms[:3]:
-            name = _safe(symptom.get("symptom"), masker, 180)
+            name = _safe(localized_failure_mode_name(symptom, language), masker, 180)
             action = _safe(localized_failure_mode_actions(symptom, language)[0], masker, 300)
             lines.append(f"  - **{name}**: {action}")
     return lines
@@ -261,4 +285,8 @@ def _family_candidate_lines(
 
 def _safe(value: object, masker: Masker, limit: int) -> str:
     text = " ".join(masker.mask_text(str(value or "")).split())
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+    # ponytail: textwrap.shorten cuts at a word boundary instead of mid-word --
+    # the naive text[:limit] slice this replaced produced garbage like
+    # "...ResourceQu…입니다." in a real report (word chopped, then a Korean
+    # copula glued onto the fragment by the translation pass).
+    return textwrap.shorten(text, width=limit, placeholder="…") if text else text

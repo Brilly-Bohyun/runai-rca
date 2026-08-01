@@ -12,7 +12,12 @@ into the action sections, no match through a negated statement.
 
 from __future__ import annotations
 
-from app.knowledge import load_architecture, load_failure_modes, match_failure_mode_symptoms
+from app.knowledge import (
+    load_architecture,
+    load_failure_modes,
+    localized_failure_mode_name,
+    match_failure_mode_symptoms,
+)
 from app.plan import InvestigationPlan
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
@@ -269,7 +274,13 @@ def test_korean_question_reaches_scheduling_ontology_through_the_planner(monkeyp
         plan=plan,
     )
     guide = detail.split("일반 점검 가이드", 1)[1]
-    assert "Preempted By Higher Priority" in guide
+    # language="ko" and the shipped catalog entry has a name_ko
+    # ("상위 우선순위 워크로드에 의한 선점") -- the guide must show that, not the
+    # English catalog key. A Korean report bolding an English symptom name mid
+    # sentence was the bug (general_guidance.py used symptom.get("symptom")
+    # unconditionally; fixed via localized_failure_mode_name).
+    assert "상위 우선순위 워크로드에 의한 선점" in guide
+    assert "Preempted By Higher Priority" not in guide
     assert "확인된 원인이 아니라" in guide
 
 
@@ -456,6 +467,67 @@ def test_external_case_reaches_the_rendered_report() -> None:
     assert "EXTERNAL-SUMMARY" in detail
     actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     assert "EXTERNAL-SUMMARY" not in actions
+
+
+def test_localized_failure_mode_name_prefers_symptom_ko() -> None:
+    name_ko = "상위 우선순위 워크로드에 의한 선점"
+    symptom = {"symptom": "Preempted By Higher Priority", "symptom_ko": name_ko}
+    assert localized_failure_mode_name(symptom, "ko") == name_ko
+    assert localized_failure_mode_name(symptom, "en") == "Preempted By Higher Priority"
+
+
+def test_localized_failure_mode_name_falls_back_without_symptom_ko() -> None:
+    # A learned (runtime) package has no name_ko/symptom_ko -- must not crash,
+    # and must not silently invent Korean text it doesn't have.
+    symptom = {"symptom": "GPU OOM during reclaim"}
+    assert localized_failure_mode_name(symptom, "ko") == "GPU OOM during reclaim"
+
+
+def test_external_case_english_text_is_marked_as_untranslated() -> None:
+    # Real report evidence (inc.json): "당시 경과: Run:ai 2.22.27 repeatedly
+    # panicked in the KAI scheduler proportion plugin ..." -- a Korean label
+    # glued straight onto an untranslated English paragraph, indistinguishable
+    # from a real translation. THANOS_CASE_CARD's analysis_summary is exactly
+    # this shape (external/vendor text, never machine-translated), so a "ko"
+    # report must say so rather than silently looking localized.
+    text = guidance(
+        "Thanos Receive 가 OOMKilled 반복되어서 메모리를 올렸는데도 자꾸 죽는데",
+        language="ko",
+        case_cards=[THANOS_CASE_CARD],
+    )
+    assert "당시 경과 (원문 미번역): EXTERNAL-SUMMARY" in text
+
+
+def test_external_case_korean_text_is_not_marked_as_untranslated() -> None:
+    korean_card = {
+        **THANOS_CASE_CARD,
+        "analysis_summary": "한글로 작성된 외부 사례 요약입니다.",
+        "successful_actions": [{"statement": "메모리 제한을 늘렸습니다.", "outcome": "mitigated"}],
+    }
+    text = guidance("무슨 일이죠", language="ko", case_cards=[korean_card])
+    assert "당시 경과: 한글로 작성된 외부 사례 요약입니다." in text
+    assert "미번역" not in text
+
+
+# --- truncation must not chop a word in half ------------------------------------
+
+
+def test_safe_truncation_breaks_on_a_word_boundary_not_mid_word() -> None:
+    # A real report showed "...네임스페이스 ResourceQu…입니다." -- a naive
+    # text[:limit] slice cut "ResourceQuota" mid-word, and the Korean
+    # translation pass then glued a copula onto the fragment. _safe's limit
+    # must land between words, like textwrap.shorten (stdlib).
+    from app.masking import build_masker
+    from app.services.general_guidance import _safe
+
+    masker = build_masker(())
+    long_text = (
+        "the workload was blocked by a namespace ResourceQuota that had "
+        "already been exhausted by other pending pods in the same project"
+    )
+    result = _safe(long_text, masker, 44)
+    assert result == "the workload was blocked by a namespace…"
+    assert "ResourceQu…" not in result
 
 
 # --- the shipped ontology really carries the scheduling knowledge ----------------

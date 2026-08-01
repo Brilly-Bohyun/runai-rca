@@ -59,7 +59,7 @@ export function SimilarIncidentsPanel({
                 <span>{item.negative_feedback} down</span>
                 <span>{item.comment_count} comments</span>
               </div>
-              <p>{item.analysis_summary || 'No prior summary captured.'}</p>
+              <p>{item.analysis_summary || '이전 요약이 없습니다.'}</p>
             </a>
           ))}
         </div>

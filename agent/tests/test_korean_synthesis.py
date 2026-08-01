@@ -190,7 +190,21 @@ async def test_korean_llm_synthesis_localizes_english_lines(monkeypatch) -> None
     sent: list[dict] = []
 
     async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
-        pending = json.loads(json_body["messages"][-1]["content"])
+        content = json_body["messages"][-1]["content"]
+        try:
+            pending = json.loads(content)
+        except json.JSONDecodeError:
+            pending = None
+        # A Korean-translation batch is specifically dict[str, str]. Other
+        # LLM-gated calls sharing this mock (plan refine's prose, operator-
+        # question sharpening's dict[str, list]) are irrelevant here -- reply
+        # harmlessly instead of forcing every caller through this shape.
+        if not isinstance(pending, dict) or not all(
+            isinstance(value, str) for value in pending.values()
+        ):
+            return SimpleNamespace(
+                ok=True, data={"choices": [{"message": {"content": "{}"}}]}
+            )
         sent.append(pending)
         # Echo every requested line, keeping backtick spans verbatim.
         translated = {key: f"[번역] {value}" for key, value in pending.items()}
