@@ -53,6 +53,7 @@ from app.collectors.change import change_query
 from app.collectors.http_json import get_json
 from app.collectors.kubernetes import (
     _READ_KINDS,
+    _pod_log_observation,
     k8s_describe,
     k8s_exec,
     k8s_logs,
@@ -63,15 +64,17 @@ from app.collectors.kubernetes import (
     resolve_read_kind,
 )
 from app.collectors.loki import (
-    _loki_headers,
+    _collect_loki_direct,
     _loki_line_affirms_failure,
-    _loki_native_response_complete,
-    _loki_streams,
-    _sample_lines,
+    _loki_query_observation,
     loki_label_catalog,
     loki_mcp_query,
 )
-from app.collectors.prometheus import prom_mcp_query, prom_query
+from app.collectors.prometheus import (
+    _prometheus_query_observation,
+    prom_mcp_query,
+    prom_query,
+)
 from app.collectors.runai_mcp import _tool_json, valid_official_workload_id
 from app.collectors.system import system_log_query
 from app.config import Settings
@@ -861,6 +864,55 @@ def _typed_artifact_result(
     # let a remote response assert ``present/scoped`` without proving the
     # requested entity, value, or incident window. Only an adapter can opt in
     # to a typed verdict it constructed and validated itself.
+    #
+    # Five producers currently opt in, each because ITS OWN RESULT (not the
+    # LLM's request) proves the two things "scoped" requires everywhere in this
+    # codebase — target identity AND incident-window relevance:
+    #   * change_query      target_scope_verified + a timed change inside the
+    #                       causal window (app.collectors.change).
+    #   * system_log_query  its own adapter-verified scope/window fields
+    #                       (app.collectors.system).
+    #   * k8s_logs          kubernetes.py's own _pod_log_observation (reused
+    #                       verbatim): source_verified + observed_entity (the
+    #                       response names the Pod/namespace it actually came
+    #                       from, not just what the args asked for) AND
+    #                       time_scope_verified + an API-timestamped line
+    #                       inside the causal window. That classifier alone
+    #                       only proves the response is HONEST about whose
+    #                       logs they are — its base-collector caller never
+    #                       needs to check WHICH Pod because it only ever
+    #                       fetches the target's own. The drill-down tool
+    #                       wrapper adds the missing check itself: observed_
+    #                       entity must equal the actual analysis target, so
+    #                       asking for a different (real) Pod's logs still
+    #                       gets downgraded.
+    #   * promql_query      the base collector's own _prometheus_query_
+    #                       observation / _loki_query_observation, called
+    #                       WITH the real target (not the unclassified raw
+    #                       fetcher these used to stop at). Their target-scope
+    #                       classifiers each gained a "drilldown" case that
+    #     logql_query       requires EVERY returned series/entry to carry the
+    #                       target's own namespace(+pod) (or node, for
+    #                       PromQL) label — proven from RESPONSE labels only,
+    #                       the LLM's query text is never consulted, and an
+    #                       EMPTY response never gets the "fixed template
+    #                       already scoped it" free pass those functions
+    #                       grant their own base-collector callers. This
+    #                       closes a real production gap: a `namespace="runai"`
+    #                       Pending-phase sweep and a `gpu-operator` log sweep
+    #                       both matched and returned real series/lines, for
+    #                       pods that were not the alert's target.
+    # Every other tool stays unverified because nothing proves that bar today:
+    #   * sql_select is arbitrary SELECT text with no entity/window concept.
+    #   * k8s_read / k8s_describe / k8s_exec take an LLM-chosen kind/
+    #     namespace/name/command with no response-side proof the object IS
+    #     the alert's entity (unlike k8s_logs, they never set source_verified).
+    #   * all 14 runai_* tools, even the ones structurally pinned to the
+    #     alert's own workload/project (args are ignored in favor of
+    #     target.runai_workload_id / target.project), are current-state reads
+    #     with no way to prove the response reflects the historical incident
+    #     window — matching change_query's own live-fallback rule, an
+    #     unbounded-in-time fact caps at present/partial, never "scoped".
     verified_observation = outcome.get("_verified_observation") is _VERIFIED_OBSERVATION
     top_level_observation = outcome.get("observation")
     observation = (
@@ -2319,12 +2371,38 @@ async def _tool_k8s_logs(settings: Settings, target: AnalysisTarget, args: dict)
         "이전 컨테이너 로그" if previous else "Pod 로그",
         "Previous container logs" if previous else "Pod logs",
     )
+    # Classify with kubernetes.py's OWN pod-log verdict rather than trusting
+    # this tool's raw transport result: present+scoped only when the RESPONSE
+    # (not the request) proves both the exact Pod (source_verified +
+    # observed_entity) and the historical window (time_scope_verified + an
+    # API-timestamped line inside the causal window). See _typed_artifact_result
+    # for the full account of why this is the only k8s tool that qualifies.
+    observation, _entries = _pod_log_observation(
+        item, time_range=causal_evidence_time_range(target)
+    )
+    # _pod_log_observation only proves the response is HONEST about whose logs
+    # they are — its base-collector caller never needs to check WHICH Pod,
+    # because it only ever fetches the target's own. This drill-down tool lets
+    # the LLM name any Pod/namespace in `args`, so that match against the
+    # actual incident target has to happen here, against the response's own
+    # observed_entity, never against the (unverified) request args.
+    observed_entity = observation.get("observed_entity")
+    observed_target_pod = (
+        isinstance(observed_entity, dict)
+        and bool(target.pod)
+        and str(observed_entity.get("namespace") or "") == target.namespace
+        and str(observed_entity.get("name") or "") == target.pod
+    )
+    if observation.get("polarity") in {"present", "absent"} and not observed_target_pod:
+        observation = {**observation, "polarity": "unknown", "coverage": "partial"}
     return {
         "query": f"kubectl logs {pod}{ns_flag}{c_flag}" + (" --previous" if previous else ""),
         "title": title,
         "summary": str(error) if error else f"{len(lines)} log line(s)",
         "error": error,
         "result": item,
+        "observation": observation,
+        "_verified_observation": _VERIFIED_OBSERVATION,
         **({"mcp_fallback": item["mcp_fallback"]} if item.get("mcp_fallback") else {}),
     }
 
@@ -2417,6 +2495,18 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
                 "summary": summary,
                 "error": error,
                 "result": item,
+                # Classify with the SAME response-labels-prove-scope machinery
+                # the base collector uses for its own fixed queries
+                # (_prometheus_target_scope's "drilldown" branch): present/
+                # absent+scoped only when EVERY returned series' own
+                # namespace+pod (or namespace, or node) label equals the
+                # alert target, and the sample timestamps prove the incident
+                # window -- never because the LLM's query text named the
+                # right selector. See _prometheus_query_observation.
+                "observation": _prometheus_query_observation(
+                    item, target=target, time_range=time_range
+                ),
+                "_verified_observation": _VERIFIED_OBSERVATION,
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
             fallback = mcp_fallback_warning(exc, source="Prometheus")
@@ -2433,6 +2523,8 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
         "summary": summary,
         "error": error,
         "result": item,
+        "observation": _prometheus_query_observation(item, target=target, time_range=time_range),
+        "_verified_observation": _VERIFIED_OBSERVATION,
         **({"mcp_fallback": fallback} if fallback else {}),
     }
 
@@ -2475,6 +2567,17 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
                 "summary": str(error) if error else f"{item.get('line_count', 0)} MCP log line(s)",
                 "error": error,
                 "result": item,
+                # Classify with the SAME response-labels-prove-scope machinery
+                # the base collector uses for its own fixed queries
+                # (_loki_target_scope's "drilldown" branch): present/absent
+                # +scoped only when a returned, in-window, failure-affirming
+                # entry's own namespace(+pod) labels equal the alert target
+                # -- never because the LLM's query text named the right
+                # selector. See _loki_query_observation.
+                "observation": _loki_query_observation(
+                    item, target=target, plan=None, time_range=time_range
+                ),
+                "_verified_observation": _VERIFIED_OBSERVATION,
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
             fallback = mcp_fallback_warning(exc, source="Loki")
@@ -2482,41 +2585,26 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
         fallback = f"{MCP_FALLBACK_WARNING}: LOKI_MCP_URL not configured"
     if not settings.loki_url:
         return {"query": logql, "title": title, "summary": fallback, "error": fallback}
-    headers, _warnings = _loki_headers(settings)
-    response = await get_json(
-        base_url=settings.loki_url,
-        path="/loki/api/v1/query_range",
-        timeout_seconds=settings.loki_timeout_seconds,
-        params={
-            "query": logql,
-            "limit": str(settings.loki_query_limit),
-            "direction": "BACKWARD",
-            **(time_range or {}),
-        },
-        headers=headers,
-        verify=mcp_tls_verify(),
+    # Reuse the base collector's own direct-query construction (rather than a
+    # hand-rolled HTTP call) so this rare fallback-of-a-fallback produces the
+    # SAME item shape (stream_labels, sample_entries, ...) _loki_query_
+    # observation/_loki_target_scope already know how to classify.
+    [item] = await _collect_loki_direct(settings, [("drilldown", logql)], [], time_range=time_range)
+    error = item.get("error")
+    lines = item.get("sample_lines") or []
+    summary = str(error) if error else (
+        f"{len(lines)} sample log line(s)" if lines else "no matching log lines"
     )
-    if response.error or not response.ok or not _loki_native_response_complete(response.data):
-        error = (
-            response.error
-            or (f"HTTP {response.status_code}" if not response.ok else "")
-            or "Loki response missing successful data.result"
-        )
-        return {
-            "query": logql,
-            "title": title,
-            "summary": error,
-            "error": error,
-            **({"mcp_fallback": fallback} if fallback else {}),
-        }
-    lines = _sample_lines(_loki_streams(response.data), limit=10)
-    summary = f"{len(lines)} sample log line(s)" if lines else "no matching log lines"
     return {
         "query": logql,
         "title": title,
         "summary": summary,
-        "error": None,
-        "result": {"lines": lines},
+        "error": error,
+        "result": item,
+        "observation": _loki_query_observation(
+            item, target=target, plan=None, time_range=time_range
+        ),
+        "_verified_observation": _VERIFIED_OBSERVATION,
         **({"mcp_fallback": fallback} if fallback else {}),
     }
 

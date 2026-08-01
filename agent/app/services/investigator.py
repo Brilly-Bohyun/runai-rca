@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -48,7 +49,10 @@ from app.services.query_memory import QueryMemory, collector_probe_key, domain_q
 from app.services.root_cause_ranking import (
     artifact_contradicts_family,
     artifact_supports_family,
+    typed_reason_family,
 )
+
+_log = logging.getLogger(__name__)
 
 _LEDGER_STATUSES = {"open", "testing", "supported", "refuted", "uncertain"}
 _USER_PROMPT_CHARS = 8000
@@ -106,6 +110,11 @@ def _prioritize_probes(
         str(item.get("id") or "")
         for item in ledger
         if str(item.get("status") or "open") in {"open", "testing", "uncertain", "untested"}
+        # A hypothesis flagged untestable (see `_hypothesis_testable`) has no
+        # reachable read-only discriminator; scoring it as "unresolved work"
+        # would keep rewarding probes that can never move it, at the expense
+        # of a probe covering a hypothesis this loop can actually test.
+        and not item.get("untestable_reason")
     }
     used_groups = {source_independence_group(name) for name in evidence}
     directive = plan.diagnostic_directive if plan else {}
@@ -159,6 +168,93 @@ def _fallback_probe(
         selected_hypothesis=selected_hypothesis,
     )
     return ordered[0] if ordered else None
+
+
+# The model is told (in the decision system prompt) to use the TOOL names from
+# diagnostic_directive.probes[].tool as discriminators, but probes[].collector
+# expects a COLLECTOR name from `all_names`. Confirmed production failure: two
+# re-analysis rounds named only "k8s_read"/"k8s_describe" there, every probe
+# was silently dropped, and 191.6s produced zero evidence. Every tool name in
+# knowledge/*.yaml maps to exactly one collector (see
+# app.services.drilldown._domain_tools), so accepting the alias is safe; kept
+# as a static table instead of importing drilldown's registry to avoid coupling
+# this file to that module's internals.
+_PROBE_COLLECTOR_ALIASES = {
+    "k8s_read": "kubernetes",
+    "k8s_describe": "kubernetes",
+    "k8s_logs": "kubernetes",
+    "k8s_change_timeline": "kubernetes",
+    "k8s_exec": "kubernetes",
+    "promql_query": "prometheus",
+    "logql_query": "loki",
+    "system_log_query": "system",
+    "change_query": "change",
+}
+
+
+def _resolve_probe_collector(raw: object, all_names: set[str]) -> str:
+    """Canonical collector name for a probe, accepting a known tool-name alias."""
+    name = str(raw or "").strip()
+    if name in all_names:
+        return name
+    alias = _PROBE_COLLECTOR_ALIASES.get(name, "")
+    return alias if alias in all_names else ""
+
+
+def _rejected_probe_feedback(offending: object, all_names: set[str]) -> dict[str, Any]:
+    """Same shape/purpose as `_rejected_adhoc_query_feedback`, for a probe naming
+    an unknown collector. Inlines the allowed collector names: burying them at
+    the top of a 3k+ token prompt previously let a model "correct" the spelling
+    of an invalid value instead of the vocabulary (see that function)."""
+    return {
+        "probe": {"collector": str(offending or "")[:120]},
+        "failure": {
+            "message": "probe rejected",
+            "category": "unknown_collector",
+            "retryable_by_query_change": True,
+            "correction_hint": (
+                "probes[].collector must be a collector name, not a tool name. Use one of: "
+                f"{', '.join(sorted(all_names))}."
+            ),
+            "evidence": False,
+        },
+    }
+
+
+def _resolve_probe(
+    probe: object,
+    all_names: set[str],
+    *,
+    query_feedback: list[dict[str, Any]],
+    reporter: ProgressReporter | None,
+    step: int | None = None,
+) -> dict[str, Any] | None:
+    """Validate/normalize one LLM-proposed probe, or reject it loudly.
+
+    A dropped probe used to vanish with no feedback, no progress event, and no
+    warning, so a model that kept naming a tool instead of a collector could
+    burn an entire re-analysis on it. Shared by the main decision loop and the
+    post-reflection verification loop, which duplicate this exact intake.
+    """
+    offending = probe.get("collector") if isinstance(probe, dict) else probe
+    collector = _resolve_probe_collector(offending, all_names) if isinstance(probe, dict) else ""
+    if collector:
+        return {**probe, "collector": collector}
+    _log.warning(
+        "dropped probe naming unknown collector %r; allowed collectors: %s",
+        offending,
+        sorted(all_names),
+    )
+    query_feedback.append(_rejected_probe_feedback(offending, all_names))
+    query_feedback[:] = query_feedback[-8:]
+    if reporter:
+        reporter.emit(
+            "investigation",
+            "Dropped probe naming an unknown collector",
+            collector=str(offending or ""),
+            **({"step": step} if step is not None else {}),
+        )
+    return None
 
 
 def _collector_name(collector: object) -> str:
@@ -266,7 +362,13 @@ def _probe_fingerprint(
 
 
 def _adhoc_query_fingerprint(query: dict[str, Any]) -> str:
-    kind = resolve_read_kind(str(query.get("kind") or "")) or str(query.get("kind") or "")
+    # An unresolvable kind (not in the allowlist) falls back to the raw text;
+    # lowercase it too so a resubmitted case-variant of an already-rejected
+    # invalid kind still fingerprints identically instead of buying another
+    # bounded round to re-discover the same rejection.
+    kind = resolve_read_kind(str(query.get("kind") or "")) or str(
+        query.get("kind") or ""
+    ).strip().lower()
     return json.dumps(
         {
             "kind": kind,
@@ -276,6 +378,51 @@ def _adhoc_query_fingerprint(query: dict[str, Any]) -> str:
         },
         sort_keys=True,
     )
+
+
+def _resolve_adhoc_query(
+    query: object,
+    *,
+    seen_queries: set[str],
+    failed_queries: set[str],
+    query_feedback: list[dict[str, Any]],
+    reporter: ProgressReporter | None,
+    step: int | None = None,
+) -> tuple[bool, bool]:
+    """Validate/dedupe one LLM-proposed ad-hoc query.
+
+    Returns ``(accepted, retryable_rejection)``; mutates `seen_queries` and
+    `query_feedback` in place. Shared by the main decision loop and the
+    post-reflection verification loop, which duplicate this exact intake.
+
+    A rejected (invalid-kind) query previously never entered `seen_queries` —
+    only the trimmed `query_feedback[-8:]` remembered it — so the identical
+    request (or a same/case-variant kind) could be resubmitted and rejected
+    again every round instead of being recognised as already answered.
+    """
+    fingerprint = _adhoc_query_fingerprint(query) if isinstance(query, dict) else ""
+    if fingerprint and fingerprint in seen_queries:
+        if fingerprint in failed_queries:
+            query_feedback.append(_duplicate_failed_query_feedback(query))
+            query_feedback[:] = query_feedback[-8:]
+            return False, True
+        # Already rejected (invalid kind) or already executed: repeating it
+        # is not new work and must not re-justify another LLM decision round.
+        return False, False
+    if not _valid_adhoc_kubernetes_query(query):
+        query_feedback.append(_rejected_adhoc_query_feedback(query))
+        query_feedback[:] = query_feedback[-8:]
+        if fingerprint:
+            seen_queries.add(fingerprint)
+        if reporter and isinstance(query, dict):
+            reporter.emit(
+                "investigation",
+                "Rejected non-Kubernetes ad-hoc query kind",
+                kind=str(query.get("kind") or ""),
+                **({"step": step} if step is not None else {}),
+            )
+        return False, True
+    return True, False
 
 
 def _remember_kubernetes_queries(
@@ -472,6 +619,8 @@ def _ledger_public_item(item: dict[str, Any]) -> dict[str, Any]:
             output[key] = values
     if next_test := str(item.get("next_discriminating_test") or "").strip():
         output["next_discriminating_test"] = next_test
+    if untestable_reason := str(item.get("untestable_reason") or "").strip():
+        output["untestable_reason"] = untestable_reason
     return output
 
 
@@ -517,6 +666,10 @@ def _compact_ledger_item(item: dict[str, Any]) -> dict[str, Any]:
             output[key] = values
     if next_test := _bounded_ledger_text(item.get("next_discriminating_test"), limit=320):
         output["next_discriminating_test"] = next_test
+    # Surfaced so the model stops re-proposing probes/queries for a
+    # hypothesis this loop structurally cannot test (see `_hypothesis_testable`).
+    if reason := _bounded_ledger_text(item.get("untestable_reason"), limit=200):
+        output["untestable_reason"] = reason
     return output
 
 
@@ -594,8 +747,7 @@ def _attach_typed_artifacts(
     """Attach verified typed support the model omitted from its ledger links."""
     if not ledger or not isinstance(artifacts, (list, tuple)):
         return
-    evidence_id_for = getattr(blackboard, "evidence_id_for", None)
-    if not callable(evidence_id_for):
+    if not callable(getattr(blackboard, "facts", None)):
         return
     for candidate in artifacts:
         result = getattr(candidate, "result", None)
@@ -607,10 +759,7 @@ def _attach_typed_artifacts(
             and observation.get("target_identity_verified") is True
         ):
             continue
-        try:
-            fact_id = str(evidence_id_for(candidate) or "").strip()
-        except Exception:  # noqa: BLE001 - attachment is advisory
-            continue
+        fact_id = _board_fact_id(blackboard, candidate)
         if not fact_id or (
             eligible_support_ids is not None and fact_id not in eligible_support_ids
         ):
@@ -621,8 +770,58 @@ def _attach_typed_artifacts(
                 _extend_text_list(item, "evidence_for", [fact_id])
 
 
+def _board_fact_id(blackboard: Any, candidate: object) -> str:
+    """Resolve the board's OWN fact ID for a collector artifact.
+
+    ``evidence_id_for`` re-hashes the artifact without the incident entity,
+    timestamp, and causal window the pipeline seeds facts with, so the ID it
+    returns never matches a seeded fact and this attachment silently did
+    nothing in every real run.  The artifact identity is context-free and
+    stable; require a UNIQUE match so an identically worded observation for
+    another Pod can never be cited here.
+    """
+    from app.services.evidence_blackboard import normalize_artifact
+
+    try:
+        artifact_id = normalize_artifact(candidate).artifact_id
+        matches = [
+            fact
+            for fact in blackboard.facts()
+            if str(getattr(fact, "artifact_id", "")) == artifact_id
+        ]
+    except Exception:  # noqa: BLE001 - attachment is advisory, never fatal
+        return ""
+    return str(getattr(matches[0], "fact_id", "")) if len(matches) == 1 else ""
+
+
+def _hypothesis_testable(candidate: dict[str, Any], all_names: set[str]) -> tuple[bool, str]:
+    """Whether `candidate` names a discriminator this loop can actually reach.
+
+    `next_discriminating_test`/`statement` are free-form model prose and do
+    not reliably contain the exact collector/kind token — keyword-matching
+    prose against a controlled vocabulary is the anti-pattern this codebase
+    avoids elsewhere — so only the structured `discriminator` field is
+    trusted. Omitting it is NOT treated as untestable (most hypotheses are
+    fine with ordinary collector probing); this only catches a hypothesis
+    that explicitly names a surface this loop cannot reach. Confirmed
+    production case: a reflection-added "runai_scheduling_permission"
+    hypothesis whose only discriminator was RBAC roles/rolebindings, which
+    are not in `_READ_KINDS` and have no owning collector, so every
+    following round chasing it was dead before it started.
+    """
+    named = str(candidate.get("discriminator") or "").strip()
+    if not named:
+        return True, ""
+    if named in all_names or resolve_read_kind(named) is not None:
+        return True, ""
+    return (
+        False,
+        f"no reachable read-only surface named '{named}' (not a collector or adhoc_query_kind)",
+    )
+
+
 def _add_reflected_hypotheses(
-    ledger: list[dict[str, Any]], candidates: object
+    ledger: list[dict[str, Any]], candidates: object, all_names: set[str] | None = None
 ) -> list[dict[str, Any]]:
     if not isinstance(candidates, list):
         return ledger
@@ -660,6 +859,12 @@ def _add_reflected_hypotheses(
                 entry[field] = values
         if next_test := str(candidate.get("next_discriminating_test") or "").strip():
             entry["next_discriminating_test"] = next_test
+        # Never silently drop an untestable hypothesis — it is still worth
+        # recording for the operator — but flag it so the ledger view/prompt
+        # can stop the loop from spending rounds chasing a dead discriminator.
+        testable, reason = _hypothesis_testable(candidate, all_names or set())
+        if not testable:
+            entry["untestable_reason"] = reason
         ledger.append(entry)
         existing.add(hypothesis_key)
     return ledger
@@ -712,8 +917,14 @@ def _evidence_sufficiency(
     One scoped-positive fact is valid evidence, but it is not enough to stop
     unrelated collection. Early-stop requires family-semantic support from two
     independent telemetry groups, no scoped family contradiction, and no
-    hypothesis-bound probe that already refuted the candidate. The explicit
-    NVIDIA XID alert signature is the sole single-source dispositive exception.
+    hypothesis-bound probe that already refuted the candidate.
+
+    Single-source exceptions are dispositive OBSERVATIONS, never prose: the
+    explicit NVIDIA XID alert signature, and a controlled-vocabulary Kubernetes
+    reason that names its family outright. An ``OOMKilled`` container or an
+    ``unschedulable`` Pod condition exists in the Kubernetes API and nowhere
+    else, so a two-group floor would make those causes permanently unreachable
+    while the run keeps collecting telemetry that cannot corroborate them.
     """
     facts_method = getattr(blackboard, "facts", None)
     get_fact = getattr(blackboard, "get", None)
@@ -725,26 +936,7 @@ def _evidence_sufficiency(
         return {"sufficient": False, "reason": "invalid_typed_blackboard"}
 
     results = list(evidence.values()) if isinstance(evidence, dict) else list(evidence)
-    eligibility_context: dict[str, object] = {}
-    if target is not None:
-        window = causal_evidence_time_range(target) or {}
-        eligibility_context = {
-            "window_start": str(window.get("start") or ""),
-            "window_end": str(window.get("end") or ""),
-            "entities": [
-                f"{field}:{value}"
-                for field in (
-                    "pod",
-                    "node",
-                    "workload_name",
-                    "runai_workload_id",
-                    "project",
-                    "queue",
-                    "namespace",
-                )
-                if (value := str(getattr(target, field, "") or "").strip())
-            ],
-        }
+    eligibility_context = _eligibility_context(target)
     for hypothesis in ledger:
         if str(hypothesis.get("status") or "") != "supported":
             continue
@@ -774,7 +966,7 @@ def _evidence_sufficiency(
             dispositive = dispositive or (
                 family == "gpu_hardware_error"
                 and str(getattr(fact, "predicate", "")) == "alert_signature:nvidia_xid"
-            )
+            ) or typed_reason_family(str(getattr(fact, "typed_reason", ""))) == family
 
         contradicted = any(
             artifact_contradicts_family(family, _fact_as_artifact(fact))
@@ -824,22 +1016,70 @@ def _fact_as_artifact(fact: Any) -> object:
                 "predicate": str(getattr(fact, "predicate", "") or ""),
                 "polarity": str(getattr(fact, "polarity", "") or "unknown"),
                 "coverage": str(getattr(fact, "coverage", "") or "unknown"),
+                # Re-emit the collector's typed reason so the shared family gate
+                # takes its controlled-vocabulary path here too, instead of
+                # keyword-matching this card's summary prose.  POSITIVE facts
+                # only: the reason makes a card relevant to exactly one family,
+                # and refutation reads scoped ABSENCES — no collector types a
+                # reason onto one today, and this keeps that true by
+                # construction rather than by coincidence.
+                **(
+                    {"container_reason": reason}
+                    if (reason := str(getattr(fact, "typed_reason", "") or ""))
+                    and str(getattr(fact, "polarity", "")) == "present"
+                    else {}
+                ),
             },
         },
     )
 
 
-def _eligible_support_ids(blackboard: Any) -> set[str]:
-    """Return only scoped positive fact IDs the investigator may cite as support."""
+def _eligibility_context(target: AnalysisTarget | None) -> dict[str, object]:
+    """The incident window and identities every citation is judged against."""
+    if target is None:
+        return {}
+    window = causal_evidence_time_range(target) or {}
+    return {
+        "window_start": str(window.get("start") or ""),
+        "window_end": str(window.get("end") or ""),
+        "entities": [
+            f"{field}:{value}"
+            for field in (
+                "pod",
+                "node",
+                "workload_name",
+                "runai_workload_id",
+                "project",
+                "queue",
+                "namespace",
+            )
+            if (value := str(getattr(target, field, "") or "").strip())
+        ],
+    }
+
+
+def _eligible_support_ids(
+    blackboard: Any, target: AnalysisTarget | None = None
+) -> set[str]:
+    """Return only scoped positive fact IDs the investigator may cite as support.
+
+    ``fact.eligibility`` answers polarity/coverage alone.  Judging citations by
+    that at this layer while the trace, the harness, and candidate promotion all
+    apply the incident window and target identity let the ledger claim support
+    from an observation those layers had already discarded.  One context, one
+    verdict — ``target`` stays optional so callers without one keep the old,
+    looser behaviour rather than silently starving.
+    """
     facts = getattr(blackboard, "facts", None)
     if not callable(facts):
         return set()
+    context = _eligibility_context(target) or None
     try:
         return {
             str(fact.fact_id)
             for fact in facts()
             if str(getattr(fact, "fact_id", ""))
-            and bool(getattr(getattr(fact, "eligibility", None), "support", False))
+            and EvidenceEligibility.from_fact(fact, context=context).support
         }
     except Exception:  # noqa: BLE001 - malformed shared observations cannot support a claim
         return set()
@@ -856,6 +1096,14 @@ def _ledger_fingerprint(
             tuple(_texts(item.get("evidence_for"))),
         )
         for item in ledger
+        # A hypothesis flagged untestable has no reachable read-only
+        # discriminator (see `_hypothesis_testable`).  Excluding it here means
+        # reflection adding ONLY such a hypothesis does not, by itself, look
+        # like a ledger change worth spending a verification round's LLM call
+        # on — the confirmed production bug: a reflection-only hypothesis with
+        # no reachable discriminator burned every later round before it
+        # started.
+        if not item.get("untestable_reason")
     )
 
 
@@ -1056,6 +1304,10 @@ async def investigate(
                         "changes. Batch all independent discriminating queries for this step "
                         "instead of spending another "
                         "reasoning round on each query. Conclude once evidence is sufficient. "
+                        "For new_hypotheses, set discriminator to the collector name (see "
+                        "available_collectors) or adhoc_query_kind that could test it; omit it "
+                        "only if nothing here can test it. Never spend a probe or query on a "
+                        "ledger entry that already shows untestable_reason. "
                         "Respond with ONLY JSON: "
                         '{"action":"probe"|"conclude","reason":str,'
                         '"selected_hypothesis":str,'
@@ -1070,7 +1322,7 @@ async def investigate(
                         '"status":"open|testing|supported|refuted|uncertain"}],'
                         '"new_hypotheses":[{"family"?:str,"statement":str,"mechanism":str,'
                         '"expected_observations":[str],"falsifiers":[str],'
-                        '"next_discriminating_test":str}]}'
+                        '"next_discriminating_test":str,"discriminator"?:str}]}'
                     ),
                     user=_investigator_masker(settings).mask_text(
                         _build_user_prompt(
@@ -1089,7 +1341,7 @@ async def investigate(
             )
             if not isinstance(decision, dict):
                 break  # unusable response -> fall through to full gather
-            eligible_support_ids = _eligible_support_ids(blackboard)
+            eligible_support_ids = _eligible_support_ids(blackboard, target)
             ledger = _apply_ledger_updates(
                 ledger,
                 decision.get("hypothesis_updates"),
@@ -1097,7 +1349,7 @@ async def investigate(
                 artifacts=[item for result in evidence.values() for item in result.artifacts],
                 eligible_support_ids=eligible_support_ids,
             )
-            ledger = _add_reflected_hypotheses(ledger, decision.get("new_hypotheses"))
+            ledger = _add_reflected_hypotheses(ledger, decision.get("new_hypotheses"), all_names)
             investigation_steps.append(
                 {
                     "step": step,
@@ -1132,18 +1384,25 @@ async def investigate(
             retryable_query_rejection = False
             fresh = []
             for probe in probes if isinstance(probes, list) else []:
-                if not isinstance(probe, dict) or probe.get("collector") not in all_names:
+                resolved = _resolve_probe(
+                    probe,
+                    all_names,
+                    query_feedback=query_feedback,
+                    reporter=reporter,
+                    step=step,
+                )
+                if resolved is None:
                     continue
                 fingerprint = _probe_fingerprint(
-                    str(probe.get("collector") or ""),
+                    str(resolved.get("collector") or ""),
                     target,
                     plan,
-                    probe.get("scope") or {},
+                    resolved.get("scope") or {},
                 )
                 if fingerprint in seen_probes:
                     continue
                 seen_probes.add(fingerprint)
-                fresh.append(probe)
+                fresh.append(resolved)
             fresh = _prioritize_probes(
                 fresh,
                 evidence=evidence,
@@ -1153,31 +1412,23 @@ async def investigate(
             )
             wanted = []
             for query in queries if isinstance(queries, list) else []:
-                if not _valid_adhoc_kubernetes_query(query):
-                    query_feedback.append(_rejected_adhoc_query_feedback(query))
-                    query_feedback[:] = query_feedback[-8:]
-                    retryable_query_rejection = True
-                    if reporter and isinstance(query, dict):
-                        reporter.emit(
-                            "investigation",
-                            "Rejected non-Kubernetes ad-hoc query kind",
-                            step=step,
-                            kind=str(query.get("kind") or ""),
-                        )
-                    continue
-                fingerprint = _adhoc_query_fingerprint(query)
-                if fingerprint in seen_queries:
-                    if fingerprint in failed_queries:
-                        query_feedback.append(_duplicate_failed_query_feedback(query))
-                        query_feedback[:] = query_feedback[-8:]
-                        retryable_query_rejection = True
+                accepted, retryable = _resolve_adhoc_query(
+                    query,
+                    seen_queries=seen_queries,
+                    failed_queries=failed_queries,
+                    query_feedback=query_feedback,
+                    reporter=reporter,
+                    step=step,
+                )
+                retryable_query_rejection = retryable_query_rejection or retryable
+                if not accepted:
                     continue
                 shared_key = domain_query_key(
                     "kubernetes", {"tool": "k8s_read", "args": query}, target
                 )
                 if query_memory is not None and not query_memory.claim(shared_key):
                     continue
-                seen_queries.add(fingerprint)
+                seen_queries.add(_adhoc_query_fingerprint(query))
                 wanted.append(query)
             if unverified_conclusion and not fresh and not wanted:
                 # Never let a model conclude from its initial, evidence-free
@@ -1295,6 +1546,7 @@ async def investigate(
                     adhoc,
                     query_feedback=query_feedback,
                     blackboard=blackboard,
+                    target=target,
                 ),
             )
         if _ledger_fingerprint(ledger) != before_reflection:
@@ -1350,7 +1602,7 @@ async def investigate(
                     verification.get("hypothesis_updates"),
                     blackboard=blackboard,
                     artifacts=[item for result in evidence.values() for item in result.artifacts],
-                    eligible_support_ids=_eligible_support_ids(blackboard),
+                    eligible_support_ids=_eligible_support_ids(blackboard, target),
                 )
                 if _evidence_sufficiency(
                     ledger, evidence, blackboard, target
@@ -1361,17 +1613,23 @@ async def investigate(
                 retryable_query_rejection = False
                 fresh = []
                 for probe in verification.get("probes") or []:
-                    if not isinstance(probe, dict) or probe.get("collector") not in all_names:
+                    resolved = _resolve_probe(
+                        probe,
+                        all_names,
+                        query_feedback=query_feedback,
+                        reporter=reporter,
+                    )
+                    if resolved is None:
                         continue
                     fingerprint = _probe_fingerprint(
-                        str(probe.get("collector") or ""),
+                        str(resolved.get("collector") or ""),
                         target,
                         plan,
-                        probe.get("scope") or {},
+                        resolved.get("scope") or {},
                     )
                     if fingerprint not in seen_probes:
                         seen_probes.add(fingerprint)
-                        fresh.append(probe)
+                        fresh.append(resolved)
                 fresh = _prioritize_probes(
                     fresh,
                     evidence=evidence,
@@ -1380,30 +1638,22 @@ async def investigate(
                 )
                 wanted = []
                 for query in verification.get("queries") or []:
-                    if not _valid_adhoc_kubernetes_query(query):
-                        query_feedback.append(_rejected_adhoc_query_feedback(query))
-                        query_feedback[:] = query_feedback[-8:]
-                        retryable_query_rejection = True
-                        if reporter and isinstance(query, dict):
-                            reporter.emit(
-                                "investigation",
-                                "Rejected non-Kubernetes ad-hoc query kind",
-                                kind=str(query.get("kind") or ""),
-                            )
-                        continue
-                    fingerprint = _adhoc_query_fingerprint(query)
-                    if fingerprint in seen_queries:
-                        if fingerprint in failed_queries:
-                            query_feedback.append(_duplicate_failed_query_feedback(query))
-                            query_feedback[:] = query_feedback[-8:]
-                            retryable_query_rejection = True
+                    accepted, retryable = _resolve_adhoc_query(
+                        query,
+                        seen_queries=seen_queries,
+                        failed_queries=failed_queries,
+                        query_feedback=query_feedback,
+                        reporter=reporter,
+                    )
+                    retryable_query_rejection = retryable_query_rejection or retryable
+                    if not accepted:
                         continue
                     shared_key = domain_query_key(
                         "kubernetes", {"tool": "k8s_read", "args": query}, target
                     )
                     if query_memory is not None and not query_memory.claim(shared_key):
                         continue
-                    seen_queries.add(fingerprint)
+                    seen_queries.add(_adhoc_query_fingerprint(query))
                     wanted.append(query)
                 if not fresh and not wanted:
                     if (
@@ -1620,7 +1870,7 @@ async def investigate(
         [],
         blackboard=blackboard,
         artifacts=[item for result in evidence.values() for item in result.artifacts],
-        eligible_support_ids=_eligible_support_ids(blackboard),
+        eligible_support_ids=_eligible_support_ids(blackboard, target),
     )
     sufficiency = _evidence_sufficiency(ledger, evidence, blackboard, target)
 
@@ -1661,6 +1911,7 @@ async def _reflect_hypotheses(
     *,
     query_feedback: list[dict[str, Any]] | None = None,
     blackboard: Any = None,
+    target: AnalysisTarget | None = None,
 ) -> list[dict[str, Any]]:
     reflection = await complete_json(
         settings,
@@ -1668,14 +1919,17 @@ async def _reflect_hypotheses(
             "You are doing one final skeptical reflection before concluding an RCA "
             "investigation. Look for a missed hypothesis, contradiction, or weakly "
             "supported confidence. Do not invent evidence; cite only F- observation IDs "
-            "from shared_observations in evidence_for/evidence_against. Respond with ONLY JSON: "
+            "from shared_observations in evidence_for/evidence_against. For new_hypotheses, "
+            "set discriminator to the collector name (see available_collectors) or "
+            "adhoc_query_kind that could test it; omit it only if nothing here can test it. "
+            "Respond with ONLY JSON: "
             '{"hypothesis_updates":[{"id":str,"confidence":number,"mechanism":str,'
             '"expected_observations":[str],"falsifiers":[str],'
             '"next_discriminating_test":str,"evidence_for":[str],'
             '"evidence_against":[str],"status":"open|testing|supported|refuted|uncertain"}],'
             '"new_hypotheses":[{"family"?:str,"statement":str,"mechanism":str,'
             '"expected_observations":[str],"falsifiers":[str],'
-            '"next_discriminating_test":str}]}'
+            '"next_discriminating_test":str,"discriminator"?:str}]}'
         ),
         user=_investigator_masker(settings).mask_text(
             _build_user_prompt(
@@ -1698,9 +1952,9 @@ async def _reflect_hypotheses(
         reflection.get("hypothesis_updates"),
         blackboard=blackboard,
         artifacts=[item for result in evidence.values() for item in result.artifacts],
-        eligible_support_ids=_eligible_support_ids(blackboard),
+        eligible_support_ids=_eligible_support_ids(blackboard, target),
     )
-    return _add_reflected_hypotheses(ledger, reflection.get("new_hypotheses"))
+    return _add_reflected_hypotheses(ledger, reflection.get("new_hypotheses"), set(by_name))
 
 
 def _build_user_prompt(
@@ -2104,6 +2358,11 @@ def _feedback_query_identity(query: object) -> dict[str, str]:
 
 
 def _rejected_adhoc_query_feedback(query: object) -> dict[str, Any]:
+    # Inline the actual allowlist: adhoc_query_kinds is buried at the top of a
+    # 3k+ token prompt while this feedback item is the freshest thing the
+    # model sees, and a model corrected only the SPELLING of an invalid kind
+    # (RoleBinding -> rolebindings) when the vocabulary itself was never shown
+    # here.
     return {
         "query": _feedback_query_identity(query),
         "failure": {
@@ -2111,8 +2370,9 @@ def _rejected_adhoc_query_feedback(query: object) -> dict[str, Any]:
             "category": "invalid_resource_kind",
             "retryable_by_query_change": True,
             "correction_hint": (
-                "Use one of adhoc_query_kinds for Kubernetes get/list. Use the matching "
-                "collector probe for logs, metrics, or deployment history."
+                "Use one of adhoc_query_kinds for Kubernetes get/list: "
+                f"{', '.join(sorted(_READ_KINDS))}. Use the matching collector probe for "
+                "logs, metrics, or deployment history."
             ),
             "evidence": False,
         },
