@@ -30,32 +30,34 @@ from typing import Any
 import yaml
 
 from app.config import load_settings
+from app.knowledge import load_family_catalog
 from app.ontology.typedb_client import _concept_value, open_driver
 from app.ontology.typedb_client import escape_typeql as esc
 
 KNOWLEDGE_FILE = Path(os.getenv("FAILURE_MODES_FILE", "knowledge/failure_modes.yaml"))
+FAMILIES_FILE = Path(os.getenv("FAMILIES_FILE", "knowledge/families.yaml"))
 _log = logging.getLogger(__name__)
 
-# Must match schema.tql sub-types and app/services/root_cause_ranking.py.
-FAMILIES = {
-    "node_kubelet_pressure",
-    "runai_scheduling_quota",
-    "k8s_scheduling_error",
-    "runai_control_plane_error",
-    "k8s_control_plane_error",
-    "workload_startup_error",
-    "image_pull_error",
-    "gpu_hardware_error",
-    "network_fabric_error",
-    "cluster_network_error",
-    "k8s_storage_error",
-    "storage_backend_error",
-    "workload_runtime_error",
-    "observability_accuracy",
-    "platform_auth_error",
-    "platform_lifecycle_change",
-    "insufficient_evidence",
-}
+
+def _catalog_families(path: str | Path = FAMILIES_FILE) -> set[str]:
+    """The closed root-cause family vocabulary, read from the single
+    authoritative catalog (families.yaml via app.knowledge.load_family_catalog)
+    instead of a private copy of the list. A private copy is how this loader
+    and ontology/load_troubleshooting.py (which imports FAMILIES from here)
+    previously went stale the moment families.yaml grew a new family: this one
+    silently skipped it, the other hard-raised.
+
+    ``insufficient_evidence`` is schema.tql's root_cause subtype for "no
+    diagnosis" and is deliberately absent from families.yaml (it is the
+    ranker's built-in sentinel, not a curated diagnostic family) but curated
+    knowledge is still allowed to target it, so it is added back here — same
+    construction app/main.py uses for its own evaluation_families universe.
+    """
+    return {*load_family_catalog(str(path)).families, "insufficient_evidence"}
+
+
+# Must match schema.tql sub-types and app/services/root_cause_ranking.FAMILIES.
+FAMILIES = _catalog_families()
 
 
 def _exists(tx: Any, match: str) -> bool:
@@ -272,12 +274,16 @@ def main() -> int:
         for entry in raw
         if isinstance(entry, dict) and str(entry.get("family", "")).strip()
     }
+    # Re-read per call (not the import-time FAMILIES) so a settings-level
+    # FAMILIES_FILE override is honored the same way settings.typedb_database
+    # already is, just below.
+    valid_families = _catalog_families(settings.families_file)
     with open_driver(settings) as driver:
         with driver.transaction(settings.typedb_database, TransactionType.WRITE) as tx:
             purge_legacy_families(tx, catalog_families)
             for entry in raw:
                 family = str(entry.get("family", "")).strip()
-                if family not in FAMILIES:
+                if family not in valid_families:
                     print(f"skip unknown family: {family!r}", file=sys.stderr)
                     continue
                 _ensure_cause(tx, family)

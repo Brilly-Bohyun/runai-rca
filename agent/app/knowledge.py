@@ -161,6 +161,12 @@ DEFAULT_FAMILIES = (
     # expected disruption, not a hardware/node fault — this family names that so
     # an upgrade isn't mis-attributed to the incidental symptoms it produces.
     "platform_lifecycle_change",
+    # Documented Run:ai regressions and by-design behaviours. They were already
+    # declared by runai_known_issues.yaml and could already headline, but were
+    # missing from this closed vocabulary, so the ranker, the facet table and
+    # the evaluation flow all saw a family name they did not know.
+    "platform_version_bug",
+    "expected_known_behavior",
 )
 
 DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
@@ -393,6 +399,16 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "helm.sh/release",
         ),
     ),
+    "platform_version_bug": (
+        "loki",
+        ("loki", "kubernetes", "runai"),
+        ("administrator prohibited modifying", "notification settings missing"),
+    ),
+    "expected_known_behavior": (
+        "kubernetes",
+        ("kubernetes", "loki", "runai"),
+        ("completed after reboot",),
+    ),
 }
 
 DEFAULT_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -460,6 +476,14 @@ DEFAULT_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "platform_lifecycle_change",
         ("rollout", "upgrade", "rollingupdate", "helm", "revision", "rolloutstuck"),
     ),
+    (
+        "platform_version_bug",
+        ("administrator prohibited modifying", "notification settings missing"),
+    ),
+    (
+        "expected_known_behavior",
+        ("completed after reboot",),
+    ),
 )
 
 DEFAULT_FAMILY_REASONS = {
@@ -485,6 +509,16 @@ DEFAULT_FAMILY_REASONS = {
     "platform_lifecycle_change": (
         "alert coincides with a rollout/upgrade of the implicated component or its "
         "dependencies — expected disruption; verify the rollout/Helm release completed"
+    ),
+    "platform_version_bug": (
+        "alert/evidence matches a documented Run:ai regression in "
+        "runai_known_issues.yaml — the real fix is upgrading to the version where "
+        "it was patched, not further on-cluster RCA"
+    ),
+    "expected_known_behavior": (
+        "alert/evidence matches a documented by-design Run:ai/Kubernetes behavior "
+        'or product limitation in runai_known_issues.yaml, not a fault — the RCA '
+        'should conclude "known, expected behavior" rather than keep searching'
     ),
 }
 
@@ -737,6 +771,18 @@ def localized_failure_mode_actions(symptom: dict[str, Any], language: str) -> li
     localized = symptom.get("actions_ko") if language == "ko" else None
     actions = localized or symptom.get("actions") or []
     return [str(action) for action in actions if str(action).strip()]
+
+
+def localized_failure_mode_name(symptom: dict[str, Any], language: str) -> str:
+    """A symptom's display name, preferring the curated translation when present.
+
+    Mirrors ``localized_failure_mode_actions``. Callers that render a symptom
+    name directly into otherwise-localized guidance text (general_guidance.py)
+    must use this instead of ``symptom.get("symptom")`` -- a Korean sentence
+    with a bolded English symptom name in the middle reads as a broken
+    translation, not a language-specific one."""
+    localized = symptom.get("symptom_ko") if language == "ko" else None
+    return str(localized or symptom.get("symptom") or "").strip()
 
 
 def family_label(family: str) -> str:
@@ -1334,12 +1380,21 @@ def _validated_package(index: int, package: Any) -> _ValidatedPackage:
         {"failure_modes", "known_issues", "probe_template_ids"} & contents.keys()
     ):
         raise ValueError(f"package {package_id} has no compiled knowledge")
-    raw_failure_modes = contents.get("failure_modes", [])
-    raw_known_issues = contents.get("known_issues", [])
-    if kind in {"failure_mode", "failure_modes"}:
-        raw_failure_modes = entries
-    elif kind in {"known_issue", "known_issues"}:
-        raw_known_issues = entries
+    # The compiled content key is authoritative: this is what the backend
+    # actually produces (knowledge.go builds compiled.failure_modes directly,
+    # see knowledge.go:631-644) and ``kind`` is set alongside it, not instead
+    # of it (knowledge.go:911). ``kind`` + top-level ``entries`` is a legacy/
+    # alternate shape for a producer that sends exactly one knowledge type per
+    # package without nesting it under the matching content key, so it may
+    # only fill in a key the content dict never populated at all — never
+    # override real compiled content just because ``kind`` also happens to be
+    # set (that clobbered every backend-emitted package with None).
+    raw_failure_modes = contents.get("failure_modes")
+    if raw_failure_modes is None:
+        raw_failure_modes = entries if kind in {"failure_mode", "failure_modes"} else []
+    raw_known_issues = contents.get("known_issues")
+    if raw_known_issues is None:
+        raw_known_issues = entries if kind in {"known_issue", "known_issues"} else []
     # Shadow is observe-only: its symptoms already stay out of matching, and its
     # probes must stay out of the PLAN for the same reason. Registering them made
     # a shadow package change what the next analysis investigates, which is

@@ -139,6 +139,22 @@ _FAMILY_FACETS: dict[str, tuple[str, str]] = {
     "observability_accuracy": ("observability", "observability"),
     "platform_auth_error": ("auth", "fault"),
     "platform_lifecycle_change": ("platform-lifecycle", "lifecycle_change"),
+    # A documented Run:ai regression (scheduler panic / UI validation / backend
+    # bug) is a real software defect in the Run:ai stack, fixed by upgrading —
+    # same locus as runai_control_plane_error; nature=fault because the failure
+    # is functionally real (not a monitoring artifact, not mid-rollout) even
+    # though the remedy is a version bump rather than an on-cluster repair.
+    "platform_version_bug": ("control-plane", "fault"),
+    # Arguably not a fault at all (by construction: this family IS "nothing is
+    # wrong"), but the nature axis has no dedicated "by-design, not a defect"
+    # bucket. lifecycle_change is the closest existing one — like
+    # platform_lifecycle_change it tells the operator "this is expected, stop
+    # chasing it as a fault"; unlike a rollout this is a standing product trait
+    # rather than a transient change, so the fit is approximate. Locus reuses
+    # platform_lifecycle_change's "platform-lifecycle": these known issues are
+    # standing facts about the platform's own documented behavior, not one
+    # technical subsystem.
+    "expected_known_behavior": ("platform-lifecycle", "lifecycle_change"),
 }
 
 
@@ -1396,6 +1412,17 @@ def _artifact_is_relevant_to_family(family: str, art: object) -> bool:
     # predicate relevance; the support path below still applies the stricter
     # value-aware matcher before accepting a positive claim.
     return any(str(keyword).casefold() in semantic_text for keyword in keywords)
+
+
+def typed_reason_family(reason: str) -> str:
+    """Family a controlled-vocabulary Kubernetes reason determines on its own.
+
+    ``OOMKilled`` exists in the Kubernetes API and nowhere else; requiring a
+    second telemetry group for it would make those causes permanently
+    unreachable.  One table, one meaning — callers must not re-derive this from
+    text.  Returns ``""`` for anything outside the vocabulary.
+    """
+    return _K8S_CONTAINER_REASON_FAMILY.get(str(reason or "").strip().casefold(), "")
 
 
 def artifact_supports_family(family: str, art: object) -> bool:

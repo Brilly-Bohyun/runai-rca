@@ -24,10 +24,15 @@ import yaml
 
 from app.config import load_settings
 from app.ontology.typedb_client import escape_typeql as esc
-from ontology.normalization import confidence_score
 from app.ontology.typedb_client import open_driver
 from app.services.decision_tree import load_tree
+
+# Single source of truth: load_knowledge.FAMILIES is families.yaml (via
+# app.knowledge.load_family_catalog) plus insufficient_evidence -- not a
+# second private copy. Re-declaring a literal set here is exactly how this
+# loader went stale before and hard-raised on every family families.yaml adds.
 from ontology.load_knowledge import FAMILIES
+from ontology.normalization import confidence_score
 
 RUNBOOK_NAME = "k8s-senior-troubleshooting"
 BUNDLED_RUNBOOK_ID = "k8s_troubleshooting"

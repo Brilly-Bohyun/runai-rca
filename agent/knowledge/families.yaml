@@ -376,3 +376,79 @@
   reason: >-
     alert coincides with a rollout/upgrade of the implicated component or its
     dependencies — expected disruption; verify the rollout/Helm release completed
+
+# ---------------------------------------------------------------------------
+# The two families below close the gap with knowledge/runai_known_issues.yaml:
+# 9 of its 12 entries declared these families before they existed here, so
+# `root_cause_family` was a string outside every consumer's closed vocabulary
+# (the ranker, _FAMILY_FACETS, the evaluation flow). Keywords are drawn only
+# from the ACTUAL known-issue entries that declare each family below — never
+# invented — and only where the entry gives an observable ERROR/OBSERVATION
+# string. Several entries contribute none: their only candidate strings were
+# component/product/field/flag identity tokens (a pod name, a DB column, a CLI
+# flag, an env var) which fire on unrelated healthy evidence — the exact class
+# of bug this repo has been burned by (see network_fabric_error /
+# node_kubelet_pressure comments above, and the 2026-07-31 runbook-URL
+# false-positive). See the diff report for the per-keyword evidence trail.
+# ---------------------------------------------------------------------------
+
+- family: platform_version_bug
+  canonical_agent: loki
+  agents:
+    - loki
+    - kubernetes
+    - runai
+  keywords:
+    # From "Distributed Training Locked hostPath Policy Rejected In UI" — the
+    # actual UI rejection message text.
+    - "administrator prohibited modifying"
+    # From "Email Notification Settings Missing After Upgrade" — the observed
+    # symptom phrase (settings absent), not the "email notification" feature
+    # name (that's a topic name that appears constantly in healthy contexts).
+    - "notification settings missing"
+    # NOTE: "Scheduler Reclaim Panic On Large GPU Job" and "Distributed
+    # Training Templates Converted To Standard After Upgrade" contribute NO
+    # keyword here on purpose. Their only candidate strings were either a
+    # generic Go runtime file present in every panic anywhere
+    # ("runtime/panic.go"), normal reclaim log lines that fire during
+    # ordinary, healthy preemption ("reclaim] attempting to reclaim" — already
+    # runai_scheduling_quota's territory), a bare source filename
+    # ("reclaim.go"), a feature name ("distributed training template"), or a
+    # DB table identifier ("crud_templates") — component/product/identity
+    # tokens, not error observations, per the critical rule above.
+  planner_keywords:
+    - "administrator prohibited modifying"
+    - "notification settings missing"
+  reason: >-
+    alert/evidence matches a documented Run:ai regression in
+    runai_known_issues.yaml — the real fix is upgrading to the version where
+    it was patched, not further on-cluster RCA
+
+- family: expected_known_behavior
+  canonical_agent: kubernetes
+  agents:
+    - kubernetes
+    - loki
+    - runai
+  keywords:
+    # From "Running Workloads Go Completed After Node Reboot" — the observed
+    # symptom phrase itself (a workload finishing precisely because the node
+    # rebooted), not "graceful node shutdown" or "shutdowngraceperiod" (the
+    # kubelet feature/field names — present in any kubelet config dump whether
+    # or not this behavior is in play).
+    - "completed after reboot"
+    # NOTE: the other 4 known issues in this family contribute NO keyword.
+    # Every remaining candidate string was a config flag/field, an audit
+    # feature name, a DB metadata column, or a component/pod name
+    # ("master-restart-policy", "--backoff-limit", "backofflimit", "audit
+    # log", "audit api", "event history", "created_by", "workloads-manager",
+    # "cache_max_store_size_mb", "runai-backend-workloads-manager") — every
+    # one an identity token, not an observation of something being wrong (by
+    # construction: this family IS "nothing is wrong", so most of its known
+    # issues have no error string to give at all).
+  planner_keywords:
+    - "completed after reboot"
+  reason: >-
+    alert/evidence matches a documented by-design Run:ai/Kubernetes behavior
+    or product limitation in runai_known_issues.yaml, not a fault — the RCA
+    should conclude "known, expected behavior" rather than keep searching

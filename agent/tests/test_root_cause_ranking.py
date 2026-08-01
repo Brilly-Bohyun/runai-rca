@@ -974,9 +974,13 @@ def test_trigger_facet_survives_signature_promotion() -> None:
         },
     )
 
+    # S7: promotion requires the keyword to have been OBSERVED (evidence_text),
+    # not merely asserted by the match itself.
     # Path A: lifecycle family is already the ranker's top → _with_signature_support.
     top_first = [lifecycle_cause, *[c for c in ranked if c.family != "platform_lifecycle_change"]]
-    promoted_a = _promote_signature_cause(top_first, [], [], [symptom])
+    promoted_a = _promote_signature_cause(
+        top_first, [], [], [symptom], evidence_text="mid-rollout"
+    )
     assert promoted_a[0].family == "platform_lifecycle_change"
     assert promoted_a[0].trigger == lifecycle_cause.trigger
     assert promoted_a[0].as_dict()["trigger"] == lifecycle_cause.trigger
@@ -984,7 +988,9 @@ def test_trigger_facet_survives_signature_promotion() -> None:
     # Path B: a different family leads → fresh lead RankedCause for the lifecycle family.
     other = next(c for c in ranked if c.family != "platform_lifecycle_change")
     top_other = [other, *[c for c in ranked if c.family != other.family]]
-    promoted_b = _promote_signature_cause(top_other, [], [], [symptom])
+    promoted_b = _promote_signature_cause(
+        top_other, [], [], [symptom], evidence_text="mid-rollout"
+    )
     assert promoted_b[0].family == "platform_lifecycle_change"
     assert promoted_b[0].trigger == lifecycle_cause.trigger
 
@@ -1021,6 +1027,7 @@ def test_signature_floor_refreshes_score_gates_without_overriding_contradiction(
                 },
             )
         ],
+        evidence_text="imagepullbackoff",
     )[0]
 
     assert promoted.score == 7.0
