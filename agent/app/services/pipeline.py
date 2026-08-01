@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import re
+import textwrap
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
@@ -42,6 +43,7 @@ from app.knowledge import (
     load_runai_known_issues,
     load_troubleshooting_cases,
     localized_failure_mode_actions,
+    localized_failure_mode_name,
     match_failure_mode_symptoms,
     match_runai_known_issues,
     merge_runtime_failure_modes,
@@ -185,6 +187,13 @@ class PipelineState:
     self_check_confidence_before: str = ""
     self_check_confidence_after: str = ""
     reanalysis_note: str = ""
+    # The family the LAST reanalysis-round note asserted as its conclusion
+    # (R1) -- captured so harness_stage can tell, once it knows the FINAL
+    # published family, whether the Self-Check text it already wrote into
+    # state.detail is now stale (a later harness repair/abstain, or the
+    # refuted-top fallback, can change the headline after this note was
+    # written).
+    reanalysis_note_family: str = ""
     synthesis_status: str = "not_requested"
     synthesis_error: str = ""
     synthesis_duration: float | None = None
@@ -431,7 +440,17 @@ def _apply_effective_target(state: PipelineState) -> AnalysisTarget:
 
     if state.declared_target is None:
         state.declared_target = state.target
-    state.target = _scope_target(state.declared_target, state.plan)
+    scoped = _scope_target(state.declared_target, state.plan)
+    # ``plan.namespaces`` is an investigation SCOPE and may lead with a platform
+    # component's home namespace (the planner puts it first so the component is
+    # read). An alert that declares its own namespace has already stated the
+    # target's identity, and evidence eligibility compares every observation
+    # against it — so the plan may ADD namespaces to read, never move the target
+    # out of the namespace the alert named. Per-probe scoping keeps using
+    # ``_scope_target`` directly and is unaffected.
+    if state.declared_target.namespace:
+        scoped = replace(scoped, namespace=state.declared_target.namespace)
+    state.target = scoped
     return state.target
 
 
@@ -1535,7 +1554,15 @@ def _public_v3_hypothesis(
         "hypothesis_id": str(item.get("id") or ""),
         "family": str(item.get("family") or ""),
         "mechanism": str(item.get("mechanism") or item.get("statement") or ""),
-        "status": str(item.get("status") or "uncertain"),
+        # The ledger's own status is not eligibility-aware: a hypothesis can be
+        # marked ``supported`` from citations this serializer then drops. Publish
+        # the reconciled state so a reader never sees "supported" with nothing
+        # supporting it.
+        "status": (
+            "testing"
+            if str(item.get("status") or "") == "supported" and not evidence_for
+            else str(item.get("status") or "uncertain")
+        ),
         "confidence": item.get("confidence"),
         "evidence_for": list(dict.fromkeys(evidence_for)),
         "evidence_against": list(dict.fromkeys(evidence_against)),
@@ -1980,6 +2007,74 @@ def _merge_open_world_candidates(
         candidate for candidate in merged if candidate.novelty == "open_world"
     ]
     return merged
+
+
+def _warn_on_starved_evidence(state: PipelineState, response: AlertAnalysisResponse) -> None:
+    """Zero eligible support beside scoped positive facts is a TARGET bug.
+
+    Eligibility answers "is this observation about the incident we are analysing".
+    When it rejects every scoped positive fact on the board, the wrong thing is
+    almost never the evidence — it is the identity/window the run is comparing
+    against (INC-…-000001: 94 facts, 0 eligible, because the plan had moved the
+    target to the ``runai`` namespace). That is invisible to
+    ``rejected_evidence_links``, which only records links somebody tried to cite.
+    Diagnose by absence: a board with nothing scoped to say stays silent, because
+    that is an honest evidence gap.
+    """
+    facts_method = getattr(state.blackboard, "facts", None)
+    if not callable(facts_method):
+        return
+    try:
+        usable = [
+            fact
+            for fact in facts_method()
+            if str(getattr(fact, "polarity", "")) == "present"
+            and str(getattr(fact, "coverage", "")) == "scoped"
+        ]
+    except Exception:  # noqa: BLE001 - a diagnostic signal is never fatal
+        return
+    if not usable:
+        return
+    eligibility = _blackboard_eligibility(state)
+    if any(getattr(item, "support", False) for item in eligibility.values()):
+        return
+    reasons = Counter(
+        str(getattr(eligibility.get(str(getattr(fact, "fact_id", ""))), "reason", ""))
+        for fact in usable
+    )
+    dominant = next((reason for reason, _ in reasons.most_common() if reason), "ineligible")
+    message = (
+        f"no observation was eligible to support a cause: all {len(usable)} scoped "
+        f"positive fact(s) were rejected ({dominant}) — check the analysis target "
+        f"identity, not the evidence"
+    )
+    _log.warning("evidence: %s", message)
+    response.warnings = sorted(set(response.warnings) | {message})
+
+
+def _warn_on_discarded_support(state: PipelineState, response: AlertAnalysisResponse) -> None:
+    """Concluding nothing WHILE discarding support links is a wiring bug.
+
+    ``rejected_evidence_links`` was recorded in the v3 trace and read by nobody,
+    so a run could spend ten minutes reporting "no evidence" about evidence it
+    was holding (INC-…-000001: every runai-test1 observation dropped because the
+    plan had moved the target to the ``runai`` namespace).  Only fires when the
+    run concluded nothing — an ordinary run with a real cause stays silent.
+    """
+    trace = state.investigation_context.get("reasoning_trace_v3")
+    links = trace.get("rejected_evidence_links") or [] if isinstance(trace, dict) else []
+    rejected = [
+        item for item in links if isinstance(item, dict) and item.get("role") == "support"
+    ]
+    if not rejected:
+        return
+    reasons = sorted({str(item.get("reason") or "") for item in rejected if item.get("reason")})
+    message = (
+        f"concluded without a cause while discarding {len(rejected)} support link(s) "
+        f"as ineligible: {', '.join(reasons[:2])}"
+    )
+    _log.warning("evidence: %s", message)
+    response.warnings = sorted(set(response.warnings) | {message})
 
 
 def _refresh_public_reasoning_trace(state: PipelineState) -> None:
@@ -2535,6 +2630,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 state.target,
                 state.self_check_next,
                 _executed_evidence_queries(state.artifacts),
+                _held_evidence_summaries(state.artifacts, eligible_support_ids),
             )
         except Exception:  # noqa: BLE001 - questions are best-effort
             questions = []
@@ -2561,6 +2657,13 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         state.detail, untranslated = await _translate_report_lines_ko(
             settings, state.detail, synthesis_diagnostics
         )
+        # Warnings are a flat list, not part of the markdown document above --
+        # without this they shipped English verbatim in an otherwise-Korean
+        # report (a real run: 9/9 warnings stayed English).
+        state.warnings, untranslated_warnings = await _translate_warnings_ko(
+            settings, state.warnings, synthesis_diagnostics
+        )
+        untranslated += untranslated_warnings
         state.synthesis_duration = round(time.monotonic() - started_at, 3)
         if untranslated:
             state.synthesis_status = "failed"
@@ -2678,6 +2781,18 @@ GENERIC_STATE_ALERTS = frozenset(
 )
 
 
+def _final_conclusion_line(final_family: str, settings: Settings) -> str:
+    """R1: restate the FINAL published family once more, placed as the very
+    last content before the appendix, so a later harness decision that moved
+    the headline off a reanalysis round's own conclusion cannot leave that
+    round's "결론: X" / "conclusion: X" line as the last thing the operator
+    reads. The per-round trail above it is left intact -- it is an honest
+    history of how the run got here, not a wrong statement to scrub."""
+    if getattr(settings, "language", "en") == "ko":
+        return f"- **최종 결론** (위 재분석 메모를 대체함): {final_family}"
+    return f"- **Final conclusion** (supersedes the re-analysis note above): {final_family}"
+
+
 async def harness_stage(state: PipelineState) -> PipelineState:
     """Validate the already-synthesized RCA and make bounded safe repairs."""
     from app.services.harness import (
@@ -2769,14 +2884,27 @@ async def harness_stage(state: PipelineState) -> PipelineState:
                 response.analysis_detail, carried_guidance
             )
             response.analysis = response.analysis_detail
-        verdict = evaluate(
-            response,
-            state.results,
-            state.root_cause_candidates,
-            next_check=state.self_check_next,
-            evidence_eligibility=_public_evidence_eligibility(state),
-            known_issues=state.known_issues,
-            generic_state_alert=state.target.alert_name in GENERIC_STATE_ALERTS,
+        # Re-scoring the REWRITTEN document is right — the abstain stub is not
+        # the document that was gated. Its gate map is not: every gate in
+        # evaluate() is guarded by ``not insufficient``, and abstain() just set
+        # the family to insufficient_evidence, so a fresh verdict reports every
+        # hard gate as False. Persisting that erased WHY the run abstained, and
+        # the backend's knowledge-promotion veto (harnessHardGatesPassed) reads
+        # exactly this map — it could only ever fail on a missing/empty harness,
+        # never on a real violation. Keep the score from the rewritten document
+        # and the gates from the document that actually failed.
+        gated_verdict = verdict
+        verdict = replace(
+            evaluate(
+                response,
+                state.results,
+                state.root_cause_candidates,
+                next_check=state.self_check_next,
+                evidence_eligibility=_public_evidence_eligibility(state),
+                known_issues=state.known_issues,
+                generic_state_alert=state.target.alert_name in GENERIC_STATE_ALERTS,
+            ),
+            gates=dict(gated_verdict.gates),
         )
         status = "abstained"
     elif verdict.score < state.settings.rca_harness_pass_score:
@@ -2800,6 +2928,8 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     # mechanism sentence beside ``insufficient_evidence``.
     final_family = response.root_cause_family
     if final_family == "insufficient_evidence":
+        _warn_on_discarded_support(state, response)
+        _warn_on_starved_evidence(state, response)
         response.analysis_summary = _short_sentence(
             _ranked_root_cause_statement(
                 [RankedCause("insufficient_evidence", "low", 0.0)],
@@ -2818,6 +2948,19 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             eligible_support_ids=_eligible_support_ids_for_output(state),
         )
     state.summary = response.analysis_summary
+    # R1: the Self-Check section was already written into analysis_detail (in
+    # synthesize_stage) from state.reanalysis_note -- a per-round trail that
+    # can go stale by the time the harness finishes: a later repair/abstain
+    # here, or the refuted-top fallback before synthesis, can change the
+    # headline AFTER that trail's last line asserted a different conclusion
+    # (real report: headline insufficient_evidence, Self-Check's last line
+    # "...결론: observability_accuracy"). The trail itself stays -- it is an
+    # honest per-round history -- but the last thing the operator reads must
+    # not contradict the headline.
+    if state.reanalysis_note_family and state.reanalysis_note_family != final_family:
+        response.analysis_detail = _insert_before_appendix(
+            response.analysis_detail, _final_conclusion_line(final_family, state.settings)
+        )
     response.context["root_cause_candidates"] = [
         candidate.as_dict() for candidate in state.root_cause_candidates
     ]
@@ -2940,6 +3083,10 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         )
         state.self_check_caveat = outcome.caveat
         state.reanalysis_note = _append_reanalysis_note(state.reanalysis_note, outcome.note)
+        if outcome.note:
+            state.reanalysis_note_family = (
+                outcome.candidates[0].family if outcome.candidates else "insufficient_evidence"
+            )
         state.self_check_refuted = outcome.refuted
         state.self_check_next = outcome.next_check
         _aggregate_evidence(state)
@@ -3710,6 +3857,17 @@ async def _translate_report_lines_ko(
     pending = _translatable_report_lines(detail)
     if not pending:
         return detail, 0
+    translations = await _translate_pending_lines(settings, pending, diagnostics)
+    missing = len(pending) - len(translations)
+    return _apply_line_translations(detail, translations), missing
+
+
+async def _translate_pending_lines(
+    settings: Settings, pending: dict[str, str], diagnostics: list[str] | None
+) -> dict[str, str]:
+    """Batch-translate a keyed dict of English lines. Shared by the report-body
+    and warnings localization passes -- both need the identical batching/
+    concurrency/failure handling, just different line extraction."""
     translations: dict[str, str] = {}
     try:
         semaphore = asyncio.Semaphore(_TRANSLATION_BATCH_CONCURRENCY)
@@ -3724,8 +3882,33 @@ async def _translate_report_lines_ko(
         if diagnostics is not None:
             diagnostics.append(message)
         _log.warning("korean synthesis call failed: %s", message)
+    return translations
+
+
+async def _translate_warnings_ko(
+    settings: Settings, warnings: list[str], diagnostics: list[str] | None = None
+) -> tuple[list[str], int]:
+    """Localize warning strings the same way the report body is localized.
+
+    ``state.warnings`` never passed through ``_translate_report_lines_ko`` -- it
+    is a flat list, not the markdown document that function parses -- so a
+    Korean report always shipped English warnings verbatim (a real run: 9/9
+    warnings stayed English). Returns ``(warnings, untranslated_count)``; a
+    line that already contains Hangul, or that fails to translate, keeps its
+    original text.
+    """
+    pending = {
+        str(index): warning
+        for index, warning in enumerate(warnings)
+        if warning.strip() and not _HANGUL_RE.search(warning)
+    }
+    if not pending:
+        return warnings, 0
+    translations = await _translate_pending_lines(settings, pending, diagnostics)
     missing = len(pending) - len(translations)
-    return _apply_line_translations(detail, translations), missing
+    return [
+        translations.get(str(index), warning) for index, warning in enumerate(warnings)
+    ], missing
 
 
 _COMMAND_ONLY_ACTION = re.compile(
@@ -4255,21 +4438,29 @@ def _failure_mode_root_cause_statement(
             eligible_evidence_ids=eligible_evidence_ids,
             language=language,
         )
-    provenance = _runtime_failure_mode_provenance(matches, candidates)
+    provenance = _runtime_failure_mode_provenance(matches, candidates, language)
     return f"{statement} ({provenance})" if provenance else statement
 
 
 def _runtime_failure_mode_provenance(
-    matches: list[tuple[str, dict]], candidates: list[RankedCause] | None
+    matches: list[tuple[str, dict]],
+    candidates: list[RankedCause] | None,
+    language: str = "en",
 ) -> str:
     """Describe the runtime symptom that supplied the selected conclusion."""
     top_family = candidates[0].family if candidates else ""
     for family, symptom in matches:
         package_id = str(symptom.get("runtime_package_id") or "").strip()
         if package_id and (not top_family or family == top_family):
-            symptom_name = str(symptom.get("symptom") or "").strip()
+            symptom_name = localized_failure_mode_name(symptom, language)
             status = str(symptom.get("runtime_status") or "").strip()
             if symptom_name and status:
+                if language == "ko":
+                    return (
+                        "런타임 지식 출처: "
+                        f"패키지 {package_id}; family {family}; 매칭된 symptom "
+                        f"{symptom_name}; 상태 {status}"
+                    )
                 return (
                     "Runtime knowledge provenance: "
                     f"package {package_id}; family {family}; matched symptom "
@@ -4961,7 +5152,35 @@ def _promote_signature_cause(
     """A specific signature names the headline family; the keyword ranker is only
     the no-signal fallback. Precedence: NVIDIA XID (dispositive) > known-issue
     signature > curated symptom keyword > ranker. When the signature agrees with
-    the ranker's top family the richer ranked entry is kept as-is."""
+    the ranker's top family the richer ranked entry is kept as-is.
+
+    Every match -- agreement with the ranker included -- passes a specificity
+    gate first (``_promotable``): a match too weak to promote must not floor
+    an unearned score, and (being a ``continue`` rather than a ``return``)
+    must not stop a later, stronger signature for a DIFFERENT family from
+    being evaluated in this same loop (S3).
+
+    A non-catalog family additionally requires the keyword to appear in
+    ``evidence_text`` (observed EVIDENCE, no alert text) -- an unvalidated
+    label needs more than the alert's own word for it (S7's non-catalog case,
+    unchanged). A CATALOG family does not: ``_alert_text`` is a first-class
+    signature source everywhere else in this pipeline (its own docstring: "it
+    often carries the signature ... even when every collector comes back
+    empty"), proven by dozens of tests where an alert's summary/description
+    alone must reach the correct catalog family with zero collector evidence
+    -- gating catalog promotion on non-alert evidence would kill exactly the
+    promotions S7's own guardrail protects ("must not kill a promotion whose
+    keyword IS in the evidence" -- alert text, by this codebase's own
+    definition, counts). The real fix for S7's confirmed harm (a non-evidence
+    alert FIELD like runbook_url contaminating the match) is S1, which keeps
+    that text out of ``_alert_text``/``state.observed`` in the first place;
+    S2 additionally stops a support-less promotion (catalog or not) from
+    outranking a stronger evidence-backed one.
+
+    A promotion may also not displace a candidate that already scores higher
+    AND carries real evidence support -- a bare signature must not leapfrog a
+    stronger, evidence-backed ranked cause (S2).
+    """
     if xid_codes:
         return _promote_xid_cause(candidates, xid_codes)
     if typed_state[0]:
@@ -4976,6 +5195,11 @@ def _promote_signature_cause(
         support_ids = support.get("evidence_ids") or []
         support_agents = support.get("agents") or []
         support_groups = support.get("groups") or []
+        matched_keywords = entry.get("matched_keywords") or []
+        if not _promotable(matched_keywords, family):
+            continue
+        if family not in FAMILIES and not _keyword_hits(evidence_text, matched_keywords)[0]:
+            continue
         if family == top_family:
             return [
                 _with_signature_support(
@@ -4988,11 +5212,6 @@ def _promote_signature_cause(
                 ),
                 *candidates[1:],
             ]
-        matched_keywords = entry.get("matched_keywords") or []
-        if not _promotable(matched_keywords, family):
-            continue
-        if family not in FAMILIES and not _keyword_hits(evidence_text, matched_keywords)[0]:
-            continue
         rationale = f"matched known-issue signature: {issue}"
         existing = next((candidate for candidate in candidates if candidate.family == family), None)
         lead = (
@@ -5024,6 +5243,10 @@ def _promote_signature_cause(
                 ],
             )
         )
+        # S2: a promotion may not displace a candidate that already scores
+        # higher AND carries real evidence support.
+        if candidates and candidates[0].score > lead.score and candidates[0].support_evidence_ids:
+            continue
         return [lead] + [c for c in candidates if c.family != family]
     for family, symptom in symptom_matches:
         if not family or is_matcher_only_family(family):
@@ -5035,6 +5258,12 @@ def _promote_signature_cause(
         support_agents = support.get("agents") or []
         support_groups = support.get("groups") or []
         matched_keywords = [str(item) for item in symptom.get("matched_keywords") or []]
+        if not _promotable(matched_keywords, family):
+            continue
+        # No evidence_text gate here: every curated symptom family is a
+        # catalog family (the closed-vocabulary invariant), so this loop's
+        # matches are the SAME "alert text is a legitimate signature source"
+        # case documented on this function -- see the known-issue loop above.
         if family == top_family:
             return [
                 _with_signature_support(
@@ -5049,8 +5278,6 @@ def _promote_signature_cause(
                 ),
                 *candidates[1:],
             ]
-        if not _promotable(symptom.get("matched_keywords") or [], family):
-            continue
         rationale = f"matched curated symptom: {symptom.get('symptom')}"
         existing = next((candidate for candidate in candidates if candidate.family == family), None)
         lead = (
@@ -5085,6 +5312,10 @@ def _promote_signature_cause(
                 ],
             )
         )
+        # S2: same "cannot displace a stronger evidence-backed candidate" rule
+        # as the known-issue loop above.
+        if candidates and candidates[0].score > lead.score and candidates[0].support_evidence_ids:
+            continue
         return [lead] + [c for c in candidates if c.family != family]
     return candidates
 
@@ -7174,12 +7405,33 @@ def _catalog_only_knowledge(
     }
 
 
+# A link says where to READ about an alert; it never observes one. Every
+# kube-prometheus-stack rule ships runbook_url=https://runbooks.prometheus-
+# operator.dev/..., so leaving it in made the vendor's own documentation host a
+# matchable signature: INC-…-000001 headlined observability_accuracy ("this
+# alert is a false alarm", 7.0/medium, zero supporting evidence) on the single
+# keyword "prometheus-operator" taken from that URL. Same rule as the ranker's
+# METADATA_VALUE_KEYS — what we ASKED or where to look is not what came back.
+# Kept as a secondary strip for a link embedded INSIDE an otherwise-evidence
+# value; the primary gate is now ``_ALERT_NON_EVIDENCE_FIELD_RE`` (S1) — the
+# same field filter ``_asserted_alert_texts`` already applies, so a whole
+# non-evidence field (runbook_url, or the operator's own chat speculation in
+# operator_prompt) is dropped outright instead of merely having its URL cut.
+_ALERT_LINK_RE = re.compile(r"https?://\S+", re.I)
+
+
 def _alert_text(request: AlertAnalysisRequest) -> str:
     """The alert's own labels+annotations text — it often carries the signature
     (e.g. 'XID 79 ... GPU has fallen off the bus') even when every collector
-    comes back empty."""
+    comes back empty.  Non-evidence fields (runbook/operator_prompt/query/...,
+    see ``_ALERT_NON_EVIDENCE_FIELD_RE``) are excluded entirely: operator
+    guidance may steer investigation order but must never promote a cause."""
     alert = request.alert
-    labels = alert.labels or {}
+    labels = {
+        key: value
+        for key, value in (alert.labels or {}).items()
+        if not _ALERT_NON_EVIDENCE_FIELD_RE.search(str(key))
+    }
     # Prometheus/Kubernetes alerts commonly encode a Boolean condition across
     # two independent labels (for example condition=DiskPressure,status=false).
     # Flattening mapping values preserves sender insertion order, so a false
@@ -7212,7 +7464,12 @@ def _alert_text(request: AlertAnalysisRequest) -> str:
         for key, value in labels.items()
         if str(key).casefold() not in paired
     )
-    parts.extend(str(v) for v in (alert.annotations or {}).values())
+    parts.extend(
+        stripped
+        for key, value in (alert.annotations or {}).items()
+        if not _ALERT_NON_EVIDENCE_FIELD_RE.search(str(key))
+        and (stripped := _ALERT_LINK_RE.sub(" ", str(value)).strip())
+    )
     return " ".join(parts)
 
 
@@ -7616,17 +7873,17 @@ def _short_sentence(value: str, *, limit: int) -> str:
     text = " ".join(value.split())
     if not text:
         return "The agent has not received enough alert context to name a root cause."
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+    # ponytail: textwrap.shorten cuts at a word boundary instead of mid-word --
+    # the naive text[:limit] slice this replaced produced garbage like
+    # "...ResourceQu…입니다." in a real report (word chopped, then a Korean
+    # copula glued onto the fragment). Same fix as general_guidance._safe.
+    return textwrap.shorten(text, width=limit, placeholder="…")
 
 
 def _safe_line(value: object, *, limit: int, masker: Masker | None = None) -> str:
     active_masker = masker or build_masker(())
     text = " ".join(active_masker.mask_text(str(value or "")).split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+    return textwrap.shorten(text, width=limit, placeholder="…") if text else text
 
 
 def _investigation_plan_lines(plan: InvestigationPlan | None) -> list[str]:
@@ -7894,6 +8151,19 @@ def _recommended_action_lines(
     include_similar: bool = True,
 ) -> list[str]:
     # Concrete actions only — no generic "trust the evidence" filler.
+    #
+    # R2: this used to also emit "Restore Run:ai API authentication" /
+    # "Fix Loki reachability" / "Restore Postgres connectivity" whenever
+    # ``missing`` carried the matching key — regardless of WHY it was missing.
+    # In a real run that gap was OUR OWN transport failure (MCP unavailable:
+    # self-signed certificate, HTTP 404), and it was the ONLY action on a
+    # GPU-exhaustion incident: fixing our own tooling is not incident
+    # remediation. ``missing`` (kept for callers/signature stability) and its
+    # human-readable cause already surface honestly via ``response.missing_data``
+    # and ``response.warnings`` (populated straight from each collector's own
+    # ``missing_data``/``warnings``, see ``_aggregate_evidence``) and, when the
+    # RCA could not settle, via ``_operator_questions``'s "is X reachable?" —
+    # this list stays reserved for fixing the CLUSTER problem.
     lines: list[str] = []
     # Weave the proven RCA/fix from a high-similarity past incident into the actions.
     top = _top_similar_incident(request) if request and include_similar else None
@@ -7905,22 +8175,6 @@ def _recommended_action_lines(
                 f"{top.similarity:.2f}) was resolved by: {proven} — verify this fix "
                 "applies here before repeating it."
             )
-    if "runai.auth" in missing or "runai.query" in missing:
-        lines.append(
-            "- Restore Run:ai API authentication so the agent can attach "
-            "workload/project context on the next analysis run."
-        )
-    if "loki.auth" in missing or "loki.query" in missing:
-        lines.append(
-            "- Fix Loki reachability for the next analysis run: prefer the direct "
-            "loki-read service, and only add tenant/auth settings when the endpoint "
-            "explicitly requires them."
-        )
-    if "postgres.query" in missing or "postgres.connection" in missing:
-        lines.append(
-            "- Restore Postgres connectivity so RCA memory and similar-incident "
-            "evidence stay current."
-        )
     return lines
 
 
@@ -7931,13 +8185,21 @@ async def _operator_questions(
     target: AnalysisTarget,
     next_check: str,
     executed_queries: list[str] | None = None,
+    held_evidence: list[str] | None = None,
 ) -> list[str]:
     """2-4 concrete follow-up questions when the RCA could not settle.
 
     Derived deterministically from missing_data + the plan; the LLM only sharpens
     the wording when configured (deterministic list is the fallback).
+
+    ``held_evidence`` (eligible artifact summaries, e.g. "E01: gpu_capacity 8 /
+    gpu_requested 8") cross-checks every draft question -- R4: a real run asked
+    for kube-scheduler logs already held as E113 and per-node GPU usage already
+    held as E01, because this function previously saw only executed QUERY
+    strings, never what they returned.
     """
     ko = getattr(settings, "language", "en") == "ko"
+    held_text = " ".join(held_evidence or [])
 
     def has(prefix: str) -> bool:
         return any(item.startswith(prefix) for item in missing)
@@ -7982,6 +8244,10 @@ async def _operator_questions(
             if ko
             else "Is the node this alert fired on accessible (system agent or SSH)?"
         )
+    # R4: drop any draft an eligible artifact already answers BEFORE the
+    # "ensure at least 2" fallback, so a filtered-out ask is genuinely replaced
+    # rather than just padding a list that already had one held-evidence dup.
+    questions = [q for q in questions if not _already_answered(q, held_text)]
     if len(questions) < 2:
         questions.append(
             "알림 발생 시각 전후에 배포나 설정 변경이 있었는지 확인해 주세요."
@@ -7993,13 +8259,45 @@ async def _operator_questions(
     if llm_configured(settings, getattr(settings, "llm_model_insight", "")):
         try:
             sharpened = await _sharpen_operator_questions(
-                settings, questions, missing, plan, executed_queries or []
+                settings, questions, missing, plan, executed_queries or [], held_evidence or []
             )
         except Exception:  # noqa: BLE001 - sharpening is best-effort
             sharpened = None
         if sharpened:
+            sharpened = [q for q in sharpened if not _already_answered(q, held_text)]
+        if sharpened:
             return sharpened
     return [_short_sentence(question, limit=240) for question in questions]
+
+
+_QUESTION_STOPWORDS = frozenset(
+    {
+        "the", "is", "are", "was", "were", "this", "that", "for", "and", "or",
+        "please", "check", "confirm", "verify", "provide", "does", "did",
+        "확인해", "주세요", "있는지", "설정되어", "가능한지", "대한", "관련",
+    }
+)
+
+
+def _already_answered(question: str, held_text: str) -> bool:
+    """True when an eligible artifact's own text already covers a draft
+    question -- most of its salient (4+ char) words already appear in
+    ``held_text``. Deliberately conservative (>=60% overlap, needs 2+ salient
+    words) so a generic connectivity question ("Is the Kubernetes token
+    valid?") is never spuriously dropped; it only catches a near-duplicate ask
+    for content an eligible artifact literally already carries."""
+    if not question or not held_text:
+        return False
+    words = [
+        w
+        for w in re.findall(r"[a-z0-9가-힣]+", question.casefold())
+        if len(w) > 3 and w not in _QUESTION_STOPWORDS
+    ]
+    if len(words) < 2:
+        return False
+    held = held_text.casefold()
+    hits = sum(1 for w in words if w in held)
+    return hits / len(words) >= 0.6
 
 
 def _executed_evidence_queries(artifacts: list[object], limit: int = 12) -> list[str]:
@@ -8019,12 +8317,36 @@ def _executed_evidence_queries(artifacts: list[object], limit: int = 12) -> list
     return queries
 
 
+def _held_evidence_summaries(
+    artifacts: list[object], eligible_support_ids: set[str] | None, limit: int = 12
+) -> list[str]:
+    """What an eligible artifact already SAYS -- R4's other half. Query strings
+    alone (``_executed_evidence_queries``) tell a reader what was ASKED, not
+    what came back, so a probe that ran and returned "gpu_capacity 8 /
+    gpu_requested 8" gave no signal that the question was already answered."""
+    out: list[str] = []
+    for item in artifacts:
+        evidence_id = str(getattr(item, "evidence_id", "") or "")
+        if not evidence_id or not _artifact_is_scoped_support(
+            item, eligible_support_ids=eligible_support_ids
+        ):
+            continue
+        summary = " ".join(str(getattr(item, "summary", "") or "").split())
+        if not summary:
+            continue
+        out.append(f"{evidence_id}: {summary}")
+        if len(out) == limit:
+            break
+    return out
+
+
 async def _sharpen_operator_questions(
     settings: Settings,
     questions: list[str],
     missing: list[str],
     plan: InvestigationPlan | None,
     executed_queries: list[str] | None = None,
+    held_evidence: list[str] | None = None,
 ) -> list[str] | None:
     """LLM-sharpened operator questions; None keeps the deterministic list."""
     ko = getattr(settings, "language", "en") == "ko"
@@ -8033,7 +8355,8 @@ async def _sharpen_operator_questions(
         "settle on a root cause. Rewrite the draft questions to be sharper and more "
         "specific to the missing data and investigation plan. Do not invent facts, "
         "do not add generic filler. Do not ask the operator to run checks equivalent "
-        "to any query in the already-executed evidence list; target only genuinely "
+        "to any query in the already-executed evidence list, and never ask for "
+        "something an item in held_evidence already states; target only genuinely "
         "missing evidence. "
         + ("반드시 한국어로 작성하세요. " if ko else "Write in English. ")
         + 'Respond with ONLY JSON: {"questions": [str, ...]} containing 2 to 4 questions.'
@@ -8044,6 +8367,7 @@ async def _sharpen_operator_questions(
             "missing_data": missing,
             "plan": plan.as_dict() if plan else {},
             "already_executed_evidence_queries": executed_queries or [],
+            "held_evidence": held_evidence or [],
         },
         ensure_ascii=False,
         default=str,
