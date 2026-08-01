@@ -731,6 +731,26 @@ class SystemCollector:
             for item in causal_errors
             for line in raw_matches.get(str(item["source"]), [])
         ]
+        # dmesg/nvidia-smi/nvlink/syslog can never pass the checks above (no
+        # journalctl --since/--until, and dmesg has no wall-clock per line),
+        # so a clean/unreachable journal reaches this point having said
+        # nothing about them -- they were queried and matched independently.
+        # Track their hits so a real signature is surfaced instead of
+        # silently dropped whenever the alert carries a firing window.
+        snapshot_hits = _snapshot_error_sources(source_results)
+        snapshot_error_lines = [
+            line
+            for item in snapshot_hits
+            for line in raw_matches.get(str(item["source"]), [])
+        ]
+        # For a still-firing alert, "now" (when this snapshot was collected)
+        # is itself inside the incident's causal window (see
+        # causal_evidence_time_range: an unresolved incident's causal span
+        # has no fixed end). That is the same reasoning already applied to
+        # current-state Kubernetes snapshots elsewhere (e.g. node pressure
+        # conditions): admissible for an active incident by collection-time
+        # simultaneity, not by the observation's own timestamp.
+        firing = not str(target.resolved_at or "").strip()
         historical_sources = [
             item for item in source_results if item["source"] in _TIME_WINDOWABLE_SOURCES
         ]
@@ -801,6 +821,46 @@ class SystemCollector:
                     "recovery window and remain context, not causal evidence."
                     if resolved else f"Node {node}: error lines could not be verified inside the causal window; kept as context."
                 ),
+            )
+        elif snapshot_hits and firing:
+            # journal/fabricmanager are clean, but a source that cannot prove
+            # per-line timing still matched, and the alert is still active:
+            # this snapshot was collected inside the incident, not merely
+            # near it. Report it as real evidence rather than a false "no
+            # error signatures" -- "scoped" only when the node itself is
+            # verified as the alert's (same bar the causal_errors branch
+            # above applies), otherwise a guessed cluster-scan node keeps
+            # this as context. A resolved/historical alert gets no such
+            # branch and falls through to `incident_successful` below
+            # unchanged: a live snapshot fetched long after resolution
+            # cannot be backdated to a closed incident (see
+            # test_historical_incident_scopes_journal_and_ignores_current_tails).
+            scoped = historical_node_scope_verified
+            status = "ok" if scoped else "partial"
+            confidence = "medium" if scoped else "low"
+            sources_text = ", ".join(sorted({item["source"] for item in snapshot_hits}))
+            deterministic = (
+                ko_en(
+                    self._settings,
+                    f"노드 {node}: {sources_text}에서 커널/GPU/하드웨어 에러 시그니처 "
+                    f"{len(snapshot_error_lines)}건을 발견했습니다. journal/fabricmanager는 "
+                    "깨끗하지만 alert가 아직 진행 중이므로 지금 수집한 스냅샷도 유효한 "
+                    "증거로 사용합니다.",
+                    f"Node {node}: {len(snapshot_error_lines)} kernel/GPU/hardware error "
+                    f"signature(s) found in {sources_text}. journal/fabricmanager are clean, "
+                    "but the alert is still firing, so this live snapshot is admissible "
+                    "evidence for the active incident.",
+                )
+                if scoped
+                else f"{NO_EVIDENCE} " + ko_en(
+                    self._settings,
+                    f"노드 {node}: {sources_text}에서 커널/GPU/하드웨어 에러 시그니처 "
+                    f"{len(snapshot_error_lines)}건을 발견했지만, alert가 노드를 명시하지 "
+                    "않아 참고용으로만 사용합니다.",
+                    f"Node {node}: {len(snapshot_error_lines)} kernel/GPU/hardware error "
+                    f"signature(s) found in {sources_text}, but the alert did not name "
+                    "this node; this is context only.",
+                )
             )
         elif incident_successful:
             # The endpoint returns a bounded journal tail. A clean tail is
@@ -895,6 +955,7 @@ class SystemCollector:
             time_range=time_range,
             node=node,
             historical_node_scope_verified=historical_node_scope_verified,
+            firing=firing,
         )
         missing_data = [] if successful else ["system_agent.query"]
         if time_range and not incident_successful:
@@ -927,14 +988,39 @@ class SystemCollector:
         )
 
 
+def _snapshot_error_sources(
+    source_results: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Sources with a matched error signature that cannot prove per-line timing.
+
+    Only journal/fabricmanager go through journalctl, which supports a
+    trustworthy ``--since``/``--until`` predicate and (per
+    ``_journal_matching_timestamps``) a wall-clock prefix per line. dmesg is
+    kernel-uptime-relative (no wall clock), and nvidia-smi/nvlink/syslog are
+    live-state snapshots with no historical query at all -- see
+    ``_TIME_WINDOWABLE_SOURCES``. None of them can be verified the way
+    journal/fabricmanager are. That is a proof gap, not an absence: a clean
+    or unreachable journal is a fact about journal/fabricmanager only, and
+    must not silently erase a real dmesg/nvidia-smi hit.
+    """
+    return [
+        item
+        for item in source_results
+        if item.get("source") not in _TIME_WINDOWABLE_SOURCES
+        and not item.get("error")
+        and int(item.get("error_count") or 0) > 0
+    ]
+
+
 def _system_observation(
     source_results: list[dict[str, object]],
     *,
     time_range: dict[str, str] | None,
     node: str,
     historical_node_scope_verified: bool,
+    firing: bool = False,
 ) -> dict[str, object]:
-    """Classify only journalctl sources that actually cover the incident window."""
+    """Classify journalctl sources first; a clean one must not hide a snapshot hit."""
     if time_range:
         historical_sources = [
             item for item in source_results if item.get("source") in _TIME_WINDOWABLE_SOURCES
@@ -971,6 +1057,27 @@ def _system_observation(
             polarity, coverage = "present", "partial"
         else:
             polarity, coverage = "unknown", "partial"
+    if polarity != "present" and time_range and firing and _snapshot_error_sources(source_results):
+        # journal/fabricmanager being clean (or unreachable) says nothing
+        # about dmesg/nvidia-smi/nvlink/syslog -- they are queried and
+        # matched independently, and none of them can be checked the way
+        # journal/fabricmanager are (see _snapshot_error_sources). For a
+        # still-firing alert that is a proof gap, not grounds to discard a
+        # real hit: causal_evidence_time_range() already treats "now" as
+        # inside an unresolved incident's causal window, and the same
+        # collection-time-simultaneity reasoning scopes current-state
+        # Kubernetes snapshots elsewhere (e.g. node pressure conditions) even
+        # when the observation's own timestamp can't be verified. Grant
+        # "scoped" on that basis -- not by claiming a per-line timestamp this
+        # source cannot produce -- only when the node itself is verified as
+        # the alert's own (the same bar the journal branch above requires);
+        # a node guessed by a cluster-wide scan keeps this as "partial"
+        # context, exactly like an unverified journal hit does. A
+        # resolved/historical alert gets no override at all and stays
+        # whatever the branches above produced: a live snapshot fetched long
+        # after resolution cannot be backdated to a closed incident.
+        polarity = "present"
+        coverage = "scoped" if historical_node_scope_verified else "partial"
     observation = {
         "kind": "system_node_logs",
         "predicate": "system_node_logs",

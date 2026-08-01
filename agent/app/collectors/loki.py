@@ -984,6 +984,12 @@ def _loki_query_observation(
         observation["observed_entity"] = observed_entity
     if target_scope_verified is not None:
         observation["target_scope_verified"] = target_scope_verified
+        # investigator._attach_typed_artifacts only auto-attaches a present+
+        # scoped artifact when the collector itself confirms this specific
+        # target identity -- kubernetes.py has stamped this for a while;
+        # Loki never did, so a genuinely scoped Loki artifact could never
+        # auto-attach to a ledger hypothesis. Same boolean, same meaning.
+        observation["target_identity_verified"] = target_scope_verified
     if polarity == "present":
         evidence_window = _loki_evidence_window(
             item.get("sample_entries"), causal_time_range
@@ -1063,9 +1069,29 @@ def _loki_target_scope(
             name,
             item,
             target=target,
+            plan=plan,
             time_range=time_range,
         )
-    if name not in {"error_logs", "recent_logs"}:
+    # "drilldown" is the ad-hoc LLM LogQL tool (see _tool_logql in
+    # drilldown.py): its selector is not collector-authored, so it shares
+    # this branch's target-derived (never query-text-derived) requirements
+    # rather than getting its own. The `direct_empty` shortcut just below
+    # stays safe for it without extra guarding: it requires
+    # `target_log_coverage_verified is True`, a flag only this module's own
+    # `_annotate_loki_target_log_coverage` ever sets, on "error_logs"/
+    # "recent_logs" items from THIS collector's own query batch -- a
+    # drill-down item can never carry it, so an empty drill-down result
+    # always falls through to the label/entry proof below instead of being
+    # trusted for free.
+    if name not in {"error_logs", "recent_logs", "drilldown"}:
+        # This set is exhaustive by construction, not by enforcement: a new
+        # named query added to collect() without a matching scope rule here
+        # would silently stay unscoped forever with no diagnostic trail.
+        _log.warning(
+            "loki target-scope check has no rule for query name %r; "
+            "treating as unscoped (can never support/refute a hypothesis)",
+            name,
+        )
         return None, False
 
     namespace = target.namespace
@@ -1148,18 +1174,34 @@ def _loki_correlated_target_scope(
     item: dict[str, object],
     *,
     target: AnalysisTarget,
+    plan: object | None,
     time_range: dict[str, str] | None,
 ) -> tuple[dict[str, str] | None, bool]:
     """Verify a historical/control-plane row against immutable target identity.
 
     The LogQL request is only intent: proxies can ignore its selector or range.
     Require every retained in-window failure row used for support to expose an
-    exact namespace label and the full Run:ai workload ID on a token boundary.
-    This works for native Loki and Grafana MCP flat entries without allowing a
-    workload name, project, or ID substring to inherit the pipeline target.
+    exact namespace label and a bounded token match of an immutable identifier
+    for THIS incident's target. The Run:ai workload ID is preferred when the
+    alert carries one. A Kubernetes-origin alert (KubePodNotReady etc.) never
+    does, so the resolved Pod name is the fallback: unlike the workload NAME
+    (kept context-only elsewhere in this module -- a short, often-reused word
+    is too likely to collide in unrelated body text), a Pod name carries a
+    generated or ordinal suffix that makes an accidental match in another
+    workload's log line implausible, the same precision already trusted for
+    the primary query's stream-label match. This works for native Loki and
+    Grafana MCP flat entries without allowing a workload name or project
+    substring to inherit the pipeline target.
     """
     workload_id = str(target.runai_workload_id or "").strip()
-    if not workload_id or not time_range:
+    pod = str(getattr(plan, "pod", "") or target.pod or "").strip()
+    if workload_id:
+        identity_kind, identity_value = "runai_workload_id", workload_id
+    elif len(pod) >= 3:
+        identity_kind, identity_value = "pod", pod
+    else:
+        identity_kind, identity_value = "", ""
+    if not identity_value or not time_range:
         return None, False
     query = str(item.get("query") or "")
     entries = _loki_correlated_failure_entries(
@@ -1169,7 +1211,7 @@ def _loki_correlated_target_scope(
     if not entries:
         return None, False
     identifier = re.compile(
-        rf"(?<![a-z0-9_-]){re.escape(workload_id.casefold())}(?![a-z0-9_-])"
+        rf"(?<![a-z0-9_-]){re.escape(identity_value.casefold())}(?![a-z0-9_-])"
     )
     for entry in entries:
         line = str(entry.get("line") or "")
@@ -1183,7 +1225,7 @@ def _loki_correlated_target_scope(
             return None, False
     # The target namespace is encoded as the workload-history selector.  The
     # control-plane query instead validates its configured Run:ai namespace
-    # selector; the globally immutable workload ID supplies target identity.
+    # selector; the identifier check above supplies target identity either way.
     if name == "workload_history_logs":
         target_namespace = str(target.namespace or "").strip()
         if not target_namespace or any(
@@ -1191,7 +1233,7 @@ def _loki_correlated_target_scope(
             for entry in entries
         ):
             return None, False
-    return {"kind": "runai_workload_id", "name": workload_id}, True
+    return {"kind": identity_kind, "name": identity_value}, True
 
 
 def _loki_correlated_failure_entries(
