@@ -323,6 +323,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "networkplugin",
             "networkpluginnotready",
             "no route to host",
+            "networkunavailable",
         ),
     ),
     "k8s_storage_error": (
@@ -1266,6 +1267,9 @@ def _load_runai_known_issues(path: str) -> list[dict[str, Any]]:
                 "affected_version": str(entry.get("affected_version") or ""),
                 "fixed_version": str(entry.get("fixed_version") or ""),
                 "actions": [str(a) for a in (entry.get("actions") or [])],
+                # Source/KB citations (e.g. "NVIDIA Case 01074073"). Render
+                # site: pipeline._known_issue_cause_lines.
+                "refs": [str(r) for r in (entry.get("refs") or []) if str(r).strip()],
             }
         )
     return out

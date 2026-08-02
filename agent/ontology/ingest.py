@@ -1093,6 +1093,32 @@ def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
     _write_trace_v3_projection(tx, inc, set(evidence_keys.values()))
 
 
+def _node_condition_type(inc: OntologyIncident) -> str:
+    """The node's cause-bearing condition (DiskPressure/MemoryPressure/...) this
+    incident actually observed PRESENT, from the kubernetes_node_condition
+    artifact (collectors/kubernetes.py._node_condition_artifacts). Without this,
+    "past incidents on nodes with MemoryPressure" was unanswerable even though
+    the condition was observed and reported every time.
+
+    ponytail: returns only the first observed-present condition. A node hitting
+    two pressure conditions at once is rare enough not to model @card(0..) on
+    the schema attribute for it; widen both sides together if that ever needs
+    to be queryable.
+    """
+    for item in inc.artifacts or []:
+        if not isinstance(item, dict) or item.get("type") != "kubernetes_node_condition":
+            continue
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        observation = result.get("observation")
+        if not isinstance(observation, dict) or observation.get("polarity") != "present":
+            continue
+        if condition := str(result.get("condition") or "").strip():
+            return condition
+    return ""
+
+
 def _write_incident(tx: Any, inc: OntologyIncident) -> None:
     # keyed singletons (match-or-insert). The infra layer is deliberately just
     # node + workload; cluster/namespace/project/queue ride as attributes
@@ -1104,6 +1130,8 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
     _ensure(tx, "alert", "alert_id", inc.alert_id)
     if inc.node:
         _replace_attr(tx, "node", "name", inc.node, "cluster_name", inc.cluster)
+        if condition := _node_condition_type(inc):
+            _replace_attr(tx, "node", "name", inc.node, "condition_type", condition)
     if inc.workload_name:
         _replace_attr(tx, "workload", "workload_uid", workload, "name", inc.workload_name)
         for attr, value in (

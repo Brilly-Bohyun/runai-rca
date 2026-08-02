@@ -29,6 +29,16 @@ fun trigger_for_xid($code: integer) -> { xid_trigger }:
     $x isa xid_error, has xid_code $c, has xid_trigger $trigger; $c == $code;
   return { $trigger };
 
+# Driver/CUDA version the fault's leads_to escalation was confirmed under
+# (xid_catalog.yaml `linkage_note`). Kept in its own function, like
+# trigger_for_xid above: it is sparse (most XIDs don't escalate), so folding it
+# into detail_for_xid's single `has` conjunction would silently drop
+# mnemonic/description/severity for every XID that lacks a linkage_note.
+fun linkage_note_for_xid($code: integer) -> { linkage_note }:
+  match
+    $x isa xid_error, has xid_code $c, has linkage_note $note; $c == $code;
+  return { $note };
+
 # The fault's own catalog identity for a specific XID code: load_xids.py
 # ingests mnemonic/description/severity for all 109 entries, but no function
 # returned them, so the graph's name for a GPU fault ("GPU has fallen off the

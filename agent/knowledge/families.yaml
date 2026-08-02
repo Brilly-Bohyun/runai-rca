@@ -249,6 +249,14 @@
     - "networkplugin"
     - "networkpluginnotready"
     - "no route to host"
+    # The kubelet Node condition TYPE itself (kubernetes.py's
+    # kubernetes_node_condition observation carries predicate
+    # "kubernetes_node_condition:networkunavailable" and a "NetworkUnavailable=
+    # True/False" summary). Node conditions have no dedicated typed channel like
+    # container_reason/scheduling_reason, so this family-relevance keyword IS the
+    # channel: without it, a node with no network can neither support nor refute
+    # this family (its siblings Disk/Memory/PIDPressure already have theirs).
+    - "networkunavailable"
   planner_keywords:
     - "dns"
     - "coredns"

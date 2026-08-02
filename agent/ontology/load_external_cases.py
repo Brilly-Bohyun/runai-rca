@@ -36,6 +36,7 @@ import os
 import re
 import sys
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -195,18 +196,27 @@ def _is_generic(token: str) -> bool:
 def _symptom_keywords(payload: dict[str, Any]) -> list[str]:
     """Case-local symptom keywords = error_signatures plus any
     curated_signature_tokens the sanitizer injected for cases that have no error
-    string, plus canonical_component_tokens (cleaned, generic dropped,
-    lowercased, deduped, capped). Component tokens are exact hyphenated names
+    string, plus canonical_component_tokens, trigger_tokens, metric_signatures,
+    and issue_references (cleaned, generic dropped, lowercased, deduped,
+    capped). Component tokens are exact hyphenated names
     (runai-backend-thanos-receive) that appear verbatim in pod-name evidence —
     they give a case whose only error signature is a rare log line a reachable
-    entry point once the component is targeted. normalized_symptoms/
-    retrieval_keywords are prose — never used; the owner's retrieval entry
-    points are the error string and canonical identifiers, never prose."""
+    entry point once the component is targeted. trigger_tokens/
+    metric_signatures/issue_references are the curator's own specific
+    signatures (PromQL fragments, external bug-tracker IDs, named trigger
+    conditions) — without them a case whose only distinguishing signal is a
+    metric or trigger token was unretrievable. normalized_symptoms/
+    retrieval_keywords/version_tokens are prose — never used; the owner's
+    retrieval entry points are the error string and canonical identifiers,
+    never prose."""
     context = payload.get("searchable_context") or {}
     sigs = (
         list(context.get("error_signatures") or [])
         + list(context.get("curated_signature_tokens") or [])
         + list(context.get("canonical_component_tokens") or [])
+        + list(context.get("trigger_tokens") or [])
+        + list(context.get("metric_signatures") or [])
+        + list(context.get("issue_references") or [])
     )
     out: list[str] = []
     seen: set[str] = set()
@@ -237,6 +247,79 @@ def _family_candidates(payload: dict[str, Any]) -> list[dict[str, str]]:
         if family not in FAMILIES:
             continue
         out.append({"family": family, "confidence": _confidence_bucket(item.get("confidence"))})
+    return out[:5]
+
+
+@lru_cache(maxsize=1)
+def _closed_symptom_names() -> frozenset[str]:
+    """Curated failure-mode symptom names (knowledge/failure_modes.yaml) — the
+    closed catalog `_knowledge_links_matches` validates a curator's free-text
+    `failure_mode_matches` citation against, same role FAMILIES plays for
+    family_candidates above."""
+    try:
+        raw = yaml.safe_load(
+            Path(load_settings().failure_modes_file).read_text(encoding="utf-8")
+        ) or []
+    except (OSError, yaml.YAMLError):
+        return frozenset()
+    return frozenset(
+        name
+        for family in raw
+        if isinstance(family, dict)
+        for symptom in family.get("symptoms") or []
+        if isinstance(symptom, dict) and (name := str(symptom.get("name") or "").strip())
+    )
+
+
+@lru_cache(maxsize=1)
+def _closed_known_issue_names() -> frozenset[str]:
+    """Known-issue names (knowledge/runai_known_issues.yaml `issue:`) — the
+    closed catalog `_knowledge_links_matches` validates a curator's free-text
+    `known_issue_matches` citation against."""
+    try:
+        raw = yaml.safe_load(
+            Path(load_settings().runai_known_issues_file).read_text(encoding="utf-8")
+        ) or []
+    except (OSError, yaml.YAMLError):
+        return frozenset()
+    return frozenset(
+        name
+        for entry in raw
+        if isinstance(entry, dict) and (name := str(entry.get("issue") or "").strip())
+    )
+
+
+def _knowledge_links_matches(
+    payload: dict[str, Any], link_key: str, valid_names: frozenset[str]
+) -> list[dict[str, str]]:
+    """Curator cross-references (``knowledge_links.failure_mode_matches`` /
+    ``known_issue_matches``): this external case's mechanism overlaps an
+    EXISTING catalog entry, so the report can cite the more precise curated
+    fix instead of only the raw external case.
+
+    Dict-shaped entries only, and only when the name exact-matches the closed
+    catalog: a prior pass wired family_candidates and explicitly left these two
+    unwired because they name free-text catalog entries needing sanitisation.
+    A bare string entry (curator prose, e.g. "X — partial match because...")
+    has no separable name field safe to validate, so it is skipped rather than
+    parsed; that also correctly drops a "no existing entry" sentinel like
+    ``{"status": "none", "candidate_name": ...}``, which never carries a
+    `catalog_entry`/`repository_entry`/`issue` key at all.
+    """
+    links = payload.get("knowledge_links") or {}
+    out: list[dict[str, str]] = []
+    for item in links.get(link_key) or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(
+            item.get("catalog_entry") or item.get("repository_entry") or item.get("issue") or ""
+        ).strip()
+        if name not in valid_names:
+            continue
+        entry = {"name": name, "confidence": _confidence_bucket(item.get("confidence"))}
+        if match_type := str(item.get("match_type") or "").strip():
+            entry["match_type"] = match_type
+        out.append(entry)
     return out[:5]
 
 
@@ -300,6 +383,12 @@ def _to_incident(
         "historical_actions": payload.get("historical_actions") or [],
         "context": {"incident_status_at_approval": status},
         "family_candidates": _family_candidates(payload),
+        "failure_mode_matches": _knowledge_links_matches(
+            payload, "failure_mode_matches", _closed_symptom_names()
+        ),
+        "known_issue_matches": _knowledge_links_matches(
+            payload, "known_issue_matches", _closed_known_issue_names()
+        ),
     }
 
     return OntologyIncident(

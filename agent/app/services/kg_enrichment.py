@@ -143,6 +143,7 @@ _FN_XIDS_FOR_GPU_MODEL = 'match let $x in xids_for_gpu_model("{model}"); select 
 _FN_ROOT_XIDS_FOR = "match let $x in root_xids_for({code}); select $x;"
 # Transitive reverse leads_to: every fault that escalates INTO an observed XID.
 _FN_ROOT_XID_CHAIN_FOR = "match let $x in root_xid_chain_for({code}); select $x;"
+_FN_LINKAGE_NOTE_FOR_XID = "match let $x in linkage_note_for_xid({code}); select $x;"
 _FN_CAUSES_FOR_SYMPTOM = 'match let $x in causes_for_symptom("{symptom}"); select $x;'
 _FN_DEPENDENCIES_FOR_COMPONENT = 'match let $x in dependencies_for_component("{component}"); select $x;'
 _FN_CHECKS_FOR_COMPONENT_PATH = 'match let $x, $y in checks_for_component_path("{component}"); select $x, $y;'
@@ -203,6 +204,22 @@ match
   $sy isa symptom, has name $sn, has keyword $kw;
   not { (symptom: $sy, remedy: $ac) isa resolved_by; };
 select $fam, $sn, $kw;
+"""
+
+# Trace-v3 probe-execution verdict history (ontology/ingest.py's
+# _write_trace_v3_projection), grouped by the hypothesis family each execution
+# tested and the probe template it ran. A template that has repeatedly come
+# back "inconclusive" for a family is worth knowing BEFORE spending another
+# round on it; a template that reliably "supports"/"refutes" is worth running
+# again. Read by planner._diagnostic_directive (see KGContext.probe_history).
+_PROBE_HISTORY_QUERY = """
+match
+  $t isa diagnostic_probe_template, has probe_id $tid;
+  $x isa probe_execution, has probe_verdict $verdict;
+  (execution: $x, template: $t) isa probe_execution_for;
+  (execution: $x, hypothesis: $h) isa probe_execution_tests;
+  $h isa hypothesis, has hypothesis_family $family;
+select $tid, $family, $verdict;
 """
 
 _KNOWLEDGE_REASON_QUERY = """
@@ -286,6 +303,11 @@ class KGContext:
     case_cards: list[dict[str, Any]] = field(default_factory=list)
     # family -> [{symptom, keywords[], actions[]}]  (curated knowledge layer)
     knowledge: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # family -> probe template_id -> {verdict: count, ..., "total": N}. Prior
+    # trace-v3 probe-execution outcomes across every ingested run, so a planner
+    # can see a template is repeatedly "inconclusive" for this family before
+    # spending another round on it. See _PROBE_HISTORY_QUERY.
+    probe_history: dict[str, dict[str, dict[str, int]]] = field(default_factory=dict)
     reasoning: dict[str, Any] = field(default_factory=dict)
     # Executable diagnostic graph projected from TypeDB. Empty means the caller
     # should use the version-controlled YAML fallback.
@@ -305,6 +327,7 @@ class KGContext:
             "workload_topology_status": self.workload_topology_status,
             "case_cards": self.case_cards,
             "knowledge": self.knowledge,
+            "probe_history": self.probe_history,
             "reasoning": self.reasoning,
             "diagnostic_tree": self.diagnostic_tree,
             "warnings": self.warnings,
@@ -370,6 +393,7 @@ async def enrich(
         workload_topology_status=str(data.get("workload_topology_status") or ""),
         case_cards=data["case_cards"],
         knowledge=data["knowledge"],
+        probe_history=data["probe_history"],
         reasoning=data["reasoning"],
         diagnostic_tree=data["diagnostic_tree"],
     )
@@ -390,6 +414,9 @@ class GraphRemediation:
     xid_mnemonics: dict[int, str] = field(default_factory=dict)
     xid_descriptions: dict[int, str] = field(default_factory=dict)
     xid_severities: dict[int, str] = field(default_factory=dict)
+    # Driver/CUDA version an XID's leads_to escalation was confirmed under
+    # (xid_catalog.yaml `linkage_note`); sparse — only XIDs that escalate.
+    xid_linkage_notes: dict[int, str] = field(default_factory=dict)
     model_xids: dict[str, list[int]] = field(default_factory=dict)
     # observed XID -> complete transitive ancestors, in causal order when known.
     root_xids: dict[int, list[int]] = field(default_factory=dict)
@@ -417,6 +444,7 @@ class GraphRemediation:
             "xid_mnemonics": {str(k): v for k, v in self.xid_mnemonics.items()},
             "xid_descriptions": {str(k): v for k, v in self.xid_descriptions.items()},
             "xid_severities": {str(k): v for k, v in self.xid_severities.items()},
+            "xid_linkage_notes": {str(k): v for k, v in self.xid_linkage_notes.items()},
             "model_xids": {k: v for k, v in self.model_xids.items()},
             "root_xids": {str(k): v for k, v in self.root_xids.items()},
             "root_xid_status": {str(k): v for k, v in self.root_xid_status.items()},
@@ -513,23 +541,29 @@ def _query_remediation(
 
 
 def _fill_xid_detail(run: Any, out: GraphRemediation, code: int) -> None:
-    """The XID's own catalog identity: mnemonic/description/severity. Isolated
+    """The XID's own catalog identity: mnemonic/description/severity, plus the
+    driver/CUDA linkage_note when its leads_to escalation carries one. Isolated
     like the fixes/triggers lookups above — a query error here must not lose
     those. Best-effort: an XID with no catalog row silently contributes nothing."""
     if code in out.xid_mnemonics:
         return
     row = next(iter(run(_FN_XID_DETAIL.format(code=code))), None)
-    if not isinstance(row, dict):
-        return
-    mnemonic = str(row.get("m") or "").strip()
-    description = str(row.get("d") or "").strip()
-    severity = str(row.get("s") or "").strip()
-    if mnemonic:
-        out.xid_mnemonics[code] = mnemonic
-    if description:
-        out.xid_descriptions[code] = description
-    if severity:
-        out.xid_severities[code] = severity
+    if isinstance(row, dict):
+        mnemonic = str(row.get("m") or "").strip()
+        description = str(row.get("d") or "").strip()
+        severity = str(row.get("s") or "").strip()
+        if mnemonic:
+            out.xid_mnemonics[code] = mnemonic
+        if description:
+            out.xid_descriptions[code] = description
+        if severity:
+            out.xid_severities[code] = severity
+    # A separate function/query (like trigger_for_xid): linkage_note is sparse,
+    # so folding it into detail_for_xid's single `has` conjunction would drop
+    # mnemonic/description/severity for every XID that never escalates.
+    note = _statements(run(_FN_LINKAGE_NOTE_FOR_XID.format(code=code)))
+    if note:
+        out.xid_linkage_notes[code] = note[0]
 
 
 def _root_chain_for(run: Any, code: int) -> tuple[list[int], str]:
@@ -743,7 +777,28 @@ def _safe_case_card(raw: Any) -> dict[str, Any]:
         ][:5]
         if safe_candidates:
             card["family_candidates"] = safe_candidates
+    # Curator cross-references to an EXISTING curated symptom / known issue
+    # (external cases only; ontology/load_external_cases.py already bounded
+    # these to the closed catalogs before they reached this card). Lets the
+    # report cite the more precise curated entry instead of only the raw case.
+    for key in ("failure_mode_matches", "known_issue_matches"):
+        if safe_matches := _safe_knowledge_link_matches(raw.get(key)):
+            card[key] = safe_matches
     return card
+
+
+def _safe_knowledge_link_matches(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict) or not (name := _card_text(item.get("name"), 160)):
+            continue
+        entry = {"name": name, "confidence": _card_text(item.get("confidence"), 20)}
+        if match_type := _card_text(item.get("match_type"), 40):
+            entry["match_type"] = match_type
+        out.append(entry)
+    return out[:5]
 
 
 def _case_card_projection(run: Any, case_id: str) -> dict[str, Any]:
@@ -1007,6 +1062,7 @@ def _query_kg(
         knowledge_actions_ko_rows = run(_KNOWLEDGE_ACTIONS_KO_QUERY)
         knowledge_affected_version_rows = run(_KNOWLEDGE_AFFECTED_VERSION_QUERY)
         knowledge_fixed_version_rows = run(_KNOWLEDGE_FIXED_VERSION_QUERY)
+        probe_history_rows = run(_PROBE_HISTORY_QUERY)
         reasoning: dict[str, Any] = {}
         component = target.workload_name
         if component:
@@ -1124,9 +1180,26 @@ def _query_kg(
         "workload_topology_status": workload_topology_status,
         "case_cards": case_cards,
         "knowledge": knowledge,
+        "probe_history": _aggregate_probe_history(probe_history_rows),
         "reasoning": reasoning,
         "diagnostic_tree": diagnostic_tree,
     }
+
+
+def _aggregate_probe_history(rows: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, int]]]:
+    """family -> template_id -> {verdict: count, ..., "total": N}, from every
+    ingested run's trace-v3 probe executions (see _PROBE_HISTORY_QUERY)."""
+    out: dict[str, dict[str, dict[str, int]]] = {}
+    for row in rows:
+        family = str(row.get("family") or "").strip()
+        template_id = str(row.get("tid") or "").strip()
+        verdict = str(row.get("verdict") or "").strip()
+        if not (family and template_id and verdict):
+            continue
+        bucket = out.setdefault(family, {}).setdefault(template_id, {"total": 0})
+        bucket[verdict] = bucket.get(verdict, 0) + 1
+        bucket["total"] += 1
+    return out
 
 
 def _similar_incident_id(item: Any) -> str:

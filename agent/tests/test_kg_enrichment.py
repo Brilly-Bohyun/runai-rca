@@ -11,6 +11,7 @@ from app.knowledge import match_failure_mode_symptoms
 from app.services.kg_enrichment import (
     _EXTERNAL_CASE_QUERY,
     KGContext,
+    _aggregate_probe_history,
     _case_card_projection,
     _prior_is_context_compatible,
     _query_candidate_families,
@@ -261,6 +262,46 @@ def test_query_remediation_projects_xid_mnemonic_and_description() -> None:
     assert out.xid_severities == {79: "fatal"}
     assert out.as_dict()["xid_mnemonics"] == {"79": "ROBUST_CHANNEL_GPU_HAS_FALLEN_OFF_THE_BUS"}
     assert not out.is_empty()
+
+
+def test_query_remediation_projects_xid_linkage_note() -> None:
+    """xid_catalog.yaml's linkage_note (26 entries) was authored, asserted only
+    by a YAML-shape test, and never reached TypeDB or a reader — this pins the
+    read side once ingest.py/load_xids.py write it."""
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "detail_for_xid(48)" in query:
+                    return [{"m": "ROBUST_CHANNEL_GPU_ECC_DBE", "d": "Double Bit ECC Error", "s": "fatal"}]
+                if "linkage_note_for_xid(48)" in query:
+                    return [{"x": "CUDA 12.7; GPU driver R565"}]
+                return []
+
+            yield run
+
+    out = _query_remediation(FakeClient(), "", [48], "")  # type: ignore[arg-type]
+
+    assert out.xid_linkage_notes == {48: "CUDA 12.7; GPU driver R565"}
+    assert out.as_dict()["xid_linkage_notes"] == {"48": "CUDA 12.7; GPU driver R565"}
+
+
+def test_query_remediation_omits_linkage_note_when_xid_never_escalates() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "detail_for_xid(79)" in query:
+                    return [{"m": "ROBUST_CHANNEL_GPU_HAS_FALLEN_OFF_THE_BUS", "d": "GPU has fallen off the bus", "s": "fatal"}]
+                return []  # linkage_note_for_xid(79) returns nothing — 79 never escalates.
+
+            yield run
+
+    out = _query_remediation(FakeClient(), "", [79], "")  # type: ignore[arg-type]
+
+    assert out.xid_linkage_notes == {}
+    assert "xid_linkage_notes" not in out.as_dict() or out.as_dict()["xid_linkage_notes"] == {}
 
 
 def test_enrich_disabled_returns_empty_context() -> None:
@@ -1192,6 +1233,36 @@ def test_safe_case_card_omits_family_candidates_key_when_absent() -> None:
     assert "family_candidates" not in _safe_case_card({"case_origin": "enterprise_support"})
 
 
+def test_safe_case_card_passes_through_knowledge_link_matches() -> None:
+    """External-case knowledge_links.failure_mode_matches / known_issue_matches
+    (2026-08 audit item #2d): load_external_cases.py now bounds these to the
+    closed catalogs before writing case_card; this is the matching read-side
+    allowlist, mirroring family_candidates above."""
+    card = _safe_case_card({
+        "case_origin": "enterprise_support",
+        "failure_mode_matches": [
+            {"name": "OOMKilled", "confidence": "high", "match_type": "exact_symptom_only", "unexpected": "drop"},
+            {"not_a_name": "x"},  # malformed entries are dropped, not passed through
+        ],
+        "known_issue_matches": [
+            {"name": "GPU Allocation Shows Zero On Dashboard", "confidence": "medium"},
+        ],
+    })
+
+    assert card["failure_mode_matches"] == [
+        {"name": "OOMKilled", "confidence": "high", "match_type": "exact_symptom_only"}
+    ]
+    assert card["known_issue_matches"] == [
+        {"name": "GPU Allocation Shows Zero On Dashboard", "confidence": "medium"}
+    ]
+
+
+def test_safe_case_card_omits_knowledge_link_match_keys_when_absent() -> None:
+    card = _safe_case_card({"case_origin": "enterprise_support"})
+    assert "failure_mode_matches" not in card
+    assert "known_issue_matches" not in card
+
+
 def test_case_card_projection_keeps_graph_links_and_strips_untrusted_fields() -> None:
     def run(query: str) -> list[dict]:
         if "has case_card $card" in query:
@@ -1221,3 +1292,70 @@ def test_case_card_projection_keeps_graph_links_and_strips_untrusted_fields() ->
     assert card["contradicting_evidence_by_source"] == {"loki": [{"evidence_id": "ANL:E2"}]}
     assert card["successful_actions"][0]["outcome"] == "mitigated"
     assert card["failed_actions"][0]["outcome"] == "ineffective"
+
+
+# --- probe_history (2026-08 audit item #1: trace-v3 written by ingest.py but
+# read by nobody at analysis time). ------------------------------------------
+
+
+def test_aggregate_probe_history_counts_verdicts_per_family_and_template() -> None:
+    rows = [
+        {"tid": "probe-a", "family": "k8s_storage_error", "verdict": "inconclusive"},
+        {"tid": "probe-a", "family": "k8s_storage_error", "verdict": "inconclusive"},
+        {"tid": "probe-a", "family": "k8s_storage_error", "verdict": "supports"},
+        {"tid": "probe-b", "family": "k8s_storage_error", "verdict": "refutes"},
+        # Same template id, different family: kept separate.
+        {"tid": "probe-a", "family": "gpu_hardware_error", "verdict": "supports"},
+    ]
+
+    history = _aggregate_probe_history(rows)
+
+    assert history["k8s_storage_error"]["probe-a"] == {
+        "inconclusive": 2, "supports": 1, "total": 3,
+    }
+    assert history["k8s_storage_error"]["probe-b"] == {"refutes": 1, "total": 1}
+    assert history["gpu_hardware_error"]["probe-a"] == {"supports": 1, "total": 1}
+
+
+def test_aggregate_probe_history_drops_incomplete_rows() -> None:
+    rows = [
+        {"tid": "", "family": "k8s_storage_error", "verdict": "supports"},
+        {"tid": "probe-a", "family": "", "verdict": "supports"},
+        {"tid": "probe-a", "family": "k8s_storage_error", "verdict": ""},
+        {"tid": "probe-a", "family": "k8s_storage_error"},
+    ]
+
+    assert _aggregate_probe_history(rows) == {}
+
+
+def test_query_kg_surfaces_probe_history() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "probe_execution_for" in query:
+                    return [
+                        {"tid": "k8s-storage-01", "family": "k8s_storage_error", "verdict": "inconclusive"},
+                        {"tid": "k8s-storage-01", "family": "k8s_storage_error", "verdict": "inconclusive"},
+                    ]
+                return []
+
+            yield run
+
+    data = _query_kg(FakeClient(), _target(), [])  # type: ignore[arg-type]
+
+    assert data["probe_history"] == {
+        "k8s_storage_error": {"k8s-storage-01": {"inconclusive": 2, "total": 2}}
+    }
+
+
+def test_kg_context_as_dict_includes_probe_history() -> None:
+    ctx = KGContext(
+        enabled=True,
+        available=True,
+        probe_history={"k8s_storage_error": {"probe-a": {"inconclusive": 3, "total": 3}}},
+    )
+
+    assert ctx.as_dict()["probe_history"] == {
+        "k8s_storage_error": {"probe-a": {"inconclusive": 3, "total": 3}}
+    }

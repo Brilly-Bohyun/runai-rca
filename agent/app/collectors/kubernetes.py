@@ -6674,6 +6674,15 @@ _FOLLOWUP_WAITING = {
     "imagepullbackoff",
     "errimagepull",
     "errimageneverpull",
+    # Unlike the other image-pull reasons above, these two never transition out
+    # of "waiting" (a malformed reference or an inspect failure never starts the
+    # container, so it never restarts or terminates either). Omitting them here
+    # left root_cause_ranking._K8S_CONTAINER_REASON_FAMILY's image_pull_error
+    # entries for both unreachable: _target_waiting_fault_reason only returns a
+    # reason in this set, so container_reason was never hoisted and polarity
+    # stayed unknown/partial no matter how long the incident ran.
+    "invalidimagename",
+    "imageinspecterror",
     "createcontainerconfigerror",
     "createcontainererror",
     "runcontainererror",

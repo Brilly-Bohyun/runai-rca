@@ -33,6 +33,24 @@ def test_load_shape_and_families_valid() -> None:
         assert entry["actions"], f"{entry['issue']}: no actions"
 
 
+def test_load_carries_refs_citations() -> None:
+    """refs (source/KB citations, e.g. "NVIDIA Case 01074073") are authored on
+    every entry but were dropped at the loader (2026-08 audit item #2a). An
+    entry may legitimately author an empty list — only the KEY must survive."""
+    catalog = load_runai_known_issues(CATALOG)
+    by_issue = {entry["issue"]: entry for entry in catalog}
+    assert all("refs" in entry for entry in catalog)
+    assert by_issue["Distributed Training Locked hostPath Policy Rejected In UI"]["refs"] == [
+        "NVIDIA Case 01074073"
+    ]
+    assert by_issue["Distributed Training Backoff And Restart Policy Semantics"]["refs"] == [
+        "NVIDIA Case 01064819",
+        "NVIDIA Case 01065900",
+    ]
+    # Authored as `refs: []` in the YAML — an honest empty list, not missing.
+    assert by_issue["Scheduler Reclaim Panic On Large GPU Job"]["refs"] == []
+
+
 def test_match_recognises_signature() -> None:
     catalog = load_runai_known_issues(CATALOG)
     hits = match_runai_known_issues(
@@ -53,6 +71,18 @@ def test_cause_line_grounds_headline_with_version() -> None:
     assert "Locked hostPath Policy" in lines[0]
     assert "fixed in 2.23.60" in lines[0]
     assert _known_issue_cause_lines(catalog, "nothing relevant here", "en") == []
+
+
+def test_cause_line_does_not_yet_render_refs() -> None:
+    """Pin, not endorsement: `refs` now reaches every matched issue dict
+    (test_load_carries_refs_citations above), but pipeline._known_issue_cause_lines
+    (not owned by this pass) does not read it yet — the citation still never
+    reaches the report. If/when that call site is wired, this test's assertion
+    flips and should be updated alongside it, not deleted silently."""
+    catalog = load_runai_known_issues(CATALOG)
+    lines = _known_issue_cause_lines(catalog, "the administrator prohibited modifying item", "en")
+    assert lines
+    assert "01074073" not in lines[0]
 
 
 def test_known_issue_signature_in_drilldown_result_is_observed() -> None:

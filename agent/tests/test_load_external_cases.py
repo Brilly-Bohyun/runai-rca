@@ -162,6 +162,109 @@ def test_family_candidates_default_to_empty_list_without_knowledge_links() -> No
     assert inc.case_card["family_candidates"] == []
 
 
+# --- knowledge_links.failure_mode_matches / known_issue_matches (2026-08 audit
+# item #2d): a prior pass wired family_candidates and explicitly skipped these
+# two because they name free-text catalog entries needing sanitisation. -------
+
+
+def test_knowledge_links_matches_accepts_only_names_in_the_closed_catalog() -> None:
+    valid = frozenset({"NFS Unresponsive / Stale Handle", "CreateContainerError"})
+    p = _payload(knowledge_links={
+        "failure_mode_matches": [
+            {"catalog_entry": "NFS Unresponsive / Stale Handle", "match_type": "exact_mechanism", "confidence": "medium"},
+            {"catalog_entry": "Not In The Catalog", "confidence": "high"},  # unknown name: dropped
+        ]
+    })
+
+    assert lx._knowledge_links_matches(p, "failure_mode_matches", valid) == [
+        {"name": "NFS Unresponsive / Stale Handle", "confidence": "medium", "match_type": "exact_mechanism"}
+    ]
+
+
+def test_knowledge_links_matches_accepts_repository_entry_and_issue_aliases() -> None:
+    valid = frozenset({"Dashboard Analytics GPU Utilization Mismatch", "Scheduler Reclaim Panic On Large GPU Job"})
+    p = _payload(knowledge_links={
+        "known_issue_matches": [
+            {"repository_entry": "Dashboard Analytics GPU Utilization Mismatch", "confidence": "medium"},
+            {"issue": "Scheduler Reclaim Panic On Large GPU Job", "confidence": "high"},
+        ]
+    })
+
+    names = {m["name"] for m in lx._knowledge_links_matches(p, "known_issue_matches", valid)}
+    assert names == {
+        "Dashboard Analytics GPU Utilization Mismatch",
+        "Scheduler Reclaim Panic On Large GPU Job",
+    }
+
+
+def test_knowledge_links_matches_skips_bare_string_entries() -> None:
+    """A curator-prose string ("X — partial match because...") has no separable
+    name field safe to validate without parsing free text — skip, don't guess."""
+    valid = frozenset({"GPU Allocation Shows Zero On Dashboard"})
+    p = _payload(knowledge_links={
+        "known_issue_matches": [
+            "GPU Allocation Shows Zero On Dashboard; partial because the follow-up chain is unconfirmed",
+        ]
+    })
+
+    assert lx._knowledge_links_matches(p, "known_issue_matches", valid) == []
+
+
+def test_knowledge_links_matches_drops_no_match_sentinel_entries() -> None:
+    """A dict that asserts NO existing catalog entry (status: none, only a
+    proposed candidate_name) must never be treated as a match — it carries
+    neither catalog_entry/repository_entry/issue, so the generic name lookup
+    already excludes it; this pins that exact real-world shape."""
+    valid = frozenset({"Storage Policy All-Blocked Selector Fallback In v2.23.x"})
+    p = _payload(knowledge_links={
+        "known_issue_matches": [
+            {
+                "status": "none",
+                "candidate_classification": "platform_version_bug",
+                "candidate_name": "Storage Policy All-Blocked Selector Fallback In v2.23.x",
+                "confidence": "high",
+            }
+        ]
+    })
+
+    assert lx._knowledge_links_matches(p, "known_issue_matches", valid) == []
+
+
+def test_closed_symptom_and_known_issue_names_load_the_real_catalogs() -> None:
+    lx._closed_symptom_names.cache_clear()
+    lx._closed_known_issue_names.cache_clear()
+    assert "OOMKilled" in lx._closed_symptom_names()
+    assert "GPU Allocation Shows Zero On Dashboard" in lx._closed_known_issue_names()
+
+
+def test_knowledge_links_matches_reach_the_case_card(monkeypatch: Any) -> None:
+    monkeypatch.setattr(lx, "_closed_symptom_names", lambda: frozenset({"OOMKilled"}))
+    monkeypatch.setattr(
+        lx, "_closed_known_issue_names", lambda: frozenset({"GPU Allocation Shows Zero On Dashboard"})
+    )
+    p = _payload(knowledge_links={
+        "failure_mode_matches": [{"catalog_entry": "OOMKilled", "confidence": "high"}],
+        "known_issue_matches": [
+            {"repository_entry": "GPU Allocation Shows Zero On Dashboard", "confidence": "medium"}
+        ],
+    })
+
+    inc = lx._to_incident(p, "op", "t")
+
+    assert inc.case_card["failure_mode_matches"] == [
+        {"name": "OOMKilled", "confidence": "high"}
+    ]
+    assert inc.case_card["known_issue_matches"] == [
+        {"name": "GPU Allocation Shows Zero On Dashboard", "confidence": "medium"}
+    ]
+
+
+def test_knowledge_links_matches_default_to_empty_list_without_knowledge_links() -> None:
+    inc = lx._to_incident(_payload(), "op", "t")
+    assert inc.case_card["failure_mode_matches"] == []
+    assert inc.case_card["known_issue_matches"] == []
+
+
 def test_unconfirmed_mechanism_is_prefixed_and_fingerprinted() -> None:
     p = _payload()
     p["incident"] = {**p["incident"], "confirmed_mechanism": None}
@@ -418,3 +521,41 @@ def test_symptom_keywords_include_canonical_component_tokens() -> None:
     keywords = lx._symptom_keywords(p)
     assert "runai-backend-thanos-receive" in keywords
     assert "oomkilled" not in keywords
+
+
+def test_symptom_keywords_include_trigger_metric_and_issue_reference_tokens() -> None:
+    """2026-08 audit item #2c: a case whose only distinguishing signal is a
+    metric expression, a curator-named trigger condition, or an external
+    bug-tracker id was unretrievable — these three searchable_context lists
+    were authored on every payload but never reached the keyword set."""
+    p = _payload()
+    p["searchable_context"] = {
+        "error_signatures": [],
+        "trigger_tokens": ["random sub-minute metric outlier", "GPU"],  # bare word dropped
+        "metric_signatures": ["DCGM_FI_DEV_GPU_UTIL > 100"],
+        "issue_references": ["NVIDIA/dcgm-exporter#418", "RUN-36505"],
+        "retrieval_keywords": ["never used"],
+    }
+    keywords = lx._symptom_keywords(p)
+    assert "random sub-minute metric outlier" in keywords
+    assert "dcgm_fi_dev_gpu_util > 100" in keywords
+    assert "nvidia/dcgm-exporter#418" in keywords
+    assert "run-36505" in keywords
+    assert "gpu" not in keywords  # bare generic single word still filtered
+    assert "never used" not in keywords
+
+
+def test_symptom_keywords_still_excludes_prose_only_fields() -> None:
+    """retrieval_keywords / normalized_symptoms / version_tokens remain
+    deliberate exclusions (owner: entry points are the error string and
+    canonical identifiers, never prose) — pinned so a future pass does not
+    "fix" this the way trigger_tokens/metric_signatures/issue_references
+    just were."""
+    p = _payload()
+    p["searchable_context"] = {
+        "error_signatures": [],
+        "retrieval_keywords": ["fractional GPU metrics missing"],
+        "normalized_symptoms": ["0.5-GPU workload runs but metrics are absent"],
+        "version_tokens": ["runai:2.24.58"],
+    }
+    assert lx._symptom_keywords(p) == []

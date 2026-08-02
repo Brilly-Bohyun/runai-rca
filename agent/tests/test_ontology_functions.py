@@ -15,6 +15,7 @@ def test_functions_tql_defines_the_expected_functions() -> None:
     for name in (
         "fixes_for_xid",
         "trigger_for_xid",
+        "linkage_note_for_xid",
         "detail_for_xid",
         "xids_for_gpu_model",
         "root_xids_for",
