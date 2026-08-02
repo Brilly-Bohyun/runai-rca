@@ -4996,6 +4996,29 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
         for observed, root_list in sorted(roots.items())
         if root_status.get(observed) == "complete-but-unordered"
     ]
+    # xid_catalog.yaml's linkage_note documents the driver/CUDA version an
+    # escalating XID's leads_to edge was actually CONFIRMED under. This line can
+    # carry up to 21 codes across unrelated chains, so a parenthetical per code
+    # does not scale here (see _xid_diagnostic_guidance_lines / _numbered_actions
+    # for the per-code identity clause); add at most one short clause per
+    # resolved chain, keyed to that chain's causal root (root_list[0] -- the
+    # topological origin _root_chain_for already resolved).
+    root_notes = list(
+        dict.fromkeys(
+            note
+            for observed, root_list in sorted(roots.items())
+            if root_status.get(observed, "ordered") == "ordered"
+            and root_list
+            and (note := graph_fixes.xid_linkage_notes.get(root_list[0]))
+        )
+    )
+    if language == "ko":
+        # Same rule as the mnemonic/description/fix text elsewhere in this file:
+        # the catalog carries no Korean linkage_note, so do not leak raw English
+        # into a ko report.
+        root_notes = [note for note in root_notes if re.search(r"[가-힣]", note)]
+    note_suffix = f" Escalation confirmed on: {'; '.join(root_notes)}." if root_notes else ""
+    note_suffix_ko = f" 승격 확인 환경: {'; '.join(root_notes)}." if root_notes else ""
     statuses = set(root_status.values())
     if "degraded" in statuses:
         qualification = (
@@ -5017,7 +5040,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
                 return (
                     f"- 관련 GPU 오류(XID): {rendered_codes} — "
                     f"인과 사슬(뿌리→관측): {'; '.join(ordered_chains)}; {details}. "
-                    "근본 원인을 먼저 조치하세요."
+                    "근본 원인을 먼저 조치하세요." + note_suffix_ko
                 )
             return (
                 f"- 관련 GPU 오류(XID): {rendered_codes} — "
@@ -5027,6 +5050,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
                     if not qualification_ko
                     else qualification_ko.strip()
                 )
+                + note_suffix_ko
             )
         if unordered:
             details = "; ".join(
@@ -5050,12 +5074,13 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
             return (
                 f"- Related GPU errors (XID): {rendered_codes} — causal chain "
                 f"(root → observed): {'; '.join(ordered_chains)}; {details}. "
-                "Fix the origin first."
+                "Fix the origin first." + note_suffix
             )
         return (
             f"- Related GPU errors (XID): {rendered_codes} — causal chain (root → observed): "
             f"{'; '.join(ordered_chains)}."
             + (" Fix the root XID first." if not qualification else qualification)
+            + note_suffix
         )
     if unordered:
         details = "; ".join(
@@ -5859,6 +5884,12 @@ def _known_issue_cause_lines(
         line = f"- {label}: **{name}**{ver}"
         if reason:
             line += f" — {reason}"
+        # Source/KB citations (e.g. "NVIDIA Case 01074073") -- identifiers, not
+        # prose, so (like the affected/fixed version above) they render in both
+        # languages rather than going through the no-Korean-text ko suppression
+        # used for catalog mnemonics/descriptions elsewhere in this file.
+        if refs := [str(r) for r in (issue.get("refs") or []) if str(r).strip()]:
+            line += f" ({', '.join(refs)})"
         out.append(line)
     return out
 

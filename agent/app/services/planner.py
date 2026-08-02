@@ -341,6 +341,15 @@ def _diagnostic_directive(
                 break
         if len(probes) == 8:
             break
+    # Prior trace-v3 verdicts for this family's probe templates (kg_enrichment's
+    # KGContext.probe_history), so a probe that has repeatedly come back
+    # inconclusive is visibly less attractive than an untried one. Compact
+    # aggregate counts only -- never raw execution rows -- to stay small in a
+    # token-bounded prompt.
+    history_by_template = (kg_context.get("probe_history") or {}).get(family, {})
+    for probe in probes:
+        if hist := history_by_template.get(str(probe.get("template_id") or "")):
+            probe["prior_verdict_summary"] = hist
     return {
         "source": source,
         "path": list(walked.get("path") or []),

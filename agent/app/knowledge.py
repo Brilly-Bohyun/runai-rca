@@ -1461,8 +1461,6 @@ def _validated_package(index: int, package: Any) -> _ValidatedPackage:
 
 @lru_cache(maxsize=1)
 def _closed_family_set() -> frozenset[str]:
-    import os
-
     return frozenset(
         load_family_catalog(os.getenv("FAMILIES_FILE", "knowledge/families.yaml")).families
     )

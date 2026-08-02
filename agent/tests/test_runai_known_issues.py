@@ -73,16 +73,17 @@ def test_cause_line_grounds_headline_with_version() -> None:
     assert _known_issue_cause_lines(catalog, "nothing relevant here", "en") == []
 
 
-def test_cause_line_does_not_yet_render_refs() -> None:
-    """Pin, not endorsement: `refs` now reaches every matched issue dict
-    (test_load_carries_refs_citations above), but pipeline._known_issue_cause_lines
-    (not owned by this pass) does not read it yet — the citation still never
-    reaches the report. If/when that call site is wired, this test's assertion
-    flips and should be updated alongside it, not deleted silently."""
+def test_cause_line_renders_the_issue_citation() -> None:
+    """The other half of the chain the pin above used to describe.
+
+    `refs` reaches every matched issue dict, and the report renders it, so an
+    operator told "this is a known issue" can also see WHICH one. Citation IDs
+    are rendered in both languages -- they are identifiers, not prose, like the
+    affected/fixed version parenthetical beside them."""
     catalog = load_runai_known_issues(CATALOG)
     lines = _known_issue_cause_lines(catalog, "the administrator prohibited modifying item", "en")
     assert lines
-    assert "01074073" not in lines[0]
+    assert "01074073" in lines[0]
 
 
 def test_known_issue_signature_in_drilldown_result_is_observed() -> None:
