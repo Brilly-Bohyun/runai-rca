@@ -69,3 +69,73 @@ def test_root_xid_fix_is_ordered_first() -> None:
     assert "xid-action-secret-12345" not in joined
     assert "\n## injected" not in joined
     assert "[MASKED]" in joined
+
+
+def test_numbered_actions_xid_fix_names_the_fault() -> None:
+    # XID 79 is a real knowledge/xid_catalog.yaml entry ("GPU has fallen off
+    # the bus", fatal). The bare "(XID 79)" prefix forces an operator to look
+    # the code up elsewhere; the identity clause names the fault inline.
+    gr = GraphRemediation(xid_fixes={79: ["Reseat or replace the GPU."]})
+    request = AlertAnalysisRequest(
+        alert=Alert(status="firing", labels={"alertname": "X"}, annotations={}, fingerprint="fp")
+    )
+    actions = _numbered_actions(
+        None,
+        gr,
+        [RankedCause(family="gpu_hardware_error", confidence="low", score=1.0)],
+        "",
+        {},
+        [],
+        request,
+    )
+    joined = "\n".join(actions)
+    assert "XID 79 — GPU has fallen off the bus (fatal)" in joined
+    assert "Reseat or replace the GPU." in joined
+
+
+def test_numbered_actions_xid_fix_unknown_code_stays_bare() -> None:
+    # A code neither the graph nor the local catalog has a name for must never
+    # grow a fabricated or dangling " — " clause.
+    gr = GraphRemediation(xid_fixes={999: ["Escalate to NVIDIA support."]})
+    request = AlertAnalysisRequest(
+        alert=Alert(status="firing", labels={"alertname": "X"}, annotations={}, fingerprint="fp")
+    )
+    actions = _numbered_actions(
+        None,
+        gr,
+        [RankedCause(family="gpu_hardware_error", confidence="low", score=1.0)],
+        "",
+        {},
+        [],
+        request,
+    )
+    xid_lines = [a for a in actions if "999" in a]
+    assert len(xid_lines) == 1
+    assert xid_lines[0].endswith("(XID 999) Escalate to NVIDIA support.")
+    assert "—" not in xid_lines[0]
+
+
+def test_numbered_actions_xid_fix_ko_does_not_leak_english_identity() -> None:
+    # knowledge/xid_catalog.yaml carries no Korean mnemonic/description for any
+    # code (verified directly against the file): the ko-leak guard must keep
+    # the deterministic Korean report free of an English identity clause,
+    # exactly like the sibling _xid_diagnostic_guidance_lines site does.
+    gr = GraphRemediation(xid_fixes={79: ["GPU를 재장착하거나 교체하세요."]})
+    request = AlertAnalysisRequest(
+        alert=Alert(status="firing", labels={"alertname": "X"}, annotations={}, fingerprint="fp")
+    )
+    actions = _numbered_actions(
+        None,
+        gr,
+        [RankedCause(family="gpu_hardware_error", confidence="low", score=1.0)],
+        "",
+        {},
+        [],
+        request,
+        language="ko",
+    )
+    xid_lines = [a for a in actions if "79" in a]
+    assert len(xid_lines) == 1
+    assert xid_lines[0].endswith("(XID 79) GPU를 재장착하거나 교체하세요.")
+    assert "GPU has fallen off the bus" not in xid_lines[0]
+    assert "—" not in xid_lines[0]

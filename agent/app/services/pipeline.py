@@ -6053,14 +6053,22 @@ def _numbered_actions(
             if graph_fixes.root_xid_status.get(observed, "ordered") == "ordered"
             for root in roots
         }
+        masker = build_masker(())
         # Fix the ROOT of the causal chain before its downstream symptoms.
         for code in sorted(graph_fixes.xid_fixes, key=lambda c: (c not in root_codes, c)):
             if language == "ko":
                 label = "근본 XID" if code in root_codes else "XID"
             else:
                 label = "root XID" if code in root_codes else "XID"
+            identity = _xid_identity_clause(graph_fixes, code, masker)
+            # Same rule as the fix-text filter below: the catalog carries no
+            # Korean mnemonic/description, so do not leak raw English into a
+            # ko report.
+            if identity and language == "ko" and not re.search(r"[가-힣]", identity):
+                identity = ""
+            header = f"{label} {code} — {identity}" if identity else f"{label} {code}"
             fixes = [
-                f"({label} {code}) {fix}"
+                f"({header}) {fix}"
                 for fix in graph_fixes.xid_fixes[code]
                 # TypeDB's graph-remediation statements currently have no
                 # locale field. Do not leak raw English into a deterministic
