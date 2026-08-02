@@ -223,9 +223,12 @@ def test_query_remediation_projects_xid_trigger_and_renders_guidance() -> None:
 
     assert out.xid_triggers == {79: "Check for PCIe link errors before reset."}
     assert out.as_dict()["xid_triggers"] == {"79": "Check for PCIe link errors before reset."}
-    assert "Diagnostic guidance (XID 79): Check for PCIe link errors before reset." in "\n".join(
-        _graph_remediation_lines(out)
-    )
+    rendered = "\n".join(_graph_remediation_lines(out))
+    assert "Diagnostic guidance (XID 79" in rendered
+    assert "Check for PCIe link errors before reset." in rendered
+    # This FakeClient never returns a detail_for_xid() row, but XID 79 is a
+    # real catalog entry: the local xid_catalog.yaml fallback still names it.
+    assert "GPU has fallen off the bus" in rendered
     # English-only graph prose is not leaked into a Korean deterministic report.
     assert _xid_diagnostic_guidance_lines(out, "ko") == []
 

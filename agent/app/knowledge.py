@@ -704,6 +704,44 @@ def load_architecture(path: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+def load_xid_catalog(path: str) -> dict[int, dict[str, Any]]:
+    """Parse xid_catalog.yaml into {xid_code: entry}.
+
+    Each entry: {code, mnemonic, description, severity, trigger, gpu_models[]}
+    -- an NVIDIA XID's own catalog identity, not just its fix. ontology/load_xids.py
+    loads the same file into TypeDB (the runtime source of truth); this is the
+    fallback for when the graph is unavailable, so the catalog stays reachable
+    without it, the same way known issues/architecture/alerts already do.
+    """
+    if not path:
+        return {}
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for entry in raw.get("xids") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            code = int(entry.get("code"))
+        except (TypeError, ValueError):
+            continue
+        out[code] = {
+            "code": code,
+            "mnemonic": str(entry.get("mnemonic") or ""),
+            "description": str(entry.get("description") or ""),
+            "severity": str(entry.get("severity") or ""),
+            "trigger": str(entry.get("trigger") or ""),
+            "gpu_models": [
+                str(m).strip() for m in (entry.get("gpu_models") or []) if str(m).strip()
+            ],
+        }
+    return out
+
+
 def component_for_target(
     components: dict[str, dict[str, Any]], *names: str
 ) -> dict[str, Any] | None:

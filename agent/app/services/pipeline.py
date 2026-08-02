@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 import textwrap
 import time
@@ -42,6 +43,7 @@ from app.knowledge import (
     load_family_catalog,
     load_runai_known_issues,
     load_troubleshooting_cases,
+    load_xid_catalog,
     localized_failure_mode_actions,
     localized_failure_mode_name,
     match_failure_mode_symptoms,
@@ -5069,6 +5071,39 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
     )
 
 
+def _xid_identity_clause(
+    graph_fixes: GraphRemediation | None, code: int, masker: Masker | None = None
+) -> str:
+    """"name (severity)" naming what an XID itself IS -- e.g. "GPU has fallen
+    off the bus (fatal)" -- not just its fix. Prefers the graph's own catalog
+    projection (kg_enrichment._fill_xid_detail); falls back to the local
+    knowledge/xid_catalog.yaml when the graph has no detail for this code (a
+    full TypeDB outage, or a partial/stale ingest), so that outage degrades
+    the wording rather than deleting it. Empty when neither source has a
+    mnemonic/description for this code -- never invented.
+    """
+    name = ""
+    severity = ""
+    if graph_fixes is not None:
+        name = str(
+            (graph_fixes.xid_descriptions or {}).get(code)
+            or (graph_fixes.xid_mnemonics or {}).get(code)
+            or ""
+        ).strip()
+        severity = str((graph_fixes.xid_severities or {}).get(code) or "").strip()
+    if not name:
+        entry = load_xid_catalog(os.getenv("XID_CATALOG_FILE", "knowledge/xid_catalog.yaml")).get(
+            code
+        )
+        if entry:
+            name = str(entry.get("description") or entry.get("mnemonic") or "").strip()
+            severity = severity or str(entry.get("severity") or "").strip()
+    if not name:
+        return ""
+    name = _safe_line(name, limit=80, masker=masker)
+    return f"{name} ({severity})" if severity else name
+
+
 def _xid_diagnostic_guidance_lines(
     graph_fixes: GraphRemediation | None, language: str
 ) -> list[str]:
@@ -5076,11 +5111,18 @@ def _xid_diagnostic_guidance_lines(
         return []
     masker = build_masker(())
     label = "진단 안내" if language == "ko" else "Diagnostic guidance"
-    return [
-        f"- {label} (XID {code}): {_safe_line(trigger, limit=360, masker=masker)}"
-        for code, trigger in sorted(graph_fixes.xid_triggers.items())
-        if language != "ko" or re.search(r"[가-힣]", str(trigger))
-    ]
+    lines: list[str] = []
+    for code, trigger in sorted(graph_fixes.xid_triggers.items()):
+        if language == "ko" and not re.search(r"[가-힣]", str(trigger)):
+            continue
+        identity = _xid_identity_clause(graph_fixes, code, masker)
+        # Same rule as the trigger text above: the catalog carries no Korean
+        # mnemonic/description, so do not leak raw English into a ko report.
+        if identity and language == "ko" and not re.search(r"[가-힣]", identity):
+            identity = ""
+        header = f"XID {code} — {identity}" if identity else f"XID {code}"
+        lines.append(f"- {label} ({header}): {_safe_line(trigger, limit=360, masker=masker)}")
+    return lines
 
 
 def _specific_keyword(kw: str) -> bool:
@@ -8544,13 +8586,18 @@ def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
     # remedies must arrive through a symptom->action relation; this renderer is
     # reserved for signature-specific graph facts such as XID codes.
     for code, fixes in graph_fixes.xid_fixes.items():
-        lines.append(f"  - NVIDIA Xid {code}:")
+        identity = _xid_identity_clause(graph_fixes, code, masker)
+        suffix = f" — {identity}" if identity else ""
+        lines.append(f"  - NVIDIA Xid {code}{suffix}:")
         lines.extend(
             f"    - {_safe_line(statement, limit=360, masker=masker)}" for statement in fixes[:5]
         )
     for code, trigger in graph_fixes.xid_triggers.items():
+        identity = _xid_identity_clause(graph_fixes, code, masker)
+        suffix = f" — {identity}" if identity else ""
         lines.append(
-            f"  - Diagnostic guidance (XID {code}): {_safe_line(trigger, limit=360, masker=masker)}"
+            f"  - Diagnostic guidance (XID {code}{suffix}): "
+            f"{_safe_line(trigger, limit=360, masker=masker)}"
         )
     for model, xids in graph_fixes.model_xids.items():
         rendered = ", ".join(str(x) for x in xids)
