@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -501,6 +502,7 @@ def _query_remediation(
     gpu_model: str,
 ) -> GraphRemediation:
     out = GraphRemediation()
+    observed_codes = {int(c) for c in xid_codes}
     with client.open_reader() as run:
         for raw_code in dict.fromkeys(xid_codes):  # de-dupe, preserve order
             code = int(raw_code)
@@ -532,12 +534,80 @@ def _query_remediation(
                         if triggers:
                             out.xid_triggers[root] = triggers[0]
                     _fill_xid_detail(run, out, root)
-        if gpu_model:
-            rows = run(_FN_XIDS_FOR_GPU_MODEL.format(model=escape_typeql(gpu_model)))
+        for candidate in _gpu_model_candidates(gpu_model):
+            rows = run(_FN_XIDS_FOR_GPU_MODEL.format(model=escape_typeql(candidate)))
             xids = sorted({int(v) for v in _values(rows) if _is_int(v)})
             if xids:
-                out.model_xids[gpu_model] = xids
+                out.model_xids[candidate] = xids
+                # Only gate when the model is known AND its catalog is non-empty.
+                # An unrecognised model or a failed/empty lookup must leave every
+                # XID in place rather than silently dropping knowledge.
+                _gate_root_xids_to_model(out, candidate, set(xids), observed_codes)
+                break
     return out
+
+
+# A100/H100/B100 and the GB-prefixed superchips, as the XID catalog names them.
+_GPU_MODEL_TOKEN = re.compile(r"\b(?:GB\d{2,4}|[A-Z]\d{3,4})\b")
+
+
+def _gpu_model_candidates(gpu_model: str) -> list[str]:
+    """The reported GPU string, then the catalog-shaped model tokens inside it.
+
+    ``xids_for_gpu_model`` matches the catalog name exactly (A100, H100, GB200),
+    but a node reports the GPU Feature Discovery product label — for example
+    ``NVIDIA-H100-80GB-HBM3``. Trying the raw value first keeps an
+    already-canonical name working; the tokens are what make the per-model gate
+    reachable from a real cluster at all, instead of a guard that never fires.
+    A string with no recognisable token contributes no extra candidate, so an
+    unknown model leaves the gate off rather than guessing at one.
+    """
+    value = str(gpu_model or "").strip()
+    if not value:
+        return []
+    candidates = [value]
+    for token in _GPU_MODEL_TOKEN.findall(value.upper()):
+        if token not in candidates:
+            candidates.append(token)
+    return candidates
+
+
+def _gate_root_xids_to_model(
+    out: GraphRemediation, gpu_model: str, valid: set[int], observed: set[int]
+) -> None:
+    """Drop upstream/ancestor XIDs the detected GPU model cannot raise.
+
+    Only ``root_xids`` VALUES (ancestor codes) are gated. An observed XID —
+    a ``root_xids`` dict key, or any code the incident itself reported — is
+    never dropped, even if it is absent from the model's catalog: that is a
+    data/detection mismatch, not a reason to delete the operator's own
+    finding, so it is left in place and flagged in ``out.warnings`` instead.
+    """
+    mismatched = sorted(code for code in observed if code not in valid)
+    if mismatched:
+        out.warnings.append(
+            f"Observed XID(s) not listed for detected GPU model {gpu_model}: "
+            f"{', '.join(str(c) for c in mismatched)}. Kept as reported."
+        )
+
+    ancestors = {root for roots in out.root_xids.values() for root in roots}
+    invalid = {code for code in ancestors if code not in valid and code not in observed}
+    if not invalid:
+        return
+    for code in list(out.root_xids):
+        kept = [root for root in out.root_xids[code] if root not in invalid]
+        if kept:
+            out.root_xids[code] = kept
+        else:
+            del out.root_xids[code]
+            out.root_xid_status.pop(code, None)
+    for code in invalid:
+        out.xid_fixes.pop(code, None)
+        out.xid_triggers.pop(code, None)
+    out.warnings.append(
+        f"Dropped upstream XID(s) not valid for detected GPU model {gpu_model}: "
+        f"{', '.join(str(c) for c in sorted(invalid))}."
+    )
 
 
 def _fill_xid_detail(run: Any, out: GraphRemediation, code: int) -> None:

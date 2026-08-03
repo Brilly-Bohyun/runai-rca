@@ -204,6 +204,72 @@ def test_podscheduled_unschedulable_confirms_scheduling_family_with_evidence():
     assert ledger[0]["evidence_for"] == [evidence_id]
 
 
+def test_runai_scheduled_unschedulable_is_not_a_kube_scheduler_fault() -> None:
+    """Same reason string, different subsystem.
+
+    A Pod carrying ``schedulerName: runai-scheduler`` was judged by Run:ai, not
+    kube-scheduler, so "Unschedulable" is a quota/gang/fraction verdict — not the
+    taint/affinity/topology predicate failure k8s_scheduling_error describes.
+    """
+    from app.services.harness import assign_evidence_ids
+    from app.services.pipeline import _dispositive_typed_state
+    from app.services.root_cause_ranking import scheduling_reason_family
+
+    target = replace(
+        make_target(), namespace="runai-test1", pod="frac-test2-0-0", pod_uid="frac-uid"
+    )
+    pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": target.pod,
+            "namespace": target.namespace,
+            "uid": target.pod_uid,
+        },
+        "spec": {
+            "containers": [{"name": "main", "image": "cuda"}],
+            "schedulerName": "runai-scheduler",
+        },
+        "status": {
+            "phase": "Pending",
+            "conditions": [
+                {
+                    "type": "PodScheduled",
+                    "status": "False",
+                    "reason": "Unschedulable",
+                    "message": "0/2 nodes are available",
+                }
+            ],
+        },
+    }
+    scheduling = _pod_scheduling_artifact("kubernetes", make_settings(), target, pod)
+    assert scheduling is not None
+
+    # The owning scheduler travels INSIDE the observation, where the family
+    # typing reads it — not only in the result body beside it.
+    assert scheduling.result["observation"]["scheduler"] == "runai-scheduler"
+
+    # The support gate and the dispositive signature must agree on one family.
+    assert artifact_supports_family("runai_scheduling_quota", scheduling)
+    assert not artifact_supports_family("k8s_scheduling_error", scheduling)
+
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="Unschedulable", artifacts=[scheduling]
+    )
+    assign_evidence_ids([result])
+    family, rationale, _ids = _dispositive_typed_state(
+        [result], {str(scheduling.evidence_id)}
+    )
+    assert family == "runai_scheduling_quota"
+    assert "Unschedulable" in rationale
+
+    # kube-scheduler (and an unnamed scheduler) keep the Kubernetes family.
+    assert scheduling_reason_family("Unschedulable", "default-scheduler") == (
+        "k8s_scheduling_error"
+    )
+    assert scheduling_reason_family("Unschedulable") == "k8s_scheduling_error"
+
+
 @pytest.mark.asyncio
 async def test_final_collector_gather_attaches_typed_support(monkeypatch):
     async def no_llm(*_args, **_kwargs):

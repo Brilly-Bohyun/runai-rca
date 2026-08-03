@@ -842,6 +842,8 @@ def _gpu_snapshot(free: int, *, scoped: bool) -> object:
             "observation": {
                 "polarity": "present" if scoped else "unknown",
                 "coverage": "scoped" if scoped else "partial",
+                # The collector names the node it verified the response against.
+                "observed_entity": {"kind": "node", "name": "dgx-01"},
             },
             "node": "dgx-01",
             "gpu_capacity": 8,
@@ -864,6 +866,65 @@ def test_gpu_exhaustion_reports_requested_against_available() -> None:
 
     # Free GPUs are never promoted, so they can never substantiate a shortage.
     assert _configuration(_gpu_snapshot(2, scoped=False)) == []
+
+
+def test_node_gpu_ledger_prints_beside_a_pending_pod_even_with_gpus_free() -> None:
+    """"I only asked for 6.4, why did nothing start?" is answered by what the node
+    has left — and that is exactly the NOT-exhausted case the eligible walk drops."""
+    scheduling = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_scheduling",
+        status="ok",
+        confidence="high",
+        summary="scheduling",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "target_identity_verified": True,
+            },
+            "resources": {"main": {"requests": {"nvidia.com/gpu": "2"}}},
+            "condition": {"reason": "Unschedulable", "message": "0/2 nodes are available"},
+        },
+    )
+    both = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="k8s",
+        artifacts=[scheduling, _gpu_snapshot(2, scoped=False)],
+    )
+    assign_evidence_ids([both])
+    ids = {str(item.evidence_id) for item in both.artifacts}
+    line = "\n".join(pipeline._observed_configuration_lines([both], ids, "en"))
+
+    assert "Node GPUs (dgx-01)" in line
+    assert "free 2/8" in line
+    assert "여유 2/8" in "\n".join(
+        pipeline._observed_configuration_lines([both], ids, "ko")
+    )
+
+
+def test_fractional_request_prints_its_whole_gpu_total() -> None:
+    """0.8 × 8 is not comparable to the quota beside it until it is multiplied."""
+    labels = pipeline._CONFIG_LABELS["en"]
+
+    parts = pipeline._runai_allocation_parts(
+        {"gpu_fraction": "0.8", "gpu_fraction_devices": "8"}, labels
+    )
+    assert "GPU fraction 0.8 × 8 (6.4)" in parts
+    # Binary floating point renders this product as 6.4000000000000005.
+    assert "6.4000" not in " ".join(parts)
+
+    # One device is already its own total; adding "(0.5)" would be noise.
+    assert pipeline._runai_allocation_parts(
+        {"gpu_fraction": "0.5", "gpu_fraction_devices": "1"}, labels
+    ) == ["GPU fraction 0.5"]
+
+    # Never guess at a value Run:ai did not write as a number.
+    assert pipeline._runai_allocation_parts(
+        {"gpu_fraction": "half", "gpu_fraction_devices": "8"}, labels
+    ) == ["GPU fraction half × 8"]
 
 
 def test_configuration_lines_need_eligible_evidence() -> None:

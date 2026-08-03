@@ -64,6 +64,36 @@ _RUNAI_CRD_PHASE_FAMILY: dict[str, str] = {
     "unschedulable": "runai_scheduling_quota",
 }
 
+# Run:ai runs its own scheduler beside kube-scheduler, and PodScheduled=False is
+# written by whichever scheduler owns the Pod. The reason string alone therefore
+# cannot say which subsystem failed: "Unschedulable" from kube-scheduler is a
+# predicate failure (taint/affinity/topology/ResourceQuota), while the identical
+# string from runai-scheduler is Run:ai's own quota/gang/fraction verdict.
+# spec.schedulerName is the only thing that distinguishes them.
+_RUNAI_SCHEDULED_REASON_FAMILY: dict[str, str] = {
+    "unschedulable": "runai_scheduling_quota",
+    "schedulinggated": "runai_scheduling_quota",
+}
+
+
+def is_runai_scheduler(scheduler: object) -> bool:
+    """Whether a spec.schedulerName names Run:ai's scheduler rather than k8s'."""
+    return "runai" in str(scheduler or "").strip().casefold()
+
+
+def scheduling_reason_family(reason: object, scheduler: object = "") -> str:
+    """The family a typed container/scheduling reason claims, per owning scheduler.
+
+    One choke point for both consumers of the typed-reason vocabulary: this
+    module's support gate and the pipeline's dispositive-signature promotion.
+    Routing in only one of them would leave the signature and the ranker
+    disagreeing about the same observation.
+    """
+    key = str(reason or "").strip().casefold()
+    if is_runai_scheduler(scheduler) and key in _RUNAI_SCHEDULED_REASON_FAMILY:
+        return _RUNAI_SCHEDULED_REASON_FAMILY[key]
+    return _K8S_CONTAINER_REASON_FAMILY.get(key, "")
+
 _FLOOR = 2.0          # min top score below which we fall back to insufficient_evidence
 _HIGH = 5.0           # score needed (with >=2 corroborating agents) for high confidence
 _MED = 2.0           # one canonical fact; non-canonical single facts remain low
@@ -1414,7 +1444,7 @@ def _artifact_is_relevant_to_family(family: str, art: object) -> bool:
         or ""
     ).strip().casefold()
     if reason:
-        return _K8S_CONTAINER_REASON_FAMILY.get(reason) == family
+        return scheduling_reason_family(reason, observation.get("scheduler")) == family
 
     crd_phase = str(observation.get("runai_phase") or "").strip().casefold()
     if crd_phase and _RUNAI_CRD_PHASE_FAMILY.get(crd_phase):

@@ -431,7 +431,10 @@ def test_never_raises_with_garbage_candidate():
     assert isinstance(out, dict)
 
 
-def test_llm_unsupported_downgrades_and_marks_refuted():
+def test_llm_unsupported_downgrades_but_does_not_refute_without_contradiction():
+    """An unsupported verdict alone downgrades confidence but must not refute:
+    refuted requires a scoped deterministic contradiction (has_contradiction),
+    never the model's bare opinion alone."""
     settings = make_settings()
     results = [
         CollectorResult(agent="kubernetes", status="ok", summary="DiskPressure=True"),
@@ -451,7 +454,7 @@ def test_llm_unsupported_downgrades_and_marks_refuted():
     finally:
         mod.llm_configured = orig_configured
         mod.complete_json = orig_json
-    assert out["refuted"] is True
+    assert out["refuted"] is False
     assert out["confidence"] == "low"
     assert out["caveat"] == "Competing cause fits better."
 
@@ -492,8 +495,139 @@ def test_llm_cannot_keep_confidence_from_context_only_evidence(monkeypatch):
     out = _run(refute_top_cause(settings, _top(confidence="high"), results))
 
     assert out["confidence"] == "medium"
-    assert out["refuted"] is True
+    # Context-only evidence is missing evidence, not a deterministic contradiction:
+    # confidence still downgrades, but refuted stays False (see has_contradiction).
+    assert out["refuted"] is False
     assert out["next_check"]
+
+
+def test_llm_unrelated_coexisting_observation_does_not_refute_dispositive_signature(
+    monkeypatch,
+):
+    """Regression for the production XID-48 incident: a dispositive alert-signature
+    artifact (has_evidence=True) plus an unrelated pod's OOM elsewhere in a
+    cluster-wide sweep. The LLM linked the OOM as a competing explanation and
+    returned supported=false -- that is prose, not a scoped contradiction, so
+    the candidate must not be refuted (artifact_contradicts_family's rule)."""
+    settings = replace(make_settings(), llm_model_self_check="m")
+
+    async def fake_complete_json(*_a, **_k):
+        return {
+            "supported": False,
+            "confidence": "medium",
+            "caveat": (
+                "An OOMKilled pod was also observed, so memory pressure may be "
+                "the cause rather than a GPU hardware error."
+            ),
+            "next_check": "Confirm XID 48 against the DCGM/nvidia-smi log for this node.",
+        }
+
+    monkeypatch.setattr("app.services.self_check.llm_configured", lambda *_a, **_k: True)
+    monkeypatch.setattr("app.services.self_check.complete_json", fake_complete_json)
+
+    xid_signature = AlertAnalysisArtifact(
+        agent="alert",
+        source="alertmanager",
+        type="alert_signature",
+        status="ok",
+        confidence="high",
+        summary="Alert payload explicitly reported NVIDIA XID 48.",
+        highlights=["NVIDIA XID 48"],
+        result={
+            "matched_signals": ["NVIDIA XID 48"],
+            "xid_codes": [48],
+            "observation": {
+                "predicate": "alert_signature:nvidia_xid",
+                "polarity": "present",
+                "coverage": "scoped",
+            },
+        },
+    )
+    top = RankedCause(
+        family="gpu_hardware_error",
+        confidence="high",
+        score=9.0,
+        rationale=["Alert payload explicitly reported NVIDIA XID 48."],
+        evidence_agents=["alert"],
+    )
+    results = [
+        CollectorResult(
+            agent="alert",
+            status="ok",
+            summary="Alert payload explicitly reported NVIDIA XID 48.",
+            artifacts=[xid_signature],
+        ),
+        # An unrelated pod's OOM from a cluster-wide sweep: real evidence, but
+        # not scoped/relevant to gpu_hardware_error, so it is context only.
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="OOMKilled observed on an unrelated pod during the cluster sweep",
+        ),
+    ]
+
+    out = _run(refute_top_cause(settings, top, results))
+
+    assert out["refuted"] is False
+    assert out["confidence"] == "medium"  # still downgraded by supported=False
+    assert out["caveat"] == (
+        "An OOMKilled pod was also observed, so memory pressure may be "
+        "the cause rather than a GPU hardware error."
+    )
+    assert out["next_check"] == (
+        "Confirm XID 48 against the DCGM/nvidia-smi log for this node."
+    )
+
+
+def test_llm_path_contradiction_still_refutes_even_when_model_says_supported(
+    monkeypatch,
+):
+    """The flip side: a real scoped contradiction must refute even if the model's
+    verdict claims support -- refuted is driven by has_contradiction alone."""
+    settings = replace(make_settings(), llm_model_self_check="m")
+
+    async def fake_complete_json(*_a, **_k):
+        return {"supported": True, "confidence": "high", "caveat": "", "next_check": ""}
+
+    monkeypatch.setattr("app.services.self_check.llm_configured", lambda *_a, **_k: True)
+    monkeypatch.setattr("app.services.self_check.complete_json", fake_complete_json)
+
+    finding = AlertAnalysisArtifact(
+        evidence_id="E-no-pressure",
+        agent="kubernetes",
+        source="kubernetes",
+        type="node_condition",
+        status="ok",
+        summary="DiskPressure=False throughout the incident window",
+        result={
+            "observation": {
+                "predicate": "node_condition:diskpressure",
+                "polarity": "absent",
+                "coverage": "scoped",
+            },
+        },
+    )
+
+    out = _run(
+        refute_top_cause(
+            settings,
+            _top(confidence="high"),
+            [
+                CollectorResult(
+                    agent="kubernetes",
+                    status="ok",
+                    summary="Node pressure condition absent",
+                    artifacts=[finding],
+                )
+            ],
+            evidence_eligibility={
+                "E-no-pressure": EvidenceEligibility(False, True, True)
+            },
+        )
+    )
+
+    assert out["refuted"] is True
+    assert out["confidence"] == "medium"
 
 
 def test_llm_refute_distinguishes_container_oom_from_node_oom(monkeypatch):

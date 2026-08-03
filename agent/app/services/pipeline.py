@@ -11,6 +11,7 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -80,6 +81,7 @@ from app.services.root_cause_ranking import (
     artifact_supports_family,
     merge_open_world_candidates,
     rank_root_cause_candidates,
+    scheduling_reason_family,
 )
 
 _log = logging.getLogger(__name__)
@@ -4808,15 +4810,22 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
     rendered_codes = ", ".join(str(code) for code in codes)
     roots = getattr(graph_fixes, "root_xids", None) or {}
     root_status = getattr(graph_fixes, "root_xid_status", {}) or {}
+    # A flat root list carries no edge structure, so an arrow chain is provable
+    # only for a single ancestor. Two or more roots can be independent faults
+    # that each lead to the observed XID (a fan-in) rather than a sequence —
+    # e.g. XID 144/145/146 are three unrelated NVLink faults that all lead to
+    # XID 48 — so "ordered" with multiple roots still renders as the plain
+    # upstream-fault list below, not an invented chain.
     ordered_chains = [
         " → ".join(f"XID {node}" for node in [*root_list, observed])
         for observed, root_list in sorted(roots.items())
-        if root_status.get(observed, "ordered") == "ordered"
+        if root_status.get(observed, "ordered") == "ordered" and len(root_list) == 1
     ]
     unordered = [
         (observed, root_list)
         for observed, root_list in sorted(roots.items())
         if root_status.get(observed) == "complete-but-unordered"
+        or (root_status.get(observed, "ordered") == "ordered" and len(root_list) > 1)
     ]
     # xid_catalog.yaml's linkage_note documents the driver/CUDA version an
     # escalating XID's leads_to edge was actually CONFIRMED under. This line can
@@ -4855,7 +4864,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
         if ordered_chains:
             if unordered:
                 details = "; ".join(
-                    f"XID {observed}의 상류 장애(완전, 순서 미상): "
+                    f"XID {observed}의 상류 장애(완전): "
                     + ", ".join(str(root) for root in root_list)
                     for observed, root_list in unordered
                 )
@@ -4876,7 +4885,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
             )
         if unordered:
             details = "; ".join(
-                f"XID {observed}의 상류 장애(완전, 순서 미상): "
+                f"XID {observed}의 상류 장애(완전): "
                 + ", ".join(str(root) for root in root_list)
                 for observed, root_list in unordered
             )
@@ -4889,7 +4898,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
     if ordered_chains:
         if unordered:
             details = "; ".join(
-                f"upstream faults of {observed} (complete, order unknown): "
+                f"upstream faults of {observed} (complete): "
                 + ", ".join(str(root) for root in root_list)
                 for observed, root_list in unordered
             )
@@ -4906,7 +4915,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
         )
     if unordered:
         details = "; ".join(
-            f"upstream faults of {observed} (complete, order unknown): "
+            f"upstream faults of {observed} (complete): "
             + ", ".join(str(root) for root in root_list)
             for observed, root_list in unordered
         )
@@ -5363,6 +5372,14 @@ def _dispositive_typed_state(
                 reason = _canonical_scheduling_reason(payload)
                 family = _typed_reason_family(reason) if reason else ""
                 if family:
+                    # The dispositive table decides WHETHER this reason is a
+                    # signature; the owning scheduler decides WHOSE. Same choke
+                    # point as the ranker, or the floor-scored signature and the
+                    # support gate would name different families for one Pod.
+                    scheduled_by = (
+                        observation.get("scheduler") if isinstance(observation, dict) else ""
+                    )
+                    family = scheduling_reason_family(reason, scheduled_by) or family
                     return (
                         family,
                         f"typed container state {reason} on the alert Pod "
@@ -5916,26 +5933,19 @@ def _numbered_actions(
         masker = build_masker(())
         # Fix the ROOT of the causal chain before its downstream symptoms.
         for code in sorted(graph_fixes.xid_fixes, key=lambda c: (c not in root_codes, c)):
-            if language == "ko":
-                label = "근본 XID" if code in root_codes else "XID"
-            else:
-                label = "root XID" if code in root_codes else "XID"
+            # Label, identity and fix text are all built in ENGLISH on purpose,
+            # and _translate_report_lines_ko localizes the finished line.
+            # _translatable_report_lines skips any line that ALREADY contains
+            # Hangul, so pre-localizing the label ("근본 XID") is precisely what
+            # made the catalog's English text untranslatable — and the two
+            # Hangul filters that used to stand here deleted it instead, which
+            # is how a ko report lost WORKFLOW_XID_48 entirely. One English
+            # line survives translation whole; when translation is unavailable
+            # the operator reads English rather than nothing.
+            label = "root XID" if code in root_codes else "XID"
             identity = _xid_identity_clause(graph_fixes, code, masker)
-            # Same rule as the fix-text filter below: the catalog carries no
-            # Korean mnemonic/description, so do not leak raw English into a
-            # ko report.
-            if identity and language == "ko" and not re.search(r"[가-힣]", identity):
-                identity = ""
             header = f"{label} {code} — {identity}" if identity else f"{label} {code}"
-            fixes = [
-                f"({header}) {fix}"
-                for fix in graph_fixes.xid_fixes[code]
-                # TypeDB's graph-remediation statements currently have no
-                # locale field. Do not leak raw English into a deterministic
-                # Korean report; the evidence-matched failure-mode catalog
-                # supplies the localized XID action when one exists.
-                if language != "ko" or re.search(r"[가-힣]", str(fix))
-            ]
+            fixes = [f"({header}) {fix}" for fix in graph_fixes.xid_fixes[code]]
             specific_actions += len(fixes)
             ordered.extend(fixes)
     ordered.extend(
@@ -6912,6 +6922,23 @@ def _flat_resource_pairs(resources: object, keys: tuple[str, ...]) -> list[str]:
     ]
 
 
+def _gpu_fraction_total(fraction: str, devices: str) -> str:
+    """``0.8`` × ``8`` -> ``" (6.4)"``, the whole-GPU equivalent of the request.
+
+    Decimal, not float: ``0.8 * 8`` prints as 6.4000000000000005 in binary
+    floating point, and a resource figure that looks like that reads as a bug.
+    Values come from Run:ai's own annotations, so anything unparseable is
+    skipped rather than guessed at.
+    """
+    if not devices or devices == "1":
+        return ""
+    try:
+        total = Decimal(fraction) * Decimal(devices)
+    except (ArithmeticError, ValueError):
+        return ""
+    return f" ({total.normalize():f})"
+
+
 def _runai_allocation_parts(allocation: object, labels: dict[str, str]) -> list[str]:
     """Run:ai's own accounting: what it asked the scheduler for, what it got.
 
@@ -6936,7 +6963,12 @@ def _runai_allocation_parts(allocation: object, labels: dict[str, str]) -> list[
     if fraction := str(allocation.get("gpu_fraction") or ""):
         devices = str(allocation.get("gpu_fraction_devices") or "")
         suffix = f" × {devices}" if devices and devices != "1" else ""
-        parts.append(f"{labels['runai_fraction']} {fraction}{suffix}")
+        # "0.8 × 8" is not comparable to the project quota printed beside it
+        # until it is multiplied out; print the total the scheduler had to find.
+        parts.append(
+            f"{labels['runai_fraction']} {fraction}{suffix}"
+            + _gpu_fraction_total(fraction, devices)
+        )
     gang = str(allocation.get("podgroup_requested_gpus") or "")
     if gang and gang != requested:
         parts.append(f"{labels['runai_gang']} {gang}")
@@ -7009,6 +7041,18 @@ def _observed_configuration_lines(
             results, "runai_queue_quota", labels, unset
         ):
             lines["runai_queue_quota"] = line
+    # The node's GPU ledger is context, not proof. "A live snapshot showing free
+    # GPUs must never substantiate a shortage" stays enforced where it belongs —
+    # the collector's observation polarity, which the ranker reads — and that is
+    # why the eligible walk above admits this artifact only when the node is
+    # exhausted. But an operator whose 6.4-GPU request did not start asks "what
+    # does the node actually have left?" precisely in the NOT-exhausted case, so
+    # printing it beside the quota ceiling is the same trade the quota line makes.
+    if "kubernetes_node_gpu_resources" not in lines and "kubernetes_pod_scheduling" in lines:
+        if line := _node_verified_configuration_line(
+            results, "kubernetes_node_gpu_resources", labels, unset
+        ):
+            lines["kubernetes_node_gpu_resources"] = line
     if "kubernetes_storage_claim" not in lines and _warning_event_observed(
         results, eligible_evidence_ids, _STORAGE_EVENT_REASONS
     ):
@@ -7067,6 +7111,35 @@ def _identity_verified_configuration_line(
             if not (
                 isinstance(observation, dict)
                 and observation.get("target_identity_verified") is True
+            ):
+                continue
+            if line := _configuration_line(kind, payload, labels, unset):
+                return line
+    return ""
+
+
+def _node_verified_configuration_line(
+    results: list[CollectorResult], kind: str, labels: dict[str, str], unset: str
+) -> str:
+    """The same, for NODE-scoped artifacts, which carry no identity flag.
+
+    A node snapshot proves which node it read by naming it in ``observed_entity``,
+    and the collector sets that only after matching the response to the node it
+    asked for — the node-side equivalent of ``target_identity_verified``.
+    """
+    for result in results:
+        for item in result.artifacts:
+            if getattr(item, "type", "") != kind:
+                continue
+            payload = getattr(item, "result", None)
+            observation = payload.get("observation") if isinstance(payload, dict) else None
+            entity = (
+                observation.get("observed_entity") if isinstance(observation, dict) else None
+            )
+            if not (
+                isinstance(entity, dict)
+                and entity.get("kind") == "node"
+                and entity.get("name")
             ):
                 continue
             if line := _configuration_line(kind, payload, labels, unset):

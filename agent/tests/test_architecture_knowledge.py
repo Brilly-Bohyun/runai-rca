@@ -162,3 +162,49 @@ def test_nvidia_operator_symptoms_resolve_and_match() -> None:
         modes, "nicclusterpolicy is not ready; gpudirect rdma missing"
     )
     assert any(s.get("component") == "network-operator" for _, s in hits)
+
+
+def test_check_order_does_not_invent_dependency_edges() -> None:
+    """A flattened BFS is not a chain.
+
+    `binder` depends on runai-scheduler-default AND runai-container-toolkit;
+    rendering the level order with arrows says the scheduler needs the toolkit.
+    The arrow survives only where every hop really is a direct depends_on.
+    """
+    from app.knowledge import dependency_path, dependency_path_text
+
+    components = {
+        "top": {"depends_on": ["left", "right"]},
+        "left": {"depends_on": []},
+        "right": {"depends_on": []},
+        "a": {"depends_on": ["b"]},
+        "b": {"depends_on": ["c"]},
+        "c": {"depends_on": []},
+    }
+
+    siblings = dependency_path(components, "top")
+    assert siblings == ["top", "left", "right"]
+    assert dependency_path_text(components, siblings) == "top, left, right"
+
+    spine = dependency_path(components, "a")
+    assert spine == ["a", "b", "c"]
+    assert dependency_path_text(components, spine) == "a → b → c"
+
+
+def test_real_architecture_check_orders_never_claim_a_false_spine() -> None:
+    """Every rendered check order must be honest against the shipped graph."""
+    from app.knowledge import dependency_path, dependency_path_text
+
+    components = load_architecture(ARCHITECTURE)
+    for name in components:
+        path = dependency_path(components, name)
+        if len(path) < 2:
+            continue
+        text = dependency_path_text(components, path)
+        if " → " not in text:
+            continue
+        for index in range(len(path) - 1):
+            deps = (components.get(path[index]) or {}).get("depends_on") or []
+            assert path[index + 1] in deps, (
+                f"{name}: arrow claims {path[index]} depends on {path[index + 1]}"
+            )

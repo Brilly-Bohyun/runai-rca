@@ -1755,6 +1755,7 @@ class KubernetesCollector:
             "warning_events": warning_events,
             "gpu_node_resource_observations": gpu_node_resource_observations,
             "node_conditions": node_conditions,
+            "gpu_model": _node_gpu_product(responses),
             "pod_logs": logs,
             "target_pod_describe": target_pod_describe,
             "workload_resolution": workload_resolution,
@@ -3914,6 +3915,17 @@ def _pod_scheduling_artifact(
                     "namespace": observed_target.namespace,
                 },
                 "scheduling_reason": scheduling_reason,
+                # WHICH scheduler wrote that reason. "Unschedulable" from
+                # kube-scheduler is a predicate failure (taint/affinity/topology);
+                # from runai-scheduler it is Run:ai's own quota/gang/fraction
+                # verdict. Same string, different subsystem — so the family
+                # typing needs it here, inside the observation the ranker reads,
+                # not only in the result body beside it.
+                **(
+                    {"scheduler": str(spec.get("schedulerName"))}
+                    if spec.get("schedulerName")
+                    else {}
+                ),
             },
             "pod": observed_target.pod,
             "namespace": observed_target.namespace,
@@ -5579,11 +5591,15 @@ def _events_in_time_range(
     return filtered
 
 
+_GPU_PRODUCT_LABEL = "nvidia.com/gpu.product"
+
+
 def _node_summary(node: dict[str, object]) -> dict[str, object]:
     metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
     status = node.get("status") if isinstance(node.get("status"), dict) else {}
     spec = node.get("spec") if isinstance(node.get("spec"), dict) else {}
-    return {
+    labels = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
+    summary = {
         "name": metadata.get("name"),
         "conditions": status.get("conditions", []),
         "capacity": status.get("capacity", {}),
@@ -5591,6 +5607,13 @@ def _node_summary(node: dict[str, object]) -> dict[str, object]:
         "unschedulable": bool(spec.get("unschedulable")),
         "taints": spec.get("taints", []),
     }
+    # The GPU model GFD publishes on the node. The XID catalog records which
+    # codes each model can raise, so without this the ontology cannot tell an
+    # A100 operator that an NVLink-5 upstream XID is not reachable on their
+    # hardware. The whole node label set stays out: only this one is consumed.
+    if product := str(labels.get(_GPU_PRODUCT_LABEL) or "").strip():
+        summary["gpu_product"] = product
+    return summary
 
 
 _GPU_RESOURCE = "nvidia.com/gpu"
@@ -6101,6 +6124,17 @@ def _pod_event_scope_empty(responses: list[dict[str, object]]) -> bool:
         and not response["data"]["items"]
         for response in scoped_lists
     )
+
+
+def _node_gpu_product(responses: list[dict[str, object]]) -> str:
+    """The GPU model read off the node, for the XID catalog's per-model gating."""
+    for response in responses:
+        if response.get("name") != "node":
+            continue
+        data = response.get("data")
+        if isinstance(data, dict) and (product := str(data.get("gpu_product") or "").strip()):
+            return product
+    return ""
 
 
 def _node_conditions(responses: list[dict[str, object]]) -> list[object]:
