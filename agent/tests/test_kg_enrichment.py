@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from contextlib import contextmanager
 from dataclasses import replace
 
@@ -69,13 +68,17 @@ def test_root_chain_queries_typeql_recursion() -> None:
     assert out.root_xid_status[154] == "ordered"
     # Fixes fetched for each discovered root too.
     assert 48 in out.xid_fixes and 144 in out.xid_fixes
+    # A flat root list has no edge structure, so the renderer can only prove a
+    # single-hop chain; two-plus ancestors (even a genuine path like this one)
+    # render as the plain complete-upstream-set list instead of an arrow chain
+    # it cannot verify against an unprovable fan-in (see xid 48/144/145/146).
     assert _causal_chain_line(out, "en") == (
-        "- Related GPU errors (XID): 48, 144, 154 — causal chain (root → observed): "
-        "XID 144 → XID 48 → XID 154. Fix the root XID first."
+        "- Related GPU errors (XID): 48, 144, 154 — "
+        "upstream faults of 154 (complete): 144, 48. Fix the origin first."
     )
     assert _causal_chain_line(out, "ko") == (
-        "- 관련 GPU 오류(XID): 48, 144, 154 — 인과 사슬(뿌리→관측): "
-        "XID 144 → XID 48 → XID 154. 뿌리 XID를 먼저 조치하세요."
+        "- 관련 GPU 오류(XID): 48, 144, 154 — "
+        "XID 154의 상류 장애(완전): 144, 48. 근본 원인을 먼저 조치하세요."
     )
 
 
@@ -153,11 +156,14 @@ def test_root_chain_branch_is_deterministic_and_contains_each_ancestor_once() ->
     out = _query_remediation(FakeClient(), "", [100], "")  # type: ignore[arg-type]
     assert out.root_xids[100] == [10, 20, 30]
     assert out.root_xid_status[100] == "ordered"
-    # \b-bounded: a bare substring count would also match "XID 10" inside "XID 100".
+    # Three ancestors can't be proven a single chain from a flat list (see
+    # test_causal_chain_line_fan_in_is_not_a_fabricated_sequence in
+    # test_xid_root_and_timeouts.py), so this renders as the plain upstream
+    # list. The exact joined substring proves each ancestor appears once, in
+    # order, with no duplicates -- "10" can't false-positive inside "100" here
+    # because the match is the full ", "-joined sequence, not a bare number.
     line = _causal_chain_line(out, "en")
-    assert len(re.findall(r"\bXID 10\b", line)) == 1
-    assert len(re.findall(r"\bXID 20\b", line)) == 1
-    assert len(re.findall(r"\bXID 30\b", line)) == 1
+    assert "upstream faults of 100 (complete): 10, 20, 30" in line
 
 
 def test_root_chain_ordering_failure_keeps_the_complete_unordered_set() -> None:
@@ -180,11 +186,11 @@ def test_root_chain_ordering_failure_keeps_the_complete_unordered_set() -> None:
     assert out.root_xid_status[154] == "complete-but-unordered"
     assert _causal_chain_line(out, "en") == (
         "- Related GPU errors (XID): 48, 144, 154 — "
-        "upstream faults of 154 (complete, order unknown): 48, 144. Fix the origin first."
+        "upstream faults of 154 (complete): 48, 144. Fix the origin first."
     )
     assert _causal_chain_line(out, "ko") == (
         "- 관련 GPU 오류(XID): 48, 144, 154 — "
-        "XID 154의 상류 장애(완전, 순서 미상): 48, 144. 근본 원인을 먼저 조치하세요."
+        "XID 154의 상류 장애(완전): 48, 144. 근본 원인을 먼저 조치하세요."
     )
 
 

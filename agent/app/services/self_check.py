@@ -225,7 +225,16 @@ async def refute_top_cause(
         if model_conf in _CONF_ORDER:
             if _CONF_ORDER.index(model_conf) < _CONF_ORDER.index(new_conf):
                 new_conf = model_conf
-        return _default(new_conf, caveat, refuted=not supported, next_check=next_check)
+        # `refuted` must come from the deterministic layer, never the model's bare
+        # opinion: the model can cite a coexisting observation (e.g. an unrelated
+        # pod's OOM next to a dispositive GPU XID alert signature) to argue against
+        # the cause in prose without that observation being a falsifier --
+        # artifact_contradicts_family() in root_cause_ranking.py documents the same
+        # rule for the ranker. `supported=False` still drives the confidence
+        # downgrade above; only a scoped deterministic contradiction may refute.
+        # The ontology-probe "refutes" verdict is a separate, evidence-grounded
+        # refutation channel handled in pipeline.py.
+        return _default(new_conf, caveat, refuted=has_contradiction, next_check=next_check)
     except Exception:  # noqa: BLE001 - self-check is best-effort; never break analyze()
         return _default(getattr(top_candidate, "confidence", "low"))
 
