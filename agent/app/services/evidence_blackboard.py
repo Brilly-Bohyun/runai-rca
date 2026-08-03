@@ -101,6 +101,25 @@ class EvidenceFact:
     # backwards-compatible ranking, while this scope prevents an identically
     # named Pod in another namespace from passing eligibility by name alone.
     entity_scope: tuple[str, ...] = ()
+    # Controlled-vocabulary Kubernetes reason (container/scheduling) the
+    # collector typed for this observation. Consumers that only ever see the
+    # fact — not the original artifact — otherwise fall back to matching the
+    # summary PROSE, which is the substring class this vocabulary exists to
+    # replace. Deliberately NOT part of ``stable_fact_id``: adding a field to
+    # that hash renumbers every response-local evidence ID, and reports cite
+    # those IDs. Two observations that hash identically therefore keep the
+    # first reason seen, which is the same collapse ``add()`` already applies
+    # to every other unhashed detail.
+    typed_reason: str = ""
+    # Compact, machine-readable reason polarity/coverage fell short of
+    # present+scoped -- e.g. "target_scope_unverified", "window_unverified".
+    # Empty when this fact IS present+scoped (nothing to explain) or when no
+    # single cause could be identified. Collectors already diagnose this
+    # themselves (see ``_COLLECTOR_DEMOTION_FLAGS``); this is that diagnosis,
+    # carried through instead of discarded. Deliberately NOT part of
+    # ``stable_fact_id`` for the same reason ``typed_reason`` is not: it is a
+    # derived label, not part of the observation identity.
+    demotion_reason: str = ""
 
     @property
     def evidence_id(self) -> str:
@@ -558,6 +577,16 @@ def normalize_artifact(
         if not _valid_observation_window(observed_window_start, observed_window_end):
             observed_window_start, observed_window_end = "", ""
             invalid_declared_scope = True
+    # A collector-declared window is part of WHAT was observed, so it identifies
+    # the fact.  The caller-supplied one is this incident's causal span, and for
+    # an unresolved alert that span ENDS AT ``now()`` — re-deriving a fact ID a
+    # few minutes later produced a different hash, so the response artifact could
+    # no longer be matched to its own fact (INC-…-000001: 42/121 cards drifted,
+    # 27 ended up citable by nothing).  The start already isolates the incident;
+    # the moving end adds no identity, only drift.
+    identity_window = [observed_window_start, observed_window_end]
+    if candidate is None and not invalid_declared_scope:
+        identity_window = [observed_window_start]
     source = _clean_text(raw.get("source")) or "unknown"
     status = _normalise_token(_clean_text(raw.get("status")))
     summary = _clean_text(raw.get("summary"))
@@ -629,6 +658,10 @@ def normalize_artifact(
     # blackboard seeding; otherwise an unrelated namespace observation can
     # pass the later entity-compatibility gate as target evidence.
     entity_declared, raw_entity = declared_metadata("observed_entity", "entity")
+    # Set only at the exact point the blackboard itself (not the collector)
+    # demotes a fact, so ``_demotion_reason`` never has to reverse-engineer
+    # which branch fired from the post-hoc polarity/coverage alone.
+    entity_demotion_reason = ""
     if entity_declared:
         resolved_entity = _observed_entity(raw_entity)
         resolved_entity_scope = _observed_entity_scope(raw_entity)
@@ -637,6 +670,7 @@ def normalize_artifact(
             # observation as the alert target.
             if resolved_coverage == "scoped":
                 resolved_polarity, resolved_coverage = "unknown", "partial"
+                entity_demotion_reason = "malformed_entity"
     elif (
         require_typed_observation
         and resolved_coverage == "scoped"
@@ -650,6 +684,7 @@ def normalize_artifact(
         resolved_entity = ""
         resolved_entity_scope = ()
         resolved_polarity, resolved_coverage = "unknown", "partial"
+        entity_demotion_reason = "entity_not_named"
     else:
         resolved_entity = entity
         resolved_entity_scope = ()
@@ -679,7 +714,7 @@ def normalize_artifact(
     stable_fields = {
         "artifact_id": artifact_id or _artifact_identity(raw),
         "timestamp": timestamp,
-        "window": [observed_window_start, observed_window_end],
+        "window": identity_window,
         "entity": safe_entity,
         "entity_scope": safe_entity_scope,
         "source": source,
@@ -694,6 +729,14 @@ def normalize_artifact(
         "provenance": safe_provenance,
     }
     fact_id = stable_fact_id(stable_fields)
+    demotion_reason = _demotion_reason(
+        resolved_polarity,
+        resolved_coverage,
+        has_explicit_semantics=has_explicit_semantics,
+        invalid_declared_scope=invalid_declared_scope,
+        entity_demotion_reason=entity_demotion_reason,
+        observation_metadata=observation_metadata,
+    )
     return EvidenceFact(
         fact_id=fact_id,
         artifact_id=str(stable_fields["artifact_id"]),
@@ -716,6 +759,11 @@ def normalize_artifact(
         run_id=resolved_run_id,
         topology=resolved_topology,
         entity_scope=safe_entity_scope,
+        typed_reason=_clean_text(
+            observation_metadata.get("container_reason")
+            or observation_metadata.get("scheduling_reason")
+        ).casefold(),
+        demotion_reason=demotion_reason,
     )
 
 
@@ -755,6 +803,116 @@ def _infer_coverage(status: str, polarity: Polarity) -> Coverage:
     if status == "partial":
         return "partial"
     return "unknown"
+
+
+# Every collector already diagnoses why its own observation cannot be trusted
+# as present+scoped and records ONE of these flags on the ``observation`` dict
+# it builds (app/collectors/*.py). No collector sets every flag -- this is a
+# priority-ordered lookup, most specific/actionable first, that returns the
+# first one that actually fired. Each entry is (key, value that means "this
+# demoted the fact", compact reason token):
+#   target_scope_verified   change.py, prometheus.py, loki.py -- returned data
+#                            not proven to be about the target entity.
+#   source_verified          kubernetes.py pod logs -- the responding Pod was
+#                            not confirmed.
+#   time_scope_verified,
+#   log_window_verified,
+#   sample_window_verified   kubernetes.py / loki.py / prometheus.py -- the
+#                            returned timestamps were not proven inside the
+#                            incident window.
+#   target_identity_ambiguous kubernetes.py Warning events -- multiple UIDs
+#                            observed with no pod_uid to disambiguate.
+#   queries_complete         kubernetes.py Warning events -- a sub-query
+#                            failed or paginated, so an empty result cannot
+#                            be trusted as a real absence.
+#   snapshot_role=="current_context",
+#   current_state_only,
+#   current_state_absent     kubernetes.py / runai.py -- only current cluster
+#                            or Run:ai API state is known, not the historical
+#                            incident state.
+#   historical_scope         system.py journal query -- matched lines exist
+#                            but were not proven to be the bounded historical
+#                            read (a live snapshot, not history).
+#   naive_timestamps_assumed_utc postgres.py -- row timestamps had no
+#                            timezone and had to be assumed UTC; kept last
+#                            because it is a caveat, not a hard rejection (a
+#                            row can still verify with an assumed-UTC time).
+_COLLECTOR_DEMOTION_FLAGS: tuple[tuple[str, object, str], ...] = (
+    ("target_scope_verified", False, "target_scope_unverified"),
+    ("source_verified", False, "source_unverified"),
+    ("time_scope_verified", False, "window_unverified"),
+    ("log_window_verified", False, "window_unverified"),
+    ("sample_window_verified", False, "window_unverified"),
+    ("target_identity_ambiguous", True, "target_identity_ambiguous"),
+    ("queries_complete", False, "queries_incomplete"),
+    ("snapshot_role", "current_context", "current_state_only"),
+    ("current_state_only", True, "current_state_only"),
+    ("current_state_absent", True, "current_state_only"),
+    ("historical_scope", False, "not_historical_scope"),
+    ("naive_timestamps_assumed_utc", True, "naive_timestamp_assumed_utc"),
+)
+
+
+def _collector_demotion_reason(observation_metadata: Mapping[str, Any]) -> str:
+    """First collector-declared verification flag explaining a shortfall."""
+    for key, sentinel, reason in _COLLECTOR_DEMOTION_FLAGS:
+        if observation_metadata.get(key) == sentinel:
+            return reason
+    line_count = observation_metadata.get("line_count")
+    if (
+        isinstance(line_count, int)
+        and line_count > 0
+        and observation_metadata.get("affirmative_line_count") == 0
+    ):
+        # loki.py: the broad LogQL token matcher also returns negated/healthy
+        # lines ("no OOM", "OOMKilled=false"); matched is not affirmed.
+        return "matched_lines_not_affirmative"
+    return ""
+
+
+def _demotion_reason(
+    polarity: Polarity,
+    coverage: Coverage,
+    *,
+    has_explicit_semantics: bool,
+    invalid_declared_scope: bool,
+    entity_demotion_reason: str,
+    observation_metadata: Mapping[str, Any],
+) -> str:
+    """Compact, machine-readable reason polarity/coverage fell short.
+
+    Present+scoped needs no explanation. Everything else was already
+    diagnosed once by the time it reaches here -- either by this module's own
+    normalization gates (no typed observation at all, a malformed declared
+    window, an unnamed/malformed entity) or by the collector itself, which
+    recorded one of the verification flags in ``_COLLECTOR_DEMOTION_FLAGS`` on
+    its own observation before ``normalize_artifact`` discarded the rest of
+    that payload. Bounded and best-effort: an empty string means no specific
+    cause could be identified, which is preferable to guessing one nobody
+    could act on.
+    """
+    if polarity == "present" and coverage == "scoped":
+        return ""
+    if polarity == "unavailable":
+        # A transport failure is always the most specific, actionable thing
+        # to say when true, whether or not the tool also carries a typed
+        # observation contract -- and in every collector reviewed, the
+        # verification flags below are only ever computed for a present/
+        # absent polarity, so this never shadows a more specific one.
+        return "source_unavailable"
+    if not has_explicit_semantics:
+        # No collector adapter opted into a typed observation contract at all
+        # for this artifact (see the producer list in
+        # app.services.drilldown._typed_artifact_result); nothing below
+        # applies because there was never a verification verdict to read.
+        return "untyped_observation"
+    if invalid_declared_scope:
+        return "malformed_scope"
+    if entity_demotion_reason:
+        return entity_demotion_reason
+    if reason := _collector_demotion_reason(observation_metadata):
+        return reason
+    return ""
 
 
 def _completed_empty_result(value: Any, *, parent_key: str = "") -> bool:

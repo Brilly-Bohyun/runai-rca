@@ -138,11 +138,13 @@ select $statement, $outcome;
 # select $x;` call form is the validated 3.11.x syntax — do not "simplify" it.
 _FN_FIXES_FOR_XID = "match let $x in fixes_for_xid({code}); select $x;"
 _FN_TRIGGER_FOR_XID = "match let $x in trigger_for_xid({code}); select $x;"
+_FN_XID_DETAIL = "match let $m, $d, $s in detail_for_xid({code}); select $m, $d, $s;"
 _FN_XIDS_FOR_GPU_MODEL = 'match let $x in xids_for_gpu_model("{model}"); select $x;'
 # Validated one-hop reverse leads_to, used only to order a complete recursive result.
 _FN_ROOT_XIDS_FOR = "match let $x in root_xids_for({code}); select $x;"
 # Transitive reverse leads_to: every fault that escalates INTO an observed XID.
 _FN_ROOT_XID_CHAIN_FOR = "match let $x in root_xid_chain_for({code}); select $x;"
+_FN_LINKAGE_NOTE_FOR_XID = "match let $x in linkage_note_for_xid({code}); select $x;"
 _FN_CAUSES_FOR_SYMPTOM = 'match let $x in causes_for_symptom("{symptom}"); select $x;'
 _FN_DEPENDENCIES_FOR_COMPONENT = 'match let $x in dependencies_for_component("{component}"); select $x;'
 _FN_CHECKS_FOR_COMPONENT_PATH = 'match let $x, $y in checks_for_component_path("{component}"); select $x, $y;'
@@ -174,6 +176,11 @@ _FN_DIAGNOSTIC_DISCONFIRM = (
 _FN_DIAGNOSTIC_PROBES = (
     'match let $id, $probe in diagnostic_probes_for_runbook("{runbook}"); select $id, $probe;'
 )
+_FN_DIAGNOSTIC_ALTERNATIVES = (
+    'match let $id, $family, $reason, $disc, $seq in '
+    'diagnostic_alternatives_for_runbook("{runbook}"); '
+    "select $id, $family, $reason, $disc, $seq;"
+)
 
 # Curated failure-mode knowledge (knowledge layer), loaded by
 # ontology/load_knowledge.py: family -> symptom(keywords) -> action. The synthesis
@@ -200,6 +207,22 @@ match
 select $fam, $sn, $kw;
 """
 
+# Trace-v3 probe-execution verdict history (ontology/ingest.py's
+# _write_trace_v3_projection), grouped by the hypothesis family each execution
+# tested and the probe template it ran. A template that has repeatedly come
+# back "inconclusive" for a family is worth knowing BEFORE spending another
+# round on it; a template that reliably "supports"/"refutes" is worth running
+# again. Read by planner._diagnostic_directive (see KGContext.probe_history).
+_PROBE_HISTORY_QUERY = """
+match
+  $t isa diagnostic_probe_template, has probe_id $tid;
+  $x isa probe_execution, has probe_verdict $verdict;
+  (execution: $x, template: $t) isa probe_execution_for;
+  (execution: $x, hypothesis: $h) isa probe_execution_tests;
+  $h isa hypothesis, has hypothesis_family $family;
+select $tid, $family, $verdict;
+"""
+
 _KNOWLEDGE_REASON_QUERY = """
 match
   $sy isa symptom, has name $sn, has reason $reason;
@@ -210,6 +233,33 @@ _KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY = """
 match
   $sy isa symptom, has name $sn, has exclusive_actions $exclusive_actions;
 select $sn, $exclusive_actions;
+"""
+
+# Rollout-flavored lifecycle symptoms (knowledge/failure_modes.yaml
+# `requires_lifecycle_signal: true`). pipeline._gate_lifecycle_symptoms drops a
+# platform_lifecycle_change match carrying this flag unless an active rollout
+# signal corroborates it — without this field surviving the graph round-trip,
+# that gate is a permanent no-op on the TypeDB path.
+_KNOWLEDGE_LIFECYCLE_SIGNAL_QUERY = """
+match
+  $sy isa symptom, has name $sn, has requires_lifecycle_signal $requires_lifecycle_signal;
+select $sn, $requires_lifecycle_signal;
+"""
+
+# Version-linked known issues (ontology/load_known_issues.py mirrors each entry
+# of knowledge/runai_known_issues.yaml as a name-keyed symptom carrying these
+# two optional attributes) so a known issue surfaced through the graph's
+# generic symptom match carries the same "affected vX, fixed in vY" context the
+# YAML-only known-issues path already attaches.
+_KNOWLEDGE_AFFECTED_VERSION_QUERY = """
+match
+  $sy isa symptom, has name $sn, has affected_version $affected_version;
+select $sn, $affected_version;
+"""
+_KNOWLEDGE_FIXED_VERSION_QUERY = """
+match
+  $sy isa symptom, has name $sn, has fixed_version $fixed_version;
+select $sn, $fixed_version;
 """
 
 _KNOWLEDGE_REASON_KO_QUERY = """
@@ -254,6 +304,11 @@ class KGContext:
     case_cards: list[dict[str, Any]] = field(default_factory=list)
     # family -> [{symptom, keywords[], actions[]}]  (curated knowledge layer)
     knowledge: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # family -> probe template_id -> {verdict: count, ..., "total": N}. Prior
+    # trace-v3 probe-execution outcomes across every ingested run, so a planner
+    # can see a template is repeatedly "inconclusive" for this family before
+    # spending another round on it. See _PROBE_HISTORY_QUERY.
+    probe_history: dict[str, dict[str, dict[str, int]]] = field(default_factory=dict)
     reasoning: dict[str, Any] = field(default_factory=dict)
     # Executable diagnostic graph projected from TypeDB. Empty means the caller
     # should use the version-controlled YAML fallback.
@@ -273,6 +328,7 @@ class KGContext:
             "workload_topology_status": self.workload_topology_status,
             "case_cards": self.case_cards,
             "knowledge": self.knowledge,
+            "probe_history": self.probe_history,
             "reasoning": self.reasoning,
             "diagnostic_tree": self.diagnostic_tree,
             "warnings": self.warnings,
@@ -338,6 +394,7 @@ async def enrich(
         workload_topology_status=str(data.get("workload_topology_status") or ""),
         case_cards=data["case_cards"],
         knowledge=data["knowledge"],
+        probe_history=data["probe_history"],
         reasoning=data["reasoning"],
         diagnostic_tree=data["diagnostic_tree"],
     )
@@ -353,6 +410,14 @@ class GraphRemediation:
     family_fixes: list[str] = field(default_factory=list)
     xid_fixes: dict[int, list[str]] = field(default_factory=dict)
     xid_triggers: dict[int, str] = field(default_factory=dict)
+    # The XID's own catalog identity (knowledge/xid_catalog.yaml mnemonic /
+    # description / severity) — "GPU has fallen off the bus", not just its fix.
+    xid_mnemonics: dict[int, str] = field(default_factory=dict)
+    xid_descriptions: dict[int, str] = field(default_factory=dict)
+    xid_severities: dict[int, str] = field(default_factory=dict)
+    # Driver/CUDA version an XID's leads_to escalation was confirmed under
+    # (xid_catalog.yaml `linkage_note`); sparse — only XIDs that escalate.
+    xid_linkage_notes: dict[int, str] = field(default_factory=dict)
     model_xids: dict[str, list[int]] = field(default_factory=dict)
     # observed XID -> complete transitive ancestors, in causal order when known.
     root_xids: dict[int, list[int]] = field(default_factory=dict)
@@ -366,6 +431,7 @@ class GraphRemediation:
             self.family_fixes
             or self.xid_fixes
             or self.xid_triggers
+            or self.xid_mnemonics
             or self.model_xids
             or self.root_xids
             or self.verified_actions
@@ -376,6 +442,10 @@ class GraphRemediation:
             "family_fixes": self.family_fixes,
             "xid_fixes": {str(k): v for k, v in self.xid_fixes.items()},
             "xid_triggers": {str(k): v for k, v in self.xid_triggers.items()},
+            "xid_mnemonics": {str(k): v for k, v in self.xid_mnemonics.items()},
+            "xid_descriptions": {str(k): v for k, v in self.xid_descriptions.items()},
+            "xid_severities": {str(k): v for k, v in self.xid_severities.items()},
+            "xid_linkage_notes": {str(k): v for k, v in self.xid_linkage_notes.items()},
             "model_xids": {k: v for k, v in self.model_xids.items()},
             "root_xids": {str(k): v for k, v in self.root_xids.items()},
             "root_xid_status": {str(k): v for k, v in self.root_xid_status.items()},
@@ -442,6 +512,7 @@ def _query_remediation(
             triggers = _statements(run(_FN_TRIGGER_FOR_XID.format(code=code)))
             if triggers:
                 out.xid_triggers[code] = triggers[0]
+            _fill_xid_detail(run, out, code)
             # Drill to the ROOT of the leads_to causal chain: which fault(s)
             # escalate INTO this observed XID. TypeDB's recursive function returns
             # the full chain in one query, so a chain 144 → 48 → 154 surfaces both
@@ -462,6 +533,7 @@ def _query_remediation(
                         triggers = _statements(run(_FN_TRIGGER_FOR_XID.format(code=root)))
                         if triggers:
                             out.xid_triggers[root] = triggers[0]
+                    _fill_xid_detail(run, out, root)
         for candidate in _gpu_model_candidates(gpu_model):
             rows = run(_FN_XIDS_FOR_GPU_MODEL.format(model=escape_typeql(candidate)))
             xids = sorted({int(v) for v in _values(rows) if _is_int(v)})
@@ -536,6 +608,32 @@ def _gate_root_xids_to_model(
         f"Dropped upstream XID(s) not valid for detected GPU model {gpu_model}: "
         f"{', '.join(str(c) for c in sorted(invalid))}."
     )
+
+
+def _fill_xid_detail(run: Any, out: GraphRemediation, code: int) -> None:
+    """The XID's own catalog identity: mnemonic/description/severity, plus the
+    driver/CUDA linkage_note when its leads_to escalation carries one. Isolated
+    like the fixes/triggers lookups above — a query error here must not lose
+    those. Best-effort: an XID with no catalog row silently contributes nothing."""
+    if code in out.xid_mnemonics:
+        return
+    row = next(iter(run(_FN_XID_DETAIL.format(code=code))), None)
+    if isinstance(row, dict):
+        mnemonic = str(row.get("m") or "").strip()
+        description = str(row.get("d") or "").strip()
+        severity = str(row.get("s") or "").strip()
+        if mnemonic:
+            out.xid_mnemonics[code] = mnemonic
+        if description:
+            out.xid_descriptions[code] = description
+        if severity:
+            out.xid_severities[code] = severity
+    # A separate function/query (like trigger_for_xid): linkage_note is sparse,
+    # so folding it into detail_for_xid's single `has` conjunction would drop
+    # mnemonic/description/severity for every XID that never escalates.
+    note = _statements(run(_FN_LINKAGE_NOTE_FOR_XID.format(code=code)))
+    if note:
+        out.xid_linkage_notes[code] = note[0]
 
 
 def _root_chain_for(run: Any, code: int) -> tuple[list[int], str]:
@@ -736,7 +834,41 @@ def _safe_case_card(raw: Any) -> dict[str, Any]:
         }
         if safe_context:
             card["context"] = safe_context
+    # Curated differential diagnosis (external cases only): other plausible
+    # families the curator weighed, each with a confidence bucket. Bounded and
+    # re-typed field-by-field — never passed through wholesale — like every
+    # other entry in this allowlist.
+    candidates = raw.get("family_candidates")
+    if isinstance(candidates, list):
+        safe_candidates = [
+            {"family": family, "confidence": _card_text(item.get("confidence"), 20)}
+            for item in candidates
+            if isinstance(item, dict) and (family := _card_text(item.get("family"), 80))
+        ][:5]
+        if safe_candidates:
+            card["family_candidates"] = safe_candidates
+    # Curator cross-references to an EXISTING curated symptom / known issue
+    # (external cases only; ontology/load_external_cases.py already bounded
+    # these to the closed catalogs before they reached this card). Lets the
+    # report cite the more precise curated entry instead of only the raw case.
+    for key in ("failure_mode_matches", "known_issue_matches"):
+        if safe_matches := _safe_knowledge_link_matches(raw.get(key)):
+            card[key] = safe_matches
     return card
+
+
+def _safe_knowledge_link_matches(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict) or not (name := _card_text(item.get("name"), 160)):
+            continue
+        entry = {"name": name, "confidence": _card_text(item.get("confidence"), 20)}
+        if match_type := _card_text(item.get("match_type"), 40):
+            entry["match_type"] = match_type
+        out.append(entry)
+    return out[:5]
 
 
 def _case_card_projection(run: Any, case_id: str) -> dict[str, Any]:
@@ -993,10 +1125,14 @@ def _query_kg(
         knowledge_rows = [*run(_KNOWLEDGE_QUERY), *run(_KNOWLEDGE_ACTIONLESS_QUERY)]
         knowledge_reason_rows = run(_KNOWLEDGE_REASON_QUERY)
         knowledge_exclusive_action_rows = run(_KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY)
+        knowledge_lifecycle_rows = run(_KNOWLEDGE_LIFECYCLE_SIGNAL_QUERY)
         knowledge_reason_ko_rows = run(_KNOWLEDGE_REASON_KO_QUERY)
         knowledge_component_rows = run(_KNOWLEDGE_COMPONENT_QUERY)
         knowledge_name_ko_rows = run(_KNOWLEDGE_NAME_KO_QUERY)
         knowledge_actions_ko_rows = run(_KNOWLEDGE_ACTIONS_KO_QUERY)
+        knowledge_affected_version_rows = run(_KNOWLEDGE_AFFECTED_VERSION_QUERY)
+        knowledge_fixed_version_rows = run(_KNOWLEDGE_FIXED_VERSION_QUERY)
+        probe_history_rows = run(_PROBE_HISTORY_QUERY)
         reasoning: dict[str, Any] = {}
         component = target.workload_name
         if component:
@@ -1028,6 +1164,21 @@ def _query_kg(
         str(row.get("sn") or "")
         for row in knowledge_exclusive_action_rows
         if row.get("sn") and str(row.get("exclusive_actions")).casefold() == "true"
+    }
+    lifecycle_required = {
+        str(row.get("sn") or "")
+        for row in knowledge_lifecycle_rows
+        if row.get("sn") and str(row.get("requires_lifecycle_signal")).casefold() == "true"
+    }
+    affected_versions = {
+        str(row.get("sn") or ""): str(row.get("affected_version") or "")
+        for row in knowledge_affected_version_rows
+        if row.get("sn") and row.get("affected_version")
+    }
+    fixed_versions = {
+        str(row.get("sn") or ""): str(row.get("fixed_version") or "")
+        for row in knowledge_fixed_version_rows
+        if row.get("sn") and row.get("fixed_version")
     }
     reasons_ko = {
         str(row.get("sn") or ""): str(row.get("reason_ko") or "")
@@ -1070,10 +1221,13 @@ def _query_kg(
                 "actions": sorted(entry["actions"]),
                 "reason": reasons.get(sname, ""),
                 "exclusive_actions": sname in exclusive_actions,
+                "requires_lifecycle_signal": sname in lifecycle_required,
                 "component": components.get(sname, ""),
                 "symptom_ko": names_ko.get(sname, ""),
                 "reason_ko": reasons_ko.get(sname, ""),
                 "actions_ko": sorted(actions_ko.get(sname, set())),
+                "affected_version": affected_versions.get(sname, ""),
+                "fixed_version": fixed_versions.get(sname, ""),
             }
         )
 
@@ -1096,9 +1250,26 @@ def _query_kg(
         "workload_topology_status": workload_topology_status,
         "case_cards": case_cards,
         "knowledge": knowledge,
+        "probe_history": _aggregate_probe_history(probe_history_rows),
         "reasoning": reasoning,
         "diagnostic_tree": diagnostic_tree,
     }
+
+
+def _aggregate_probe_history(rows: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, int]]]:
+    """family -> template_id -> {verdict: count, ..., "total": N}, from every
+    ingested run's trace-v3 probe executions (see _PROBE_HISTORY_QUERY)."""
+    out: dict[str, dict[str, dict[str, int]]] = {}
+    for row in rows:
+        family = str(row.get("family") or "").strip()
+        template_id = str(row.get("tid") or "").strip()
+        verdict = str(row.get("verdict") or "").strip()
+        if not (family and template_id and verdict):
+            continue
+        bucket = out.setdefault(family, {}).setdefault(template_id, {"total": 0})
+        bucket[verdict] = bucket.get(verdict, 0) + 1
+        bucket["total"] += 1
+    return out
 
 
 def _similar_incident_id(item: Any) -> str:
@@ -1404,6 +1575,23 @@ def _query_diagnostic_tree(run: Any) -> dict[str, Any]:
         probe = _json_object(row.get("probe"))
         if node is not None and probe:
             node.setdefault("probes", []).append(probe)
+
+    try:
+        alternative_rows = run(_FN_DIAGNOSTIC_ALTERNATIVES.format(runbook=runbook))
+    except Exception:  # noqa: BLE001 - schema v1 remains a rolling-upgrade fallback
+        alternative_rows = []
+    for row in sorted(alternative_rows, key=lambda item: int(item.get("seq") or 0)):
+        node = nodes.get(str(row.get("id") or ""))
+        family = str(row.get("family") or "")
+        if node is None or not family:
+            continue
+        node.setdefault("alternatives", []).append(
+            {
+                "family": family,
+                "reason": str(row.get("reason") or ""),
+                "discriminator": str(row.get("disc") or ""),
+            }
+        )
 
     transitions = run(_FN_DIAGNOSTIC_TRANSITIONS.format(runbook=runbook))
     for row in sorted(transitions, key=lambda item: int(item.get("priority") or 0)):

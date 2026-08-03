@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,6 +38,35 @@ func operatorCatalogAgent(t *testing.T, analyze func(*http.Request) AgentAnalysi
 		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(encoded))}, nil
 	})}
 	return server
+}
+
+// TestRenderOperatorCorrectionDetailMatchesDeploymentLanguage pins a real
+// mixed-language defect: the section headings were hardcoded Korean
+// unconditionally ("## 1. 문제") while the field labels right below them were
+// hardcoded English ("Root cause family:", "Operator conclusion:", "No
+// recommended actions provided.", "Base analysis run:") -- every operator
+// correction document, in EVERY deployment language, mixed both. An
+// English-language deployment additionally got Korean headings outright.
+func TestRenderOperatorCorrectionDetailMatchesDeploymentLanguage(t *testing.T) {
+	en := renderOperatorCorrectionDetail("gpu_hardware_error", "XID evidence identifies the GPU.", []string{"Drain the node"}, "ANL-base", "en")
+	for _, korean := range []string{"문제", "원인", "조치"} {
+		if strings.Contains(en, korean) {
+			t.Fatalf("english-deployment correction must not contain Korean heading text (%q): %s", korean, en)
+		}
+	}
+	if !strings.Contains(en, "## 1. Problem") || !strings.Contains(en, "Root cause family: `gpu_hardware_error`") || !strings.Contains(en, "Base analysis run: `ANL-base`") {
+		t.Fatalf("english correction missing expected headings/labels: %s", en)
+	}
+
+	ko := renderOperatorCorrectionDetail("gpu_hardware_error", "GPU XID 로그로 확인된 하드웨어 오류입니다.", nil, "", "ko")
+	for _, english := range []string{"Root cause family", "Operator conclusion", "No recommended actions provided"} {
+		if strings.Contains(ko, english) {
+			t.Fatalf("korean-deployment correction must not contain hardcoded English labels (%q): %s", english, ko)
+		}
+	}
+	if !strings.Contains(ko, "## 1. 문제 (Problem)") || !strings.Contains(ko, "## 2. 원인 (Root Cause)") || !strings.Contains(ko, "권장 조치가 제공되지 않았습니다") {
+		t.Fatalf("korean correction missing expected localized headings/labels: %s", ko)
+	}
 }
 
 func TestOperatorCorrectionAppendsPinsAndCanBeApproved(t *testing.T) {

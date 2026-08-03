@@ -24,7 +24,19 @@ from app.services.pipeline import (
     _promote_xid_cause,
     _xid_codes_from_results,
 )
-from app.services.root_cause_ranking import RankedCause
+from app.services.root_cause_ranking import FAMILIES, RankedCause
+
+# _promote_signature_cause applies a higher evidence bar (>= 2 matched
+# keywords, no single-specific-keyword exemption, plus mandatory evidence-text
+# grounding) to any family outside the closed catalog -- an unvalidated label
+# needs more proof before it can headline. Deliberately not a real family: the
+# knowledge catalogs (failure_modes.yaml, runai_known_issues.yaml) are a
+# closed vocabulary now (test_knowledge_reachability.py), so this fixture
+# stands in for an LLM-asserted or otherwise unvalidated family string. Assert
+# the premise instead of letting it silently go stale like
+# expected_known_behavior did when it was promoted into families.yaml.
+NON_CATALOG_FAMILY = "unmapped_signature_family"
+assert NON_CATALOG_FAMILY not in FAMILIES
 
 
 def _xid_request() -> AlertAnalysisRequest:
@@ -325,12 +337,13 @@ def test_signature_promotion_beats_ranker_and_respects_precedence() -> None:
     }]
     out = _promote_signature_cause(ranked, [], ki, [], evidence_text="scheduler reclaim")
     assert out[0].family == "platform_version_bug"
-    # curated symptom beats the ranker when no known issue matched
+    # curated symptom beats the ranker when no known issue matched (S7: the
+    # keyword must be OBSERVED, not merely asserted by the match itself)
     sym = [(
         "gpu_hardware_error",
         {"symptom": "GPU Fallen Off The Bus", "matched_keywords": ["fallen off the bus"]},
     )]
-    out = _promote_signature_cause(ranked, [], [], sym)
+    out = _promote_signature_cause(ranked, [], [], sym, evidence_text="fallen off the bus")
     assert out[0].family == "gpu_hardware_error"
     # XID outranks both
     out = _promote_signature_cause(ranked, [79], ki, sym)
@@ -340,7 +353,7 @@ def test_signature_promotion_beats_ranker_and_respects_precedence() -> None:
         "node_kubelet_pressure",
         {"symptom": "Node Disk Pressure", "matched_keywords": ["disk pressure"]},
     )]
-    out = _promote_signature_cause(ranked, [], [], agree)
+    out = _promote_signature_cause(ranked, [], [], agree, evidence_text="disk pressure")
     assert out[0].family == "node_kubelet_pressure"
     assert out[0].score == 7.0
     assert out[0].rationale == ["matched curated symptom: Node Disk Pressure"]
@@ -395,7 +408,7 @@ def test_lifecycle_symptom_promotion_is_gated_by_active_signal() -> None:
     passed = _gate_lifecycle_symptoms(sym, {"active": True, "components": ["x"]})
     assert passed == sym
     assert (
-        _promote_signature_cause(ranked, [], [], passed)[0].family
+        _promote_signature_cause(ranked, [], [], passed, evidence_text="mid-rollout")[0].family
         == "platform_lifecycle_change"
     )
 
@@ -413,7 +426,7 @@ def test_non_catalog_promotion_needs_two_hits() -> None:
 
     ranked = [RankedCause(family="workload_startup_error", confidence="high", score=9.0)]
     one = [{
-        "issue": "Expected behavior", "family": "expected_known_behavior",
+        "issue": "Unmapped issue", "family": NON_CATALOG_FAMILY,
         "matched_keywords": ["--backoff-limit"],
     }]
     assert _promote_signature_cause(ranked, [], one, [], evidence_text="--backoff-limit")[0].family == "workload_startup_error"
@@ -421,7 +434,7 @@ def test_non_catalog_promotion_needs_two_hits() -> None:
     promoted = _promote_signature_cause(
         ranked, [], two, [], evidence_text="--backoff-limit master-restart-policy"
     )
-    assert promoted[0].family == "expected_known_behavior"
+    assert promoted[0].family == NON_CATALOG_FAMILY
     assert promoted[0].score == 8.0
 
 
@@ -430,7 +443,7 @@ def test_non_catalog_promotion_needs_evidence_grounding() -> None:
 
     ranked = [RankedCause(family="workload_startup_error", confidence="high", score=9.0)]
     known_issue = [{
-        "issue": "Alert-only issue", "family": "expected_known_behavior",
+        "issue": "Alert-only issue", "family": NON_CATALOG_FAMILY,
         "matched_keywords": ["--backoff-limit", "master-restart-policy"],
     }]
     assert _promote_signature_cause(
@@ -446,7 +459,11 @@ def test_catalog_promotion_single_specific_keyword_ok() -> None:
         "issue": "GPU issue", "family": "gpu_hardware_error",
         "matched_keywords": ["fallen off the bus"],
     }]
-    assert _promote_signature_cause(ranked, [], phrase, [])[0].family == "gpu_hardware_error"
+    assert (
+        _promote_signature_cause(ranked, [], phrase, [], evidence_text="fallen off the bus")[0]
+        .family
+        == "gpu_hardware_error"
+    )
     short = [{**phrase[0], "matched_keywords": ["mig"]}]
     assert _promote_signature_cause(ranked, [], short, [])[0].family == "workload_startup_error"
 
@@ -456,15 +473,17 @@ def test_backofflimitexceeded_end_to_end_headline() -> None:
 
     ranked = [RankedCause(family="workload_startup_error", confidence="medium", score=3.0)]
     failure_modes = load_failure_modes("knowledge/failure_modes.yaml")
-    matches = match_failure_mode_symptoms(
-        failure_modes, "Job Failed: BackoffLimitExceeded"
-    )
+    # Real callers always pass the lowercased ``_observed_text()`` output as
+    # evidence_text; matched_keywords are lowercase too, and _keyword_hits does
+    # a case-sensitive substring search (no internal casefold).
+    observed = "Job Failed: BackoffLimitExceeded".casefold()
+    matches = match_failure_mode_symptoms(failure_modes, observed)
     assert any(
         family == "workload_startup_error"
         and symptom.get("matched_keywords") == ["backofflimitexceeded"]
         for family, symptom in matches
     )
-    promoted = _promote_signature_cause(ranked, [], [], matches)
+    promoted = _promote_signature_cause(ranked, [], [], matches, evidence_text=observed)
     assert promoted[0].family == "workload_startup_error"
     assert promoted[0].score == 7.0
     assert "signature" in promoted[0].evidence_agents
@@ -494,7 +513,12 @@ def test_learned_novel_family_can_match_but_never_leads_the_rca() -> None:
         "gpu_hardware_error",
         {"symptom": "GPU Fallen Off The Bus", "matched_keywords": ["fallen off the bus"]},
     )]
-    assert _promote_signature_cause(ranked, [], [], novel + catalog)[0].family == "gpu_hardware_error"
+    assert (
+        _promote_signature_cause(
+            ranked, [], [], novel + catalog, evidence_text="fallen off the bus"
+        )[0].family
+        == "gpu_hardware_error"
+    )
 
 
 def test_novel_family_cannot_lead_the_plan_either() -> None:

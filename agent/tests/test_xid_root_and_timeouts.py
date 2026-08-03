@@ -5,7 +5,12 @@ from __future__ import annotations
 from app.collectors.http_json import _client_timeout
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services.kg_enrichment import GraphRemediation
-from app.services.pipeline import _causal_chain_line, _numbered_actions
+from app.services.pipeline import (
+    _HANGUL_RE,
+    _causal_chain_line,
+    _numbered_actions,
+    _translatable_report_lines,
+)
 from app.services.root_cause_ranking import RankedCause
 
 
@@ -76,7 +81,8 @@ def test_causal_chain_line_fan_in_is_not_a_fabricated_sequence() -> None:
     # (see knowledge/xid_catalog.yaml); the topological sort still reports
     # "ordered" even though there is no edge between them, so joining the root
     # list with "→" must not invent a 144 -> 145 -> 146 sequence that doesn't
-    # exist.
+    # exist. An audit of the catalog found all five XIDs with upstream faults
+    # are fan-ins -- there is no genuine chain to lose.
     gr = GraphRemediation(
         xid_fixes={48: ["fix 48"], 144: ["fix 144"], 145: ["fix 145"], 146: ["fix 146"]},
         root_xids={48: [144, 145, 146]},
@@ -99,25 +105,12 @@ def test_causal_chain_line_single_root_keeps_the_arrow_chain() -> None:
     assert "XID 74 → XID 45" in _causal_chain_line(gr, "en")
 
 
-def test_numbered_actions_keeps_english_xid_fix_in_korean_report() -> None:
-    # Bug: a Korean-only filter dropped every XID fix because TypeDB's
-    # graph-remediation text has no locale field and is always English. Report-
-    # line translation (_translate_report_lines_ko) runs downstream over the
-    # whole assembled report, so _numbered_actions must not filter these out by
-    # language -- doing so silently deleted the answer to the operator's
-    # question.
-    gr = GraphRemediation(
-        xid_fixes={
-            48: [
-                "Data Center Recovery Action Solo: RESET_GPU w/ 63 or 64: "
-                "DRAIN_AND_RESET ... RUN_FIELDDIAG"
-            ]
-        }
-    )
+def _xid_actions(gr: GraphRemediation, language: str = "") -> list[str]:
     request = AlertAnalysisRequest(
         alert=Alert(status="firing", labels={"alertname": "X"}, annotations={}, fingerprint="fp")
     )
-    actions = _numbered_actions(
+    kwargs = {"language": language} if language else {}
+    return _numbered_actions(
         None,
         gr,
         [RankedCause(family="gpu_hardware_error", confidence="low", score=1.0)],
@@ -125,7 +118,53 @@ def test_numbered_actions_keeps_english_xid_fix_in_korean_report() -> None:
         {},
         [],
         request,
-        language="ko",
+        **kwargs,
     )
-    joined = "\n".join(actions)
-    assert "RESET_GPU" in joined
+
+
+def test_numbered_actions_xid_fix_names_the_fault() -> None:
+    # XID 79 is a real knowledge/xid_catalog.yaml entry ("GPU has fallen off
+    # the bus", fatal). The bare "(XID 79)" prefix forces an operator to look
+    # the code up elsewhere; the identity clause names the fault inline.
+    joined = "\n".join(_xid_actions(GraphRemediation(xid_fixes={79: ["Reseat or replace the GPU."]})))
+    assert "XID 79 — GPU has fallen off the bus (fatal)" in joined
+    assert "Reseat or replace the GPU." in joined
+
+
+def test_numbered_actions_xid_fix_unknown_code_stays_bare() -> None:
+    # A code neither the graph nor the local catalog has a name for must never
+    # grow a fabricated or dangling " — " clause.
+    actions = _xid_actions(GraphRemediation(xid_fixes={999: ["Escalate to NVIDIA support."]}))
+    xid_lines = [a for a in actions if "999" in a]
+    assert len(xid_lines) == 1
+    assert xid_lines[0].endswith("(XID 999) Escalate to NVIDIA support.")
+    assert "—" not in xid_lines[0]
+
+
+def test_numbered_actions_ko_keeps_the_catalog_text_translatable() -> None:
+    # The catalog is English-only, and _translatable_report_lines SKIPS any line
+    # that already contains Hangul. Pre-localizing the label ("근본 XID") or
+    # dropping the English clauses -- the two things this site used to do --
+    # therefore either leaked untranslated English or deleted the answer
+    # outright: a ko report lost WORKFLOW_XID_48 entirely that way.
+    #
+    # The contract now is that the whole line is built in English so
+    # _translate_report_lines_ko can localize it downstream. The invariant that
+    # matters is that the ko line is translatable, i.e. carries no Hangul of
+    # its own.
+    gr = GraphRemediation(
+        xid_fixes={
+            48: [
+                "Data Center Recovery Action Solo: RESET_GPU w/ 63 or 64: "
+                "DRAIN_AND_RESET ... RUN_FIELDDIAG"
+            ]
+        },
+        root_xids={48: [144]},
+        root_xid_status={48: "ordered"},
+    )
+    xid_lines = [a for a in _xid_actions(gr, "ko") if "48" in a]
+    assert xid_lines, "the fix text must survive into a Korean report"
+    for line in xid_lines:
+        assert "RESET_GPU" in line
+        assert not _HANGUL_RE.search(line), f"untranslatable mixed line: {line}"
+    assert any(_translatable_report_lines(line) for line in xid_lines)

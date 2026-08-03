@@ -6,10 +6,22 @@ is it actually present, does a competing cause fit better, and what single check
 would settle it. If the evidence doesn't support the cause, confidence is
 downgraded and a short caveat is attached.
 
-LLM-gated: with no LLM configured the deterministic fallback fires — if no
-eligible collector supplied a family-relevant scoped positive fact, or a scoped
-absence directly contradicts the family, confidence drops one level. A direct
-contradiction also refutes the candidate. Otherwise confidence is kept.
+LLM-gated: with no LLM configured the deterministic fallback fires. A scoped
+absence that directly contradicts the family always refutes the candidate.
+For a caller that passes a real evidence_eligibility map, missing eligible
+evidence (no eligible collector supplied a family-relevant scoped positive
+fact) only refutes when the family was promoted by a DISPOSITIVE signature
+(NVIDIA XID / a typed, machine-reported Kubernetes state -- see
+_is_signature_promoted): that is a specific, verified claim, and no evidence
+means there was never anything behind it. Every other family with no eligible
+evidence -- ranker-derived, or promoted only by a curated known-issue/symptom
+keyword hit against the alert's own prose -- is merely unconfirmed, not
+refuted, so confidence only drops one level. The LLM path applies the same
+conditional; a model's own supported=false can still refute when eligible
+evidence DOES exist but the model finds it unconvincing. A standalone/legacy
+caller (evidence_eligibility=None) skips this conditional entirely and keeps
+the original unconditional gate, since it has no rigorous eligibility
+computation to reason about.
 
 Never raises into analyze(): any failure returns a safe default that preserves
 the ranked confidence with no caveat.
@@ -22,6 +34,7 @@ verbatim.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult, condition_observations
@@ -35,6 +48,8 @@ from app.services.root_cause_ranking import (
     artifact_contradicts_family,
     artifact_supports_family,
 )
+
+_log = logging.getLogger(__name__)
 
 _CONF_ORDER = ("low", "medium", "high")
 
@@ -61,37 +76,37 @@ def _downgrade(confidence: str) -> str:
         return "low"
 
 
-def _canonical_has_evidence(
-    family: str,
-    results: list[CollectorResult],
-    *,
-    evidence_eligibility: Mapping[str, object] | None = None,
-) -> bool:
-    """True only when the canonical collector has scoped positive evidence.
+_DISPOSITIVE_SIGNATURE_KINDS = frozenset({"nvidia_xid", "typed_container_state"})
 
-    The ranker already rejects context-only observations. The deterministic
-    self-check must use the same bar: otherwise a broad collector summary (or
-    a raw usage metric) can preserve confidence after the ranker correctly
-    refused to treat it as proof.
+
+def _is_signature_promoted(top: RankedCause) -> bool:
+    """True when the headline is a DISPOSITIVE signature, not a keyword hint.
+
+    ``harness._signature_support`` treats every signature-promotion call site
+    in pipeline.py alike (checking ``"signature" in top.evidence_agents`` OR a
+    rationale substring). We instead read the structured ``score_breakdown``
+    ``kind`` -- pipeline.py stamps one of four: ``nvidia_xid``,
+    ``typed_container_state``, ``known_issue``, ``curated_symptom`` -- and only
+    treat the first two as "signature-promoted" for this refutation gate.
+
+    That split is deliberate, not an oversight: NVIDIA XID and a typed,
+    machine-reported Kubernetes reason are verified structured facts, so no
+    eligible evidence behind them is genuinely anomalous ("there was never
+    anything behind it"). known_issue/curated_symptom are keyword hits against
+    the alert's own free-form prose -- inherently a heuristic hint, not a
+    verified fact -- so with no eligible evidence they are simply unconfirmed,
+    same as a ranker-derived family. Proven empirically: treating those two
+    kinds as refutable-on-missing-evidence broke ~14 curated-symptom/known-
+    issue scenarios in tests/test_troubleshooting_scenarios.py (e.g.
+    admission-webhook x509 -> k8s_control_plane_error), which never simulate
+    real collector evidence and rely on exactly this leniency.
     """
-    rule = _FAMILY_RULES.get(family)
-    if not rule:
-        return True  # unknown family (e.g. insufficient_evidence) — nothing to refute
-    canonical = rule[0]
-    for r in results:
-        if r.agent != canonical:
-            continue
-        if r.status == "unavailable":
-            return False
-        return any(
-            _artifact_has_evidence(
-                family,
-                art,
-                evidence_eligibility=evidence_eligibility,
-            )
-            for art in getattr(r, "artifacts", []) or []
-        )
-    return False  # canonical collector did not even run
+    return any(
+        isinstance(entry, Mapping)
+        and str(entry.get("stage") or "").strip().lower() == "signature"
+        and str(entry.get("kind") or "").strip().lower() in _DISPOSITIVE_SIGNATURE_KINDS
+        for entry in getattr(top, "score_breakdown", None) or []
+    )
 
 
 def _artifact_has_evidence(
@@ -135,6 +150,37 @@ def _artifact_has_evidence(
     )
 
 
+def _deterministic_gate(
+    confidence: str,
+    family: str,
+    settings: Settings,
+    *,
+    has_evidence: bool,
+    has_contradiction: bool,
+    missing_evidence_refutes: bool,
+) -> _Result:
+    """Shared body of the no-LLM gate and the LLM-returned-nothing fallback.
+
+    Factored out so the two callers cannot re-diverge the way the
+    LLM-verdict-present path once diverged from them: a scoped contradiction
+    always refutes; missing eligible evidence only refutes a signature-
+    promoted family (``missing_evidence_refutes``), otherwise it just
+    downgrades confidence one level (unconfirmed, not refuted).
+    """
+    if not has_evidence or has_contradiction:
+        return _default(
+            _downgrade(confidence),
+            (
+                _caveat_contradiction(family, settings)
+                if has_contradiction
+                else _caveat_missing_evidence(family, settings)
+            ),
+            refuted=has_contradiction or missing_evidence_refutes,
+            next_check=_next_check_missing_evidence(family, settings),
+        )
+    return _default(confidence)
+
+
 async def refute_top_cause(
     settings: Settings,
     top_candidate: RankedCause,
@@ -161,22 +207,35 @@ async def refute_top_cause(
         has_contradiction = _has_family_contradiction(
             family, results, evidence_eligibility=evidence_eligibility
         )
+        # OWNER DECISION: "no eligible evidence" refutes a family only when it
+        # was promoted by a DISPOSITIVE signature (NVIDIA XID / typed
+        # Kubernetes-reported state -- see _is_signature_promoted) -- a
+        # specific claim with nothing behind it. A ranker-derived family
+        # (including a curated known-issue/symptom keyword hint) with no
+        # eligible evidence is merely unconfirmed, so it is only downgraded
+        # one level, never refuted on that basis alone.
+        #
+        # Scoped to callers that pass a real evidence_eligibility map: a
+        # standalone/legacy caller (map is None) has no rigorous eligibility
+        # computation behind has_evidence/has_contradiction at all (see
+        # _artifact_has_evidence's narrow local fallback), so this conditional
+        # does not apply there -- it keeps the original unconditional gate.
+        eligibility_aware = evidence_eligibility is not None
+        missing_evidence_refutes = (
+            eligibility_aware
+            and not has_evidence
+            and _is_signature_promoted(top_candidate)
+        )
 
         if not llm_configured(settings, settings.llm_model_self_check):
-            # ponytail: deterministic gate — the only signal we have without an LLM
-            # is whether the canonical source actually backed the claim.
-            if not has_evidence or has_contradiction:
-                return _default(
-                    _downgrade(confidence),
-                    (
-                        _caveat_contradiction(family, settings)
-                        if has_contradiction
-                        else _caveat_missing_evidence(family, settings)
-                    ),
-                    refuted=has_contradiction,
-                    next_check=_next_check_missing_evidence(family, settings),
-                )
-            return _default(confidence)
+            return _deterministic_gate(
+                confidence,
+                family,
+                settings,
+                has_evidence=has_evidence,
+                has_contradiction=has_contradiction,
+                missing_evidence_refutes=missing_evidence_refutes,
+            )
 
         verdict = await _llm_refute(
             settings,
@@ -188,29 +247,43 @@ async def refute_top_cause(
             evidence_eligibility=evidence_eligibility,
         )
         if not verdict:
-            # LLM failed/empty: fall back to the deterministic gate.
-            if not has_evidence or has_contradiction:
-                return _default(
-                    _downgrade(confidence),
-                    (
-                        _caveat_contradiction(family, settings)
-                        if has_contradiction
-                        else _caveat_missing_evidence(family, settings)
-                    ),
-                    refuted=has_contradiction,
-                    next_check=_next_check_missing_evidence(family, settings),
-                )
-            return _default(confidence)
+            # LLM failed/empty: fall back to the deterministic gate above.
+            _log.warning("self-check LLM returned no verdict; using deterministic gate")
+            return _deterministic_gate(
+                confidence,
+                family,
+                settings,
+                has_evidence=has_evidence,
+                has_contradiction=has_contradiction,
+                missing_evidence_refutes=missing_evidence_refutes,
+            )
 
         # The model may use context to explain/refute a hypothesis, but it must
-        # never turn that context into support.  ``has_evidence`` is computed
-        # deterministically from a scoped positive canonical observation (or a
-        # direct alert signature), so it is the upper bound on the verdict.
-        supported = (
-            bool(verdict.get("supported", True))
-            and has_evidence
+        # never turn that context into support on its own. A direct
+        # contradiction always refutes. For an eligibility-aware caller,
+        # missing evidence with no contradiction refutes only a signature-
+        # promoted family (missing_evidence_refutes above); a ranker-derived
+        # family instead gets the same one-level downgrade as the
+        # deterministic gate, regardless of the model's own "supported"
+        # opinion, so all three paths agree on the unconfirmed-not-refuted
+        # contract. A standalone/legacy caller (no eligibility map) keeps the
+        # original formula below, where has_evidence is an unconditional
+        # upper bound on the model's verdict.
+        if (
+            eligibility_aware
             and not has_contradiction
-        )
+            and not has_evidence
+            and not missing_evidence_refutes
+        ):
+            supported = True
+            new_conf = _downgrade(confidence)
+        else:
+            supported = (
+                bool(verdict.get("supported", True))
+                and has_evidence
+                and not has_contradiction
+            )
+            new_conf = confidence if supported else _downgrade(confidence)
         masker = _self_check_masker(settings)
         caveat = _one_line(masker.mask_text(str(verdict.get("caveat") or "")), limit=360)
         next_check = _one_line(
@@ -219,7 +292,6 @@ async def refute_top_cause(
         if not has_evidence:
             caveat = caveat or _caveat_missing_evidence(family, settings)
             next_check = next_check or _next_check_missing_evidence(family, settings)
-        new_conf = confidence if supported else _downgrade(confidence)
         # Also honour an explicit weaker confidence from the model, never a stronger one.
         model_conf = str(verdict.get("confidence") or "").strip().lower()
         if model_conf in _CONF_ORDER:
@@ -231,11 +303,19 @@ async def refute_top_cause(
         # the cause in prose without that observation being a falsifier --
         # artifact_contradicts_family() in root_cause_ranking.py documents the same
         # rule for the ranker. `supported=False` still drives the confidence
-        # downgrade above; only a scoped deterministic contradiction may refute.
-        # The ontology-probe "refutes" verdict is a separate, evidence-grounded
+        # downgrade above. The two refuting conditions are exactly the deterministic
+        # gate's, so all three paths agree: a scoped contradiction, or the OWNER
+        # DECISION above (a signature-promoted claim with nothing eligible behind
+        # it). The ontology-probe "refutes" verdict is a separate, evidence-grounded
         # refutation channel handled in pipeline.py.
-        return _default(new_conf, caveat, refuted=has_contradiction, next_check=next_check)
+        return _default(
+            new_conf,
+            caveat,
+            refuted=has_contradiction or missing_evidence_refutes,
+            next_check=next_check,
+        )
     except Exception:  # noqa: BLE001 - self-check is best-effort; never break analyze()
+        _log.warning("self-check failed; keeping ranked confidence unchanged", exc_info=True)
         return _default(getattr(top_candidate, "confidence", "low"))
 
 
@@ -244,16 +324,23 @@ def _one_line(value: object, *, limit: int) -> str:
 
 
 def _caveat_missing_evidence(family: str, settings: Settings) -> str:
+    """Caveat for the "no eligible evidence" gate.
+
+    The live gate (``_has_family_evidence``) accepts eligible support from ANY
+    collector, not only the family's canonical one, so this must not claim the
+    canonical source specifically was consulted and came up empty — it may
+    never have run at all. Name it only as where to look next.
+    """
     canonical = _FAMILY_RULES.get(family, ("the canonical source",))[0]
     if getattr(settings, "language", "en") == "ko":
         return (
-            f"자기 점검: 이 원인의 핵심 근거 수집기({canonical})에서 증거를 확인하지 못해 "
-            "신뢰도를 한 단계 낮췄습니다. 결론 전에 해당 소스를 직접 확인하세요."
+            "자기 점검: 이 원인을 뒷받침하는 증거를 수집기에서 확인하지 못해 신뢰도를 "
+            f"한 단계 낮췄습니다. 결론 전에 핵심 근거 수집기({canonical})를 직접 확인하세요."
         )
     return (
-        f"Self-check: the canonical evidence source ({canonical}) for this cause returned "
-        "no usable evidence, so confidence was lowered one level. Verify that source directly "
-        "before acting."
+        "Self-check: no collector returned usable scoped evidence for this cause, so "
+        f"confidence was lowered one level. Verify the canonical source ({canonical}) "
+        "directly before acting."
     )
 
 

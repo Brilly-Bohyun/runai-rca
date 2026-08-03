@@ -1045,7 +1045,18 @@ def test_prometheus_unbounded_empty_result_is_not_a_scoped_absence() -> None:
     assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
 
 
-def test_prometheus_empty_vector_requires_direct_native_transport() -> None:
+def test_prometheus_empty_vector_is_a_verified_absence_on_either_transport() -> None:
+    """An empty result refutes on MCP too, now that MCP proves it is complete.
+
+    This used to require ``direct`` because ``_prometheus_mcp_flat_result_complete``
+    validated the envelope of a NON-empty list but accepted an empty one
+    unconditionally — so an empty MCP response proved strictly less than a direct
+    one. That hole is closed (``_prometheus_mcp_empty_result_verified`` demands the
+    envelope's own ``status: success``), and an item can only reach this classifier
+    with ``transport="mcp"`` and no error once that check has passed upstream.
+    Leaving the restriction in place cost every MCP deployment — which is what the
+    chart ships — the ability to refute anything from a PromQL result.
+    """
     window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
     base = {"name": "container_restarts", "series_count": 0, "value_summary": {}}
     mcp = prometheus._prometheus_query_observation(
@@ -1054,9 +1065,17 @@ def test_prometheus_empty_vector_requires_direct_native_transport() -> None:
     direct = prometheus._prometheus_query_observation(
         {**base, "transport": "direct"}, target=make_target(), time_range=window
     )
+    unknown_transport = prometheus._prometheus_query_observation(
+        {**base, "transport": "grafana-proxy"}, target=make_target(), time_range=window
+    )
 
-    assert (mcp["polarity"], mcp["coverage"]) == ("unknown", "partial")
+    assert (mcp["polarity"], mcp["coverage"]) == ("absent", "scoped")
     assert (direct["polarity"], direct["coverage"]) == ("absent", "scoped")
+    # Still an allow-list: a transport with no completeness contract cannot refute.
+    assert (unknown_transport["polarity"], unknown_transport["coverage"]) == (
+        "unknown",
+        "partial",
+    )
 
 
 def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() -> None:

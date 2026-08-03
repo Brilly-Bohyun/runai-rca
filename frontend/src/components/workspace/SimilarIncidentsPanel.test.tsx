@@ -39,4 +39,18 @@ describe('SimilarIncidentsPanel', () => {
     );
     expect(markup.indexOf('INC-closest')).toBeLessThan(markup.indexOf('INC/older'));
   });
+
+  it('falls back to a Korean placeholder when a prior incident has no stored summary', () => {
+    // analysis_summary here is Korean by chart default (same field the main
+    // RCA Summary panel renders); an English "No prior summary captured."
+    // placeholder in the same slot reads as an untranslated fragment on an
+    // otherwise-Korean incident panel.
+    const noSummary = { ...similarIncident('INC-blank', 0.8), analysis_summary: '' };
+    const markup = renderToStaticMarkup(
+      <SimilarIncidentsPanel items={[noSummary]} recentCount={1} onOpenIncident={vi.fn()} />,
+    );
+
+    expect(markup).toContain('이전 요약이 없습니다.');
+    expect(markup).not.toContain('No prior summary captured.');
+  });
 });

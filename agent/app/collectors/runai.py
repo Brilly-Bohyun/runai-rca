@@ -899,9 +899,15 @@ def _runai_query_observation(
     expected = _runai_expected_identity(name, target)
     status_code = item.get("status_code")
     name_keyed_404 = False
+    # Only these two branches actually prove the response is ABOUT this
+    # target: an exact-ID 404 (the request itself is the identity) and an
+    # identity match found in the returned data. Every other branch is
+    # unavailable/unknown/an ignored filter and must not claim proof.
+    target_identity_verified = False
     if item.get("error"):
         if _runai_exact_resource_lookup(name, used_mcp=used_mcp) and status_code == 404:
             polarity, coverage = "absent", "scoped"
+            target_identity_verified = True
         elif not used_mcp and name in {"project", "queue"} and status_code == 404:
             polarity, coverage = "unknown", "partial"
             name_keyed_404 = True
@@ -913,6 +919,7 @@ def _runai_query_observation(
         item.get("data"), expected, resource=name, target=target
     ):
         polarity, coverage = "present", "scoped"
+        target_identity_verified = True
     elif item.get("explicitly_empty") or _runai_is_explicitly_empty(item.get("data")):
         # A successful but empty body can be an ignored filter, an API gateway
         # envelope, or a truncated MCP response. Only an explicit 404 above
@@ -929,6 +936,14 @@ def _runai_query_observation(
         "observed_entity": _runai_observed_entity(name, target),
         "status_code": status_code,
         "observation_window": time_range or {},
+        # investigator._attach_typed_artifacts only auto-attaches a present+
+        # scoped artifact when the collector itself confirms this specific
+        # target identity -- kubernetes.py has stamped this for a while;
+        # runai.py never did. A later timing downgrade (below) can still turn
+        # this present/absent into unknown/partial; the identity proof itself
+        # does not change, and the attach gate separately requires
+        # present+scoped, so a downgraded observation stays inert either way.
+        **({"target_identity_verified": True} if target_identity_verified else {}),
     }
     if name_keyed_404 and time_range:
         observation["current_state_absent"] = True

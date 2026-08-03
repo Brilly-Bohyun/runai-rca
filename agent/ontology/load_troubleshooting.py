@@ -24,10 +24,15 @@ import yaml
 
 from app.config import load_settings
 from app.ontology.typedb_client import escape_typeql as esc
-from ontology.normalization import confidence_score
 from app.ontology.typedb_client import open_driver
 from app.services.decision_tree import load_tree
+
+# Single source of truth: load_knowledge.FAMILIES is families.yaml (via
+# app.knowledge.load_family_catalog) plus insufficient_evidence -- not a
+# second private copy. Re-declaring a literal set here is exactly how this
+# loader went stale before and hard-raised on every family families.yaml adds.
 from ontology.load_knowledge import FAMILIES
+from ontology.normalization import confidence_score
 
 RUNBOOK_NAME = "k8s-senior-troubleshooting"
 BUNDLED_RUNBOOK_ID = "k8s_troubleshooting"
@@ -97,6 +102,7 @@ def _delete_existing(tx: Any, runbook: str) -> None:
         ("diagnostic_outcome", "step"),
         ("diagnostic_recommendation", "step"),
         ("probe_template_for", "step"),
+        ("diagnostic_alternative", "step"),
     ):
         tx.query(
             f'match $s isa diagnostic_step, has runbook_name "{name}"; '
@@ -303,6 +309,38 @@ def _insert_outcome(tx: Any, node: dict[str, Any]) -> int:
     return len([action for action in actions if action])
 
 
+def _insert_alternatives(tx: Any, node: dict[str, Any]) -> int:
+    """Persist the step's authored differential diagnosis (YAML `alternatives`).
+
+    Every node with competing-hypothesis knowledge gets it, not only conclusion
+    (leaf) nodes: the `diagnostic_defaults` family blocks attach `alternatives`
+    to intermediate branch nodes too.
+    """
+    alternatives = node.get("alternatives")
+    if not isinstance(alternatives, list):
+        return 0
+    step_id = str(node["id"])
+    count = 0
+    for index, alternative in enumerate(alternatives):
+        if not isinstance(alternative, dict):
+            continue
+        family = str(alternative.get("family") or "").strip()
+        if not family:
+            continue
+        reason = str(alternative.get("reason") or "")
+        discriminator = str(alternative.get("discriminator") or "")
+        _ensure_cause(tx, family)
+        tx.query(
+            f'match $s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
+            f'$c isa {family}, has subtype "{esc(family)}"; '
+            f'insert $x isa diagnostic_alternative(step: $s, cause: $c), '
+            f'has reason "{esc(reason)}", has discriminator "{esc(discriminator)}", '
+            f"has sequence_index {index};"
+        ).resolve()
+        count += 1
+    return count
+
+
 def _insert_transitions(tx: Any, nodes: list[dict[str, Any]]) -> int:
     count = 0
     for node in nodes:
@@ -342,6 +380,8 @@ def _load(tx: Any, raw: dict[str, Any]) -> tuple[int, int, int]:
     _insert_domain_runbooks(tx, [str(node["id"]) for node in nodes])
     edges = _insert_transitions(tx, nodes)
     actions = sum(_insert_outcome(tx, node) for node in nodes)
+    for node in nodes:
+        _insert_alternatives(tx, node)
     return len(nodes), edges, actions
 
 

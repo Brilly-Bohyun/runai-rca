@@ -36,6 +36,7 @@ import os
 import re
 import sys
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -195,18 +196,27 @@ def _is_generic(token: str) -> bool:
 def _symptom_keywords(payload: dict[str, Any]) -> list[str]:
     """Case-local symptom keywords = error_signatures plus any
     curated_signature_tokens the sanitizer injected for cases that have no error
-    string, plus canonical_component_tokens (cleaned, generic dropped,
-    lowercased, deduped, capped). Component tokens are exact hyphenated names
+    string, plus canonical_component_tokens, trigger_tokens, metric_signatures,
+    and issue_references (cleaned, generic dropped, lowercased, deduped,
+    capped). Component tokens are exact hyphenated names
     (runai-backend-thanos-receive) that appear verbatim in pod-name evidence —
     they give a case whose only error signature is a rare log line a reachable
-    entry point once the component is targeted. normalized_symptoms/
-    retrieval_keywords are prose — never used; the owner's retrieval entry
-    points are the error string and canonical identifiers, never prose."""
+    entry point once the component is targeted. trigger_tokens/
+    metric_signatures/issue_references are the curator's own specific
+    signatures (PromQL fragments, external bug-tracker IDs, named trigger
+    conditions) — without them a case whose only distinguishing signal is a
+    metric or trigger token was unretrievable. normalized_symptoms/
+    retrieval_keywords/version_tokens are prose — never used; the owner's
+    retrieval entry points are the error string and canonical identifiers,
+    never prose."""
     context = payload.get("searchable_context") or {}
     sigs = (
         list(context.get("error_signatures") or [])
         + list(context.get("curated_signature_tokens") or [])
         + list(context.get("canonical_component_tokens") or [])
+        + list(context.get("trigger_tokens") or [])
+        + list(context.get("metric_signatures") or [])
+        + list(context.get("issue_references") or [])
     )
     out: list[str] = []
     seen: set[str] = set()
@@ -221,6 +231,96 @@ def _symptom_keywords(payload: dict[str, Any]) -> list[str]:
         if len(out) >= _MAX_KEYWORDS:
             break
     return out
+
+
+def _family_candidates(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Curated differential diagnosis (``knowledge_links.family_candidates``):
+    other plausible families the curator weighed against the one asserted
+    ``indicates`` edge, each with a confidence bucket. Bounded to the closed
+    family catalog so an unrecognized name never reaches a consumer."""
+    links = payload.get("knowledge_links") or {}
+    out: list[dict[str, str]] = []
+    for item in links.get("family_candidates") or []:
+        if not isinstance(item, dict):
+            continue
+        family = str(item.get("family") or "").strip()
+        if family not in FAMILIES:
+            continue
+        out.append({"family": family, "confidence": _confidence_bucket(item.get("confidence"))})
+    return out[:5]
+
+
+@lru_cache(maxsize=1)
+def _closed_symptom_names() -> frozenset[str]:
+    """Curated failure-mode symptom names (knowledge/failure_modes.yaml) — the
+    closed catalog `_knowledge_links_matches` validates a curator's free-text
+    `failure_mode_matches` citation against, same role FAMILIES plays for
+    family_candidates above."""
+    try:
+        raw = yaml.safe_load(
+            Path(load_settings().failure_modes_file).read_text(encoding="utf-8")
+        ) or []
+    except (OSError, yaml.YAMLError):
+        return frozenset()
+    return frozenset(
+        name
+        for family in raw
+        if isinstance(family, dict)
+        for symptom in family.get("symptoms") or []
+        if isinstance(symptom, dict) and (name := str(symptom.get("name") or "").strip())
+    )
+
+
+@lru_cache(maxsize=1)
+def _closed_known_issue_names() -> frozenset[str]:
+    """Known-issue names (knowledge/runai_known_issues.yaml `issue:`) — the
+    closed catalog `_knowledge_links_matches` validates a curator's free-text
+    `known_issue_matches` citation against."""
+    try:
+        raw = yaml.safe_load(
+            Path(load_settings().runai_known_issues_file).read_text(encoding="utf-8")
+        ) or []
+    except (OSError, yaml.YAMLError):
+        return frozenset()
+    return frozenset(
+        name
+        for entry in raw
+        if isinstance(entry, dict) and (name := str(entry.get("issue") or "").strip())
+    )
+
+
+def _knowledge_links_matches(
+    payload: dict[str, Any], link_key: str, valid_names: frozenset[str]
+) -> list[dict[str, str]]:
+    """Curator cross-references (``knowledge_links.failure_mode_matches`` /
+    ``known_issue_matches``): this external case's mechanism overlaps an
+    EXISTING catalog entry, so the report can cite the more precise curated
+    fix instead of only the raw external case.
+
+    Dict-shaped entries only, and only when the name exact-matches the closed
+    catalog: a prior pass wired family_candidates and explicitly left these two
+    unwired because they name free-text catalog entries needing sanitisation.
+    A bare string entry (curator prose, e.g. "X — partial match because...")
+    has no separable name field safe to validate, so it is skipped rather than
+    parsed; that also correctly drops a "no existing entry" sentinel like
+    ``{"status": "none", "candidate_name": ...}``, which never carries a
+    `catalog_entry`/`repository_entry`/`issue` key at all.
+    """
+    links = payload.get("knowledge_links") or {}
+    out: list[dict[str, str]] = []
+    for item in links.get(link_key) or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(
+            item.get("catalog_entry") or item.get("repository_entry") or item.get("issue") or ""
+        ).strip()
+        if name not in valid_names:
+            continue
+        entry = {"name": name, "confidence": _confidence_bucket(item.get("confidence"))}
+        if match_type := str(item.get("match_type") or "").strip():
+            entry["match_type"] = match_type
+        out.append(entry)
+    return out[:5]
 
 
 def _to_incident(
@@ -282,6 +382,13 @@ def _to_incident(
         "searchable_context": payload.get("searchable_context") or {},
         "historical_actions": payload.get("historical_actions") or [],
         "context": {"incident_status_at_approval": status},
+        "family_candidates": _family_candidates(payload),
+        "failure_mode_matches": _knowledge_links_matches(
+            payload, "failure_mode_matches", _closed_symptom_names()
+        ),
+        "known_issue_matches": _knowledge_links_matches(
+            payload, "known_issue_matches", _closed_known_issue_names()
+        ),
     }
 
     return OntologyIncident(
@@ -306,7 +413,12 @@ def _to_incident(
     )
 
 
-def _write_case(tx: Any, inc: OntologyIncident, keywords: list[str]) -> None:
+def _write_case(
+    tx: Any,
+    inc: OntologyIncident,
+    keywords: list[str],
+    identity_tokens: frozenset[str] = frozenset(),
+) -> None:
     """Write one case's incident projection + its ``ext:`` symptom, wired into
     the SAME family→symptom→action chain as curated knowledge.
 
@@ -337,11 +449,20 @@ def _write_case(tx: Any, inc: OntologyIncident, keywords: list[str]) -> None:
     #      ("oomkilled") would substring-match every unrelated OOM incident.
     #      When no keyword survives the gate, the case demotes to retrieval-only
     #      with its full keyword set instead of entering the chain unanchored.
+    #   3. canonical_component_tokens (identity_tokens) never anchor the chain,
+    #      no matter how long or hyphenated they are — a component name says
+    #      WHO was touched, not WHAT broke. They stay in the retrieval-only
+    #      keyword set (below) so a demoted or non-chain case can still be
+    #      found via them.
     chain = (
         inc.root_cause_family in FAMILIES
         and bool(inc.case_card.get("mechanism_confirmed"))
     )
-    chain_keywords = [kw for kw in keywords if _chain_specific(kw)] if chain else []
+    chain_keywords = (
+        [kw for kw in keywords if kw not in identity_tokens and _chain_specific(kw)]
+        if chain
+        else []
+    )
     if chain and not chain_keywords:
         chain = False
     _ensure_symptom(
@@ -386,6 +507,26 @@ def _chain_specific(keyword: str) -> bool:
     token, or a code-ish identifier (runai_pod_gpu_info, error: column …)."""
     keyword = keyword.strip()
     return " " in keyword or len(keyword) >= 12 or any(c in keyword for c in "_:./")
+
+
+def _component_identity_tokens(payload: dict[str, Any]) -> frozenset[str]:
+    """The subset of ``_symptom_keywords`` sourced from canonical_component_tokens
+    — cleaned/lowercased the same way, so the strings compare equal.
+
+    A component name (gpu-operator, runai-scheduler-default, ...) identifies
+    WHICH pod/product an incident touched, never WHAT went wrong; it says
+    nothing that ``_chain_specific``'s length/shape heuristic can see (these
+    names are routinely long and hyphenated, so they pass it). Identity is
+    provenance, not shape — the loader must track it by source, not guess it
+    back from the string. Legitimate for retrieval (kept in _symptom_keywords'
+    output); excluded from _write_case's causal chain_keywords."""
+    context = payload.get("searchable_context") or {}
+    out: set[str] = set()
+    for token in context.get("canonical_component_tokens") or []:
+        cleaned = _clean_keyword(token)
+        if cleaned:
+            out.add(cleaned.lower())
+    return frozenset(out)
 
 
 _PLAYBOOK_STEP_OUTCOMES = ("diagnostic", "preventive")
@@ -519,7 +660,9 @@ def _write_diagnostic_playbook(tx: Any, inc: OntologyIncident) -> None:
         previous = step_id
 
 
-def _write_external(cases: list[tuple[OntologyIncident, list[str]]]) -> tuple[int, int]:
+def _write_external(
+    cases: list[tuple[OntologyIncident, list[str], frozenset[str]]]
+) -> tuple[int, int]:
     """One WRITE txn per case (mirrors ingest._write); commits per case so a bad
     row can't drop the batch."""
     from typedb.driver import TransactionType
@@ -529,10 +672,10 @@ def _write_external(cases: list[tuple[OntologyIncident, list[str]]]) -> tuple[in
     settings = load_settings()
     written = failed = 0
     with open_driver(settings) as driver:
-        for inc, keywords in cases:
+        for inc, keywords, identity_tokens in cases:
             try:
                 with driver.transaction(settings.typedb_database, TransactionType.WRITE) as tx:
-                    _write_case(tx, inc, keywords)
+                    _write_case(tx, inc, keywords, identity_tokens)
                     tx.commit()
                 written += 1
             except Exception as exc:  # noqa: BLE001 - report and continue the batch
@@ -629,7 +772,9 @@ def main() -> int:
         print("ENABLE_TYPEDB is not set; nothing written.", file=sys.stderr)
         return 0
 
-    written, failed = _write_external([(inc, kw) for inc, _payload, kw in prepared])
+    written, failed = _write_external(
+        [(inc, kw, _component_identity_tokens(payload)) for inc, payload, kw in prepared]
+    )
     # keep set = every case the repo SHIPS (write success or not): a transient
     # write failure must never let the sweep delete a real case's knowledge.
     keep_ids = {inc.incident_id for inc, _payload, _kw in prepared}

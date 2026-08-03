@@ -53,3 +53,13 @@ def test_every_subtype_parent_exists() -> None:
     types = {match.group(1) for match in re.finditer(r"^entity (\w+)", schema, re.M)}
     parents = {match.group(2) for match in re.finditer(r"^entity (\w+) sub (\w+)", schema, re.M)}
     assert not (parents - types), f"sub references undeclared parent(s): {sorted(parents - types)}"
+
+
+def test_every_declared_attribute_is_owned() -> None:
+    """A declared attribute nobody `owns` can never be attached to anything —
+    it is dead on arrival (2026-08 audit: `gpu_requested` shipped this way,
+    unnoticed because nothing else in this file's checks looks at it)."""
+    schema = _schema()
+    declared = {match.group(1) for match in re.finditer(r"^attribute (\w+)", schema, re.M)}
+    owned = {match.group(1) for match in re.finditer(r"owns (\w+)", schema)}
+    assert not (declared - owned), f"attribute(s) declared but never owned: {sorted(declared - owned)}"

@@ -34,6 +34,14 @@ ROUTING_FIXTURES = {
     "observability_accuracy": ["target down scrape failed", "dashboard shows stale metrics"],
     "platform_auth_error": ["forbidden cannot list resource", "oidc invalid token"],
     "platform_lifecycle_change": ["rollingupdate revision change", "helm upgrade rollout"],
+    "platform_version_bug": [
+        "administrator prohibited modifying the hostpath policy in the ui",
+        "email notification settings missing after upgrade",
+    ],
+    "expected_known_behavior": [
+        "training workload completed after reboot",
+        "node rebooted and the job completed after reboot as expected",
+    ],
 }
 
 

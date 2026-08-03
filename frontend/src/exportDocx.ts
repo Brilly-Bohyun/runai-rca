@@ -64,7 +64,7 @@ export async function exportIncidentDocx(incident: IncidentDetail): Promise<void
     new Paragraph({ text: incident.title || incident.incident_id, heading: HeadingLevel.TITLE }),
     keyValueTable(docx, metaRows(incident)),
     new Paragraph({ text: 'Summary', heading: HeadingLevel.HEADING_1 }),
-    new Paragraph({ text: incident.analysis_summary || 'No summary captured.' }),
+    new Paragraph({ text: summaryParagraphText(incident.analysis_summary) }),
     new Paragraph({ text: 'Report', heading: HeadingLevel.HEADING_1 }),
     ...markdownToDocxElements(docx, stripAppendixEvidence(incident.analysis_detail || '')),
     new Paragraph({ text: 'Evidence', heading: HeadingLevel.HEADING_1 }),
@@ -375,25 +375,48 @@ function diagnosticConfidence(diagnostics?: Record<string, unknown>): string | u
   return undefined;
 }
 
-function artifactTable(docx: DocxModule, artifacts: Artifact[]) {
-  const rows = artifacts.length
+// The exported incident's own content is Korean by chart default (charts/
+// runai-rca/values.yaml language: ko); a Word doc with a Korean report and an
+// English "No summary captured." placeholder in the exact same slot is what
+// the product owner flagged reading the export. There is no per-incident
+// language field on the wire, so this matches whatever language the incident
+// content itself is in -- same reasoning as rcaSummaryText in
+// utils/analysisPresentation.ts for the live UI's equivalent slot.
+export function summaryParagraphText(summary?: string): string {
+  return summary || '요약이 생성되지 않았습니다.';
+}
+
+// Row-building is split out from the docx.Table construction below purely so
+// the empty-state placeholder text is unit-testable without instantiating
+// the docx library's Table/TableCell object graph.
+export function artifactRows(artifacts: Artifact[]): string[][] {
+  return artifacts.length
     ? artifacts.map((item) => [item.agent, item.status, item.summary || item.type])
-    : [['-', '-', 'No evidence cards captured.']];
-  return simpleTable(docx, ['Agent', 'Status', 'Summary'], rows, [1500, 1500, 6360]);
+    : [['-', '-', '수집된 증거 카드가 없습니다.']];
+}
+
+export function alertRows(alerts: AlertRecord[]): string[][] {
+  return alerts.length
+    ? alerts.map((item) => [item.alert_id, item.status, item.alarm_title])
+    : [['-', '-', '수집된 알림이 없습니다.']];
+}
+
+export function similarRows(items: SimilarIncident[]): string[][] {
+  return items.length
+    ? items.map((item) => [item.incident_id, `${Math.round(item.similarity * 100)}%`, item.analysis_summary || item.title])
+    : [['-', '-', '유사한 과거 인시던트가 없습니다.']];
+}
+
+function artifactTable(docx: DocxModule, artifacts: Artifact[]) {
+  return simpleTable(docx, ['Agent', 'Status', 'Summary'], artifactRows(artifacts), [1500, 1500, 6360]);
 }
 
 function alertTable(docx: DocxModule, alerts: AlertRecord[]) {
-  const rows = alerts.length
-    ? alerts.map((item) => [item.alert_id, item.status, item.alarm_title])
-    : [['-', '-', 'No alerts captured.']];
-  return simpleTable(docx, ['Alert', 'Status', 'Title'], rows, [2400, 1500, 5460]);
+  return simpleTable(docx, ['Alert', 'Status', 'Title'], alertRows(alerts), [2400, 1500, 5460]);
 }
 
 function similarTable(docx: DocxModule, items: SimilarIncident[]) {
-  const rows = items.length
-    ? items.map((item) => [item.incident_id, `${Math.round(item.similarity * 100)}%`, item.analysis_summary || item.title])
-    : [['-', '-', 'No similar incidents captured.']];
-  return simpleTable(docx, ['Incident', 'Similarity', 'Summary'], rows, [2000, 1200, 6160]);
+  return simpleTable(docx, ['Incident', 'Similarity', 'Summary'], similarRows(items), [2000, 1200, 6160]);
 }
 
 function simpleTable(docx: DocxModule, headers: string[], rows: string[][], columnWidths: number[]) {

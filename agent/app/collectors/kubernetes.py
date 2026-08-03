@@ -4104,6 +4104,18 @@ def _queue_quota_summary(queue: dict[str, object]) -> dict[str, object]:
     return summary
 
 
+def _gpu_share_quantity(value: object) -> Decimal | None:
+    """Parse a Queue status GPU resource.Quantity string, e.g. Kubernetes' own
+    canonical ``"15400m"`` (milli-GPU) serialization of a 15.4 GPU demand."""
+    text = str(value).strip() if value not in (None, "") else ""
+    if not text:
+        return None
+    try:
+        return Decimal(text[:-1]) / 1000 if text.endswith("m") else Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+
+
 async def _queue_quota_artifacts(
     agent: str,
     settings: Settings,
@@ -4114,8 +4126,11 @@ async def _queue_quota_artifacts(
     """Read the alert project's scheduler queues when its Pod cannot be scheduled.
 
     Only reached for an unschedulable target, so the quota is fetched exactly when
-    it can explain the wait. The queue is CURRENT state — it types as context, not
-    as proof about the incident window; the report prints it as configuration.
+    it can explain the wait. The queue is CURRENT state, so it only stands in for
+    the incident window while the alert is still firing -- and only when it shows
+    a live demand/allocation gap for THIS project's own queue (requested > what it
+    is actually granted right now), the same live-snapshot rule node GPU
+    exhaustion already uses. Otherwise it types as context, not proof.
     """
     if not target.project:
         return []
@@ -4126,6 +4141,7 @@ async def _queue_quota_artifacts(
     items = payload.get("items") if isinstance(payload, dict) else None
     if response.get("error") or not isinstance(items, list):
         return []
+    firing = not str(target.resolved_at or "").strip()
     artifacts = []
     for queue in items[:3]:
         if not isinstance(queue, dict):
@@ -4135,6 +4151,15 @@ async def _queue_quota_artifacts(
             continue
         if "gpu_quota" not in summary and "gpu_requested" not in summary:
             continue
+        requested = _gpu_share_quantity(summary.get("gpu_requested"))
+        allocated = _gpu_share_quantity(summary.get("gpu_allocated"))
+        deficit = bool(
+            firing
+            and time_range
+            and requested is not None
+            and allocated is not None
+            and requested > allocated
+        )
         artifacts.append(
             artifact(
                 agent=agent,
@@ -4159,17 +4184,20 @@ async def _queue_quota_artifacts(
                     "observation": {
                         "kind": "runai_queue_quota",
                         "predicate": "runai_queue_quota",
-                        # Quota is a live read of a policy object. It explains the
-                        # ceiling, never that the ceiling was hit in this window.
-                        "polarity": "unknown",
-                        "coverage": "partial",
+                        # A live policy read explains the ceiling, never that it was
+                        # hit in this window -- UNLESS the queue is currently
+                        # granting this project less than it is asking for while
+                        # the alert still fires, which is the live shortfall an
+                        # unschedulable Pod in this project is waiting on.
+                        "polarity": "present" if deficit else "unknown",
+                        "coverage": "scoped" if deficit else "partial",
                         "target_identity_verified": True,
                         "observed_entity": {
                             "kind": "queue",
                             "name": str(summary.get("queue") or ""),
                         },
-                        "observation_window": {},
-                        "snapshot_role": "current_context",
+                        "observation_window": time_range if deficit else {},
+                        "snapshot_role": "live_incident" if deficit else "current_context",
                     },
                     **summary,
                 },
@@ -6533,7 +6561,14 @@ def _runai_crd_health_artifacts(
         namespace = str(finding.get("namespace") or "").strip()
         # A cluster-scoped CRD cannot stand in for a namespaced incident target.
         # Keep it as context even when its transition falls inside the window.
-        scoped = bool(namespace and transition and start and end and start <= transition <= end)
+        # lastTransitionTime is when the condition STARTED, not when it stopped
+        # being true — findings only ever carry a CURRENTLY-bad condition (see
+        # _crd_not_ready), so one that began before the window and is still bad
+        # was bad THROUGHOUT it too. Requiring the transition to also fall after
+        # `start` rejected exactly that steady-state case. Only reject a
+        # transition that lands after the window closed — that one came later
+        # (or is a resolution artifact) and cannot explain this incident.
+        scoped = bool(namespace and transition and start and end and transition <= end)
         polarity, coverage = ("present", "scoped") if scoped else ("unknown", "partial")
         kind = str(finding.get("kind") or "Run:ai resource")
         name = str(finding.get("name") or "unknown")
@@ -6673,6 +6708,15 @@ _FOLLOWUP_WAITING = {
     "imagepullbackoff",
     "errimagepull",
     "errimageneverpull",
+    # Unlike the other image-pull reasons above, these two never transition out
+    # of "waiting" (a malformed reference or an inspect failure never starts the
+    # container, so it never restarts or terminates either). Omitting them here
+    # left root_cause_ranking._K8S_CONTAINER_REASON_FAMILY's image_pull_error
+    # entries for both unreachable: _target_waiting_fault_reason only returns a
+    # reason in this set, so container_reason was never hoisted and polarity
+    # stayed unknown/partial no matter how long the incident ran.
+    "invalidimagename",
+    "imageinspecterror",
     "createcontainerconfigerror",
     "createcontainererror",
     "runcontainererror",

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import yaml
 
+from app.knowledge import load_xid_catalog
+
 CATALOG = Path(__file__).resolve().parents[1] / "knowledge" / "xid_catalog.yaml"
 
 # Well-known GPU hardware faults, verified present in the parsed catalog.
@@ -93,3 +95,37 @@ def test_resolution_buckets_resolve_action_text() -> None:
             continue
         resolved = buckets.get(bucket, bucket)
         assert isinstance(resolved, str) and resolved.strip()
+
+
+# --- app/knowledge.py fallback reader (used when TypeDB is unavailable) ------
+#
+# Every other curated file (alerts, known issues, architecture, failure modes)
+# has a YAML fallback reader in app/knowledge.py; this catalog had none, so
+# with TypeDB off the whole 109-entry catalog -- including a fault's own name
+# -- was unreachable. These drive the real shipped file, not a fixture.
+
+
+def test_load_xid_catalog_matches_the_reference_data() -> None:
+    raw_codes = {x["code"] for x in _load()["xids"]}
+    catalog = load_xid_catalog(str(CATALOG))
+
+    assert set(catalog) == raw_codes
+    assert len(catalog) == 109
+
+    for code, desc_substr in KNOWN_XIDS.items():
+        entry = catalog[code]
+        assert entry["code"] == code
+        assert desc_substr.lower() in entry["description"].lower()
+
+    x79 = catalog[79]
+    assert x79["mnemonic"] == "ROBUST_CHANNEL_GPU_HAS_FALLEN_OFF_THE_BUS"
+    assert x79["severity"] == "fatal"
+    assert {"A100", "H100"} <= set(x79["gpu_models"])
+    raw_x79 = next(x for x in _load()["xids"] if x["code"] == 79)
+    assert x79["trigger"] == raw_x79["trigger"]
+    assert "pci express" in x79["trigger"].lower()
+
+
+def test_load_xid_catalog_degrades_on_missing_or_bad_input() -> None:
+    assert load_xid_catalog("") == {}
+    assert load_xid_catalog("knowledge/does-not-exist.yaml") == {}

@@ -288,7 +288,7 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		actions := compactCorrectionActions(req.Actions)
-		detailMarkdown := renderOperatorCorrectionDetail(req.RootCauseFamily, req.Summary, actions, detail.AnalysisRunID)
+		detailMarkdown := renderOperatorCorrectionDetail(req.RootCauseFamily, req.Summary, actions, detail.AnalysisRunID, s.language)
 		alertID := ""
 		if len(detail.Alerts) > 0 {
 			alertID = detail.Alerts[0].AlertID
@@ -507,29 +507,45 @@ func compactCorrectionActions(actions []string) []string {
 	return compact
 }
 
-func renderOperatorCorrectionDetail(family, summary string, actions []string, baseRunID string) string {
+// renderOperatorCorrectionDetail builds the analysis_detail markdown for a
+// manually-entered RCA correction -- the backend's OWN report builder,
+// separate from the agent's. It used to hardcode Korean section headings
+// unconditionally while every field label ("Root cause family:", "Operator
+// conclusion:", "No recommended actions provided.", "Base analysis run:") was
+// hardcoded English, so an English deployment got Korean headings and every
+// deployment got a mixed-language document. Match the agent's own heading
+// text (agent/app/services/pipeline.py _HEADINGS) so a correction reads the
+// same as an agent-produced report.
+func renderOperatorCorrectionDetail(family, summary string, actions []string, baseRunID string, language string) string {
+	problemHeading, causeHeading, actionsHeading := "## 1. Problem", "## 2. Root Cause", "## 3. Recommended Actions"
+	familyLabel, conclusionLabel, noActionsLine, baseRunLabel := "Root cause family", "Operator conclusion", "- No recommended actions provided.", "Base analysis run"
+	if language == "ko" {
+		problemHeading, causeHeading, actionsHeading = "## 1. 문제 (Problem)", "## 2. 원인 (Root Cause)", "## 3. 권장 조치 (Recommended Actions)"
+		familyLabel, conclusionLabel, noActionsLine, baseRunLabel =
+			"원인 계열(family)", "운영자 결론", "- 권장 조치가 제공되지 않았습니다.", "기준 분석 실행"
+	}
 	lines := []string{
-		"## 1. 문제",
+		problemHeading,
 		"",
 		summary,
 		"",
-		"## 2. 원인",
+		causeHeading,
 		"",
-		fmt.Sprintf("- Root cause family: `%s`", family),
-		fmt.Sprintf("- Operator conclusion: %s", summary),
+		fmt.Sprintf("- %s: `%s`", familyLabel, family),
+		fmt.Sprintf("- %s: %s", conclusionLabel, summary),
 		"",
-		"## 3. 권장 조치",
+		actionsHeading,
 		"",
 	}
 	if len(actions) == 0 {
-		lines = append(lines, "- No recommended actions provided.")
+		lines = append(lines, noActionsLine)
 	} else {
 		for index, action := range actions {
 			lines = append(lines, fmt.Sprintf("%d. %s", index+1, action))
 		}
 	}
 	if baseRunID != "" {
-		lines = append(lines, "", fmt.Sprintf("Base analysis run: `%s`", baseRunID))
+		lines = append(lines, "", fmt.Sprintf("%s: `%s`", baseRunLabel, baseRunID))
 	}
 	return strings.Join(lines, "\n")
 }

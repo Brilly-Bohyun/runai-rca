@@ -341,6 +341,15 @@ def _diagnostic_directive(
                 break
         if len(probes) == 8:
             break
+    # Prior trace-v3 verdicts for this family's probe templates (kg_enrichment's
+    # KGContext.probe_history), so a probe that has repeatedly come back
+    # inconclusive is visibly less attractive than an untried one. Compact
+    # aggregate counts only -- never raw execution rows -- to stay small in a
+    # token-bounded prompt.
+    history_by_template = (kg_context.get("probe_history") or {}).get(family, {})
+    for probe in probes:
+        if hist := history_by_template.get(str(probe.get("template_id") or "")):
+            probe["prior_verdict_summary"] = hist
     return {
         "source": source,
         "path": list(walked.get("path") or []),
@@ -653,10 +662,18 @@ def _component_plan_fields(
     return component, namespaces, workload, hypotheses
 
 
-def _component_narrative(entry: dict, component: str, narrative: str) -> str:
+def _component_narrative(
+    entry: dict, component: str, narrative: str, language: str = "en"
+) -> str:
+    effect = entry.get("failure_effect") or entry.get("purpose")
+    if language == "ko":
+        return (
+            f"알림 대상은 플랫폼 컴포넌트 '{component}'입니다 ({effect}). "
+            "해당 컴포넌트와 depends_on 체인을 먼저 확인하세요. " + narrative
+        )
     return (
         f"The alert target IS the platform component '{component}' "
-        f"({entry.get('failure_effect') or entry.get('purpose')}). "
+        f"({effect}). "
         "Check that component and its depends_on chain first. " + narrative
     )
 
@@ -897,8 +914,15 @@ async def plan_investigation(
             f"({matched_alert.get('severity', 'n/a')}): {matched_alert.get('trigger', '')} "
             + narrative
         )
-    if component_entry:
-        narrative = _component_narrative(component_entry, component, narrative)
+    # R3: "the alert target IS this component" is a false, self-contradicting
+    # claim when scope already resolved to a USER workload (the narrative just
+    # above says "This alert is a user workload... focus on the Run:ai
+    # scheduler") -- component identity may steer investigation order there,
+    # but must not assert an identity the scope determination itself refutes.
+    if component_entry and scope != "workload":
+        narrative = _component_narrative(
+            component_entry, component, narrative, getattr(settings, "language", "en")
+        )
     if seed_valid:
         narrative = (
             f"A seeded root-cause family selected {seed_family} as the leading hypothesis. "
@@ -1015,10 +1039,11 @@ async def _llm_refine(
     )
     if getattr(settings, "language", "en") == "ko":
         system += " Write the focus, reason, and narrative values in Korean."
+    scope = _namespace_scope(target, settings)
     user = _planner_masker(settings).mask_text(
         f"Alert: {target.alert_name}\n"
         f"Operator guidance: {guidance or '(none)'}\n"
-        f"Namespace: {target.namespace} (scope: {_namespace_scope(target, settings)})  "
+        f"Namespace: {target.namespace} (scope: {scope})  "
         f"Node: {target.node}  "
         f"Workload: {target.workload_name}  Pod: {target.pod}  "
         f"Project: {target.project}  Queue: {target.queue}\n"
@@ -1078,8 +1103,10 @@ async def _llm_refine(
         if isinstance(narrative, str) and narrative.strip()
         else plan.narrative
     )
-    if component_entry:
-        refined_narrative = _component_narrative(component_entry, component, refined_narrative)
+    if component_entry and scope != "workload":
+        refined_narrative = _component_narrative(
+            component_entry, component, refined_narrative, getattr(settings, "language", "en")
+        )
 
     return InvestigationPlan(
         focus=_plan_text(masker, focus, limit=240)

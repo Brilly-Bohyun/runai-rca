@@ -5,8 +5,8 @@ import pytest
 from app.config import load_settings
 from app.knowledge import (
     DEFAULT_FAMILIES,
-    _bundled_probe_template_ids,
     KnowledgeRegistry,
+    _bundled_probe_template_ids,
     match_failure_mode_symptoms,
     validate_runtime_knowledge,
 )
@@ -401,12 +401,12 @@ def test_family_catalog_route_exposes_selectable_output_families() -> None:
     route = next(route for route in app.routes if route.path == "/knowledge/families")
 
     assert route.endpoint() == {
-        "families": [
-            *DEFAULT_FAMILIES,
-            "platform_version_bug",
-            "expected_known_behavior",
-            "insufficient_evidence",
-        ]
+        # DEFAULT_FAMILIES already carries platform_version_bug and
+        # expected_known_behavior (they are catalog families now, not just
+        # known-issue-only labels) — appending them again would assert a
+        # duplicate the real route never produces (evaluation_families
+        # dedupes via dict.fromkeys).
+        "families": [*DEFAULT_FAMILIES, "insufficient_evidence"]
     }
 
 

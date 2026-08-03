@@ -155,8 +155,9 @@ supported root-cause claim 및 반증 없는 canonical supporting evidence가 �
 
 ### 인프라 계층 — *인제스트로 채워짐*
 `node`, `workload`, `service`, `pvc`, `control_plane_component`.
-GPU는 속성으로 모델링됩니다. `gpu_allocated`는 `node`만 소유하고,
-`gpu_requested`는 선언되어 있지만 소유 엔티티가 없습니다.
+GPU 용량은 여기서 모델링하지 않습니다. 이를 위한 속성 두 개가 선언만 되고 한 번도
+기록되지 않았습니다 — 노드가 지금 무엇을 들고 있는지는 과거 사고를 설명하지 못하므로,
+스키마가 지키지 못할 약속으로 남기지 않고 제거했습니다.
 
 ### 인시던트 / RCA 계층 — *인제스트로 채워짐*
 `alert`, `incident`(이전 RCA를 질의할 수 있도록 `analysis_summary` 소유),

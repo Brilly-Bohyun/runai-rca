@@ -161,6 +161,12 @@ DEFAULT_FAMILIES = (
     # expected disruption, not a hardware/node fault — this family names that so
     # an upgrade isn't mis-attributed to the incidental symptoms it produces.
     "platform_lifecycle_change",
+    # Documented Run:ai regressions and by-design behaviours. They were already
+    # declared by runai_known_issues.yaml and could already headline, but were
+    # missing from this closed vocabulary, so the ranker, the facet table and
+    # the evaluation flow all saw a family name they did not know.
+    "platform_version_bug",
+    "expected_known_behavior",
 )
 
 DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
@@ -317,6 +323,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "networkplugin",
             "networkpluginnotready",
             "no route to host",
+            "networkunavailable",
         ),
     ),
     "k8s_storage_error": (
@@ -393,6 +400,16 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "helm.sh/release",
         ),
     ),
+    "platform_version_bug": (
+        "loki",
+        ("loki", "kubernetes", "runai"),
+        ("administrator prohibited modifying", "notification settings missing"),
+    ),
+    "expected_known_behavior": (
+        "kubernetes",
+        ("kubernetes", "loki", "runai"),
+        ("completed after reboot",),
+    ),
 }
 
 DEFAULT_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -460,6 +477,14 @@ DEFAULT_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "platform_lifecycle_change",
         ("rollout", "upgrade", "rollingupdate", "helm", "revision", "rolloutstuck"),
     ),
+    (
+        "platform_version_bug",
+        ("administrator prohibited modifying", "notification settings missing"),
+    ),
+    (
+        "expected_known_behavior",
+        ("completed after reboot",),
+    ),
 )
 
 DEFAULT_FAMILY_REASONS = {
@@ -485,6 +510,16 @@ DEFAULT_FAMILY_REASONS = {
     "platform_lifecycle_change": (
         "alert coincides with a rollout/upgrade of the implicated component or its "
         "dependencies — expected disruption; verify the rollout/Helm release completed"
+    ),
+    "platform_version_bug": (
+        "alert/evidence matches a documented Run:ai regression in "
+        "runai_known_issues.yaml — the real fix is upgrading to the version where "
+        "it was patched, not further on-cluster RCA"
+    ),
+    "expected_known_behavior": (
+        "alert/evidence matches a documented by-design Run:ai/Kubernetes behavior "
+        'or product limitation in runai_known_issues.yaml, not a fault — the RCA '
+        'should conclude "known, expected behavior" rather than keep searching'
     ),
 }
 
@@ -670,6 +705,44 @@ def load_architecture(path: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+def load_xid_catalog(path: str) -> dict[int, dict[str, Any]]:
+    """Parse xid_catalog.yaml into {xid_code: entry}.
+
+    Each entry: {code, mnemonic, description, severity, trigger, gpu_models[]}
+    -- an NVIDIA XID's own catalog identity, not just its fix. ontology/load_xids.py
+    loads the same file into TypeDB (the runtime source of truth); this is the
+    fallback for when the graph is unavailable, so the catalog stays reachable
+    without it, the same way known issues/architecture/alerts already do.
+    """
+    if not path:
+        return {}
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for entry in raw.get("xids") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            code = int(entry.get("code"))
+        except (TypeError, ValueError):
+            continue
+        out[code] = {
+            "code": code,
+            "mnemonic": str(entry.get("mnemonic") or ""),
+            "description": str(entry.get("description") or ""),
+            "severity": str(entry.get("severity") or ""),
+            "trigger": str(entry.get("trigger") or ""),
+            "gpu_models": [
+                str(m).strip() for m in (entry.get("gpu_models") or []) if str(m).strip()
+            ],
+        }
+    return out
+
+
 def component_for_target(
     components: dict[str, dict[str, Any]], *names: str
 ) -> dict[str, Any] | None:
@@ -737,6 +810,18 @@ def localized_failure_mode_actions(symptom: dict[str, Any], language: str) -> li
     localized = symptom.get("actions_ko") if language == "ko" else None
     actions = localized or symptom.get("actions") or []
     return [str(action) for action in actions if str(action).strip()]
+
+
+def localized_failure_mode_name(symptom: dict[str, Any], language: str) -> str:
+    """A symptom's display name, preferring the curated translation when present.
+
+    Mirrors ``localized_failure_mode_actions``. Callers that render a symptom
+    name directly into otherwise-localized guidance text (general_guidance.py)
+    must use this instead of ``symptom.get("symptom")`` -- a Korean sentence
+    with a bolded English symptom name in the middle reads as a broken
+    translation, not a language-specific one."""
+    localized = symptom.get("symptom_ko") if language == "ko" else None
+    return str(localized or symptom.get("symptom") or "").strip()
 
 
 def family_label(family: str) -> str:
@@ -1199,6 +1284,9 @@ def _load_runai_known_issues(path: str) -> list[dict[str, Any]]:
                 "affected_version": str(entry.get("affected_version") or ""),
                 "fixed_version": str(entry.get("fixed_version") or ""),
                 "actions": [str(a) for a in (entry.get("actions") or [])],
+                # Source/KB citations (e.g. "NVIDIA Case 01074073"). Render
+                # site: pipeline._known_issue_cause_lines.
+                "refs": [str(r) for r in (entry.get("refs") or []) if str(r).strip()],
             }
         )
     return out
@@ -1351,12 +1439,21 @@ def _validated_package(index: int, package: Any) -> _ValidatedPackage:
         {"failure_modes", "known_issues", "probe_template_ids"} & contents.keys()
     ):
         raise ValueError(f"package {package_id} has no compiled knowledge")
-    raw_failure_modes = contents.get("failure_modes", [])
-    raw_known_issues = contents.get("known_issues", [])
-    if kind in {"failure_mode", "failure_modes"}:
-        raw_failure_modes = entries
-    elif kind in {"known_issue", "known_issues"}:
-        raw_known_issues = entries
+    # The compiled content key is authoritative: this is what the backend
+    # actually produces (knowledge.go builds compiled.failure_modes directly,
+    # see knowledge.go:631-644) and ``kind`` is set alongside it, not instead
+    # of it (knowledge.go:911). ``kind`` + top-level ``entries`` is a legacy/
+    # alternate shape for a producer that sends exactly one knowledge type per
+    # package without nesting it under the matching content key, so it may
+    # only fill in a key the content dict never populated at all — never
+    # override real compiled content just because ``kind`` also happens to be
+    # set (that clobbered every backend-emitted package with None).
+    raw_failure_modes = contents.get("failure_modes")
+    if raw_failure_modes is None:
+        raw_failure_modes = entries if kind in {"failure_mode", "failure_modes"} else []
+    raw_known_issues = contents.get("known_issues")
+    if raw_known_issues is None:
+        raw_known_issues = entries if kind in {"known_issue", "known_issues"} else []
     # Shadow is observe-only: its symptoms already stay out of matching, and its
     # probes must stay out of the PLAN for the same reason. Registering them made
     # a shadow package change what the next analysis investigates, which is
@@ -1381,8 +1478,6 @@ def _validated_package(index: int, package: Any) -> _ValidatedPackage:
 
 @lru_cache(maxsize=1)
 def _closed_family_set() -> frozenset[str]:
-    import os
-
     return frozenset(
         load_family_catalog(os.getenv("FAMILIES_FILE", "knowledge/families.yaml")).families
     )
@@ -1842,6 +1937,15 @@ def _keyword_hits(text: str, keywords: list[str]) -> tuple[list[str], bool]:
                 token_start - 1
             ].isalnum():
                 token_start -= 1
+            # Purely-numeric keywords (NVSwitch SXid codes) need a strict LEFT
+            # boundary too. The left-lenient walk above exists so a keyword that
+            # is the suffix of a concatenated alert name (KubePodImagePullBackOff)
+            # still matches; a digit run has no such compound-identifier meaning
+            # and instead collides by coincidence — a resourceVersion or port
+            # number that merely ends in the same five digits as an SXid code.
+            if keyword.isdigit() and token_start != idx:
+                start = end
+                continue
             token_end = end
             while token_end < len(text) and text[token_end].isascii() and text[
                 token_end

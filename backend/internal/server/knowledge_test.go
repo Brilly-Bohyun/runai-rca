@@ -434,6 +434,52 @@ func TestKnowledgeCandidateRequiresEligibleTraceV3AndCompilesSafePayload(t *test
 	}
 }
 
+// TestLearnedPackageCarriesLocalizedNameAndReason pins the fix for a
+// confirmed lead: the compiled payload used to omit name_ko/reason/reason_ko/
+// actions_ko entirely, so agent/app/knowledge.py's ko-preferring lookups
+// silently fell back to `mechanism` -- the ranking LLM's English-only
+// internal text -- for every learned remediation in a Korean report. A real
+// report showed the fallout: an English mechanism sentence bolded mid-Korean
+// paragraph ("이전 인시던트에서 학습된 지식(카탈로그 계열 아님): **<English text>**").
+// name_ko/reason_ko must come from the Korean analysis_summary headline
+// instead of copying the English mechanism into a "_ko" field.
+func TestLearnedPackageCarriesLocalizedNameAndReason(t *testing.T) {
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.Snapshot["analysis_summary"] = "GPU 쿼터가 소진되어 스케줄러가 배치하지 못했습니다. 세부 원인은 계속 조사 중입니다."
+	snapshot.Snapshot["case_card"].(map[string]any)["successful_actions"] = []any{"raise the project quota"}
+
+	candidate := knowledgeCandidateForSnapshot(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("expected ready candidate, got %+v", candidate)
+	}
+	symptom := candidate.Payload["compiled"].(map[string]any)["failure_modes"].([]any)[0].(map[string]any)["symptoms"].([]any)[0].(map[string]any)
+
+	if symptom["name"] != "quota exhausted" {
+		t.Fatalf("expected the English mechanism to stay under name, got %+v", symptom["name"])
+	}
+	wantKo := "GPU 쿼터가 소진되어 스케줄러가 배치하지 못했습니다"
+	if symptom["name_ko"] != wantKo {
+		t.Fatalf("expected name_ko sourced from the Korean analysis_summary headline (%q), got %+v", wantKo, symptom["name_ko"])
+	}
+	if symptom["reason"] != "quota exhausted" {
+		t.Fatalf("expected reason to be populated (was always empty before the fix), got %+v", symptom["reason"])
+	}
+	if symptom["reason_ko"] != wantKo {
+		t.Fatalf("expected reason_ko sourced the same way as name_ko, got %+v", symptom["reason_ko"])
+	}
+	actions, ok := symptom["actions"].([]string)
+	if !ok || len(actions) == 0 {
+		t.Fatalf("expected non-empty actions, got %+v", symptom["actions"])
+	}
+	actionsKo, ok := symptom["actions_ko"].([]string)
+	if !ok || len(actionsKo) != len(actions) || actionsKo[0] != actions[0] {
+		t.Fatalf("expected actions_ko to mirror actions (only one authored version exists), got actions=%+v actions_ko=%+v", actions, symptom["actions_ko"])
+	}
+	if summary, ok := candidate.Payload["summary"].(string); !ok || summary != "quota exhausted" || strings.Contains(summary, "Evidence-backed") {
+		t.Fatalf("expected summary to be the bare mechanism sentence, not a family-slug concatenation, got %+v", candidate.Payload["summary"])
+	}
+}
+
 func TestKnowledgeCandidateEligibilityFailsClosedOnPlanGates(t *testing.T) {
 	tests := []struct {
 		name   string

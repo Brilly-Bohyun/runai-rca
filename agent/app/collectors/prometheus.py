@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.collectors.base import (
     NO_EVIDENCE,
@@ -250,7 +250,11 @@ class PrometheusCollector:
         ]
         artifacts.extend(
             _prometheus_query_artifact(
-                self.name, item, target=target, time_range=time_range
+                self.name,
+                item,
+                target=target,
+                time_range=time_range,
+                control_plane_namespaces=tuple(control_plane_namespaces),
             )
             for item in query_results
         )
@@ -905,10 +909,14 @@ def _prometheus_query_artifact(
     *,
     target: AnalysisTarget,
     time_range: dict[str, str] | None,
+    control_plane_namespaces: tuple[str, ...] = (),
 ):
     """Expose one query's verified truth value as an RCA-safe evidence card."""
     observation = _prometheus_query_observation(
-        item, target=target, time_range=time_range
+        item,
+        target=target,
+        time_range=time_range,
+        control_plane_namespaces=control_plane_namespaces,
     )
     name = str(item.get("name") or "metric")
     polarity = str(observation["polarity"])
@@ -993,6 +1001,7 @@ def _prometheus_query_observation(
     *,
     time_range: dict[str, str] | None,
     target: AnalysisTarget | None = None,
+    control_plane_namespaces: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Classify output without treating a non-empty all-zero vector as a failure."""
     name = str(item.get("name") or "metric")
@@ -1030,10 +1039,27 @@ def _prometheus_query_observation(
                 polarity, coverage = "absent", "scoped"
             else:
                 polarity, coverage = "unknown", "partial"
-        elif series_count == 0 and item.get("transport") == "direct":
+        elif series_count == 0 and item.get("transport") in {"direct", "mcp"}:
             # An empty range response has no sample timestamp to inspect, but
             # remains a direct answer to the bounded query. Keep its existing
             # absence semantics; non-empty replies must prove their timing.
+            #
+            # MCP joined this branch once its own asymmetry was closed. An
+            # empty flat-fallback body used to be accepted by
+            # `_prometheus_mcp_flat_result_complete` as "complete" with NO
+            # structural check at all (unlike a non-empty one, whose items
+            # must each look like a real `value`/`values` sample), so an empty
+            # MCP result used to prove LESS than an empty direct HTTP one.
+            # `_prometheus_mcp_empty_result_verified` now requires the
+            # envelope's own explicit `status: success` -- proof the query
+            # actually ran and succeeded -- before an empty MCP result (native
+            # or flat shape) is treated as complete at all. That check runs
+            # during item construction (`_prometheus_mcp_item` /
+            # `_prometheus_mcp_tool_item`), not here: an unverified empty
+            # response is stopped there with an explicit `error` instead, so
+            # it never reaches this classifier as `series_count == 0` with no
+            # error. By the time an item gets here with `transport == "mcp"`
+            # and no error, the proof already happened.
             polarity, coverage = "absent", "scoped"
         elif series_count == 0:
             polarity, coverage = "unknown", "partial"
@@ -1092,6 +1118,7 @@ def _prometheus_query_observation(
             summary,
             target,
             has_series=bool(int(item.get("series_count") or 0)),
+            control_plane_namespaces=control_plane_namespaces,
         )
         if target_scope_verified is not True:
             # The selector we sent is not proof that the proxy returned only
@@ -1117,11 +1144,37 @@ def _prometheus_query_observation(
         observation["observed_entity"] = observed_entity
     if target_scope_verified is not None:
         observation["target_scope_verified"] = target_scope_verified
+        # investigator._attach_typed_artifacts only auto-attaches a present+
+        # scoped artifact when the collector itself confirms this specific
+        # target identity -- kubernetes.py has stamped this for a while;
+        # prometheus.py never did, so a genuinely scoped PromQL artifact could
+        # never auto-attach to a ledger hypothesis. Same boolean, same meaning.
+        observation["target_identity_verified"] = target_scope_verified
     if polarity == "present":
         evidence_window = _prometheus_evidence_window(summary, time_range)
         if evidence_window:
             observation["evidence_window"] = evidence_window
     return observation
+
+
+def _prometheus_label_values(
+    value_summary: dict[str, object], label: str
+) -> set[str] | None:
+    """Label values the response actually carried, on EVERY returned series.
+
+    ``None`` when the response cannot prove the label (missing/partial counts),
+    which callers must treat as unverified rather than as an empty match.
+    """
+    labels = value_summary.get("observed_label_values")
+    counts = value_summary.get("observed_label_series_counts")
+    series_count = int(value_summary.get("series_count_observed") or 0)
+    if not isinstance(labels, dict) or not isinstance(counts, dict) or series_count <= 0:
+        return None
+    values = labels.get(label)
+    if not isinstance(values, list) or int(counts.get(label) or 0) != series_count:
+        return None
+    observed = {str(value).strip() for value in values if str(value).strip()}
+    return observed or None
 
 
 def _prometheus_target_scope(
@@ -1130,6 +1183,7 @@ def _prometheus_target_scope(
     target: AnalysisTarget,
     *,
     has_series: bool,
+    control_plane_namespaces: tuple[str, ...] = (),
 ) -> tuple[dict[str, str] | None, bool | None]:
     """Return the explicitly queried entity only when response labels prove it.
 
@@ -1164,6 +1218,58 @@ def _prometheus_target_scope(
             return None, False
         requirements = (("project", target.project),)
         entity = {"kind": "project", "name": target.project}
+    elif name.startswith("runai_control_plane_"):
+        # These queries are built with a MULTI-namespace regex
+        # (namespace=~"runai|runai-backend"), so the single-value equality the
+        # branches above use cannot express them: the response legitimately
+        # carries several namespaces. Verification is set MEMBERSHIP — every
+        # namespace the response returned must be one this deployment
+        # configured as a control plane. The configured set is the authority,
+        # never the request text (a datasource proxy can rewrite that), so with
+        # no set supplied we stay unverified rather than guess.
+        allowed = {ns.strip() for ns in control_plane_namespaces if ns and ns.strip()}
+        if not allowed:
+            return None, False
+        entity = {"kind": "namespace", "name": ", ".join(sorted(allowed))}
+        if not has_series:
+            return entity, True
+        observed = _prometheus_label_values(value_summary, "namespace")
+        if observed is None or not observed <= allowed:
+            return None, False
+        if name == "runai_control_plane_pending":
+            # The query pins phase="Pending"; a proxy that dropped it would
+            # turn "some control-plane pod is stuck" into "any pod exists".
+            phases = _prometheus_label_values(value_summary, "phase")
+            if phases != {"Pending"}:
+                return None, False
+        return entity, True
+    elif name == "drilldown":
+        # An ad-hoc LLM drill-down PromQL query (see _tool_promql in
+        # drilldown.py) has no collector-authored, pre-scoped selector to
+        # trust. Every branch above may treat an EMPTY response as trivially
+        # scoped (`if not has_series: return entity, True`, below) because
+        # THIS module wrote those queries' selectors itself; that shortcut
+        # must NOT extend here; the LLM wrote this selector, so a
+        # namespace-wide sweep with zero rows proves nothing about the pod it
+        # claims to target. Require actual, non-empty, response-label proof
+        # every time -- the query text (the args the LLM sent) is never
+        # consulted, only what the response's own series carried.
+        if not has_series:
+            return None, False
+        if target.namespace and target.pod:
+            namespaces = _prometheus_label_values(value_summary, "namespace")
+            pods = _prometheus_label_values(value_summary, "pod")
+            if namespaces == {target.namespace} and pods == {target.pod}:
+                return {"kind": "pod", "name": target.pod}, True
+        elif target.namespace:
+            namespaces = _prometheus_label_values(value_summary, "namespace")
+            if namespaces == {target.namespace}:
+                return {"kind": "namespace", "name": target.namespace}, True
+        elif target.node:
+            nodes = _prometheus_label_values(value_summary, "node")
+            if nodes == {target.node}:
+                return {"kind": "node", "name": target.node}, True
+        return None, False
     else:
         return None, None
 
@@ -1229,6 +1335,19 @@ def _prometheus_samples_in_window(
     create or erase an incident signal.  A definite out-of-window boundary is
     enough to reject a supposedly historical query, which catches instant-query
     fallbacks and mixed range responses.
+
+    A range query is step-aligned by the query engine (Prometheus itself, or a
+    Grafana MCP proxy in front of it): the first returned sample lands on the
+    nearest step boundary at or before ``start``, not at ``start`` exactly.
+    Since ``fired_at`` carries an arbitrary wall-clock second, that leading
+    sample is almost always a few seconds early -- a property of how the
+    engine aligns buckets, not evidence the metric occurred outside the
+    incident. Tolerate exactly the step this collector itself requested (see
+    ``_prometheus_range_step``, used to build both the direct ``step=`` and
+    the MCP ``stepSeconds`` request params) before ``start``, and nothing
+    more, so a sample that is genuinely outside the window -- even by a
+    fraction of a step past ``end``, or by more than one step before
+    ``start`` -- is still rejected.
     """
     if not time_range:
         return None
@@ -1236,6 +1355,7 @@ def _prometheus_samples_in_window(
     end = parse_incident_time(time_range.get("end"))
     if start is None or end is None or end < start:
         return None
+    tolerant_start = start - timedelta(seconds=_prometheus_range_step(time_range))
     timestamps: list[datetime] = []
     series = value_summary.get("sample_windows")
     if not isinstance(series, list):
@@ -1258,7 +1378,7 @@ def _prometheus_samples_in_window(
             timestamps.append(parsed)
     if not timestamps:
         return None
-    return all(start <= timestamp <= end for timestamp in timestamps)
+    return all(tolerant_start <= timestamp <= end for timestamp in timestamps)
 
 
 def _prometheus_sample_timestamps_unparseable(value_summary: object) -> bool:
@@ -1369,32 +1489,43 @@ def _first_result_list(data: object) -> list[object]:
 def _prometheus_mcp_result(data: object) -> list[object]:
     """Return only documented/native MCP metric-vector envelopes."""
     native = _prometheus_result(data)
-    if _prometheus_result_complete(data):
+    if _prometheus_result_complete(data) and (
+        native or _prometheus_mcp_empty_result_verified(data)
+    ):
         return native
     if not isinstance(data, dict):
         return []
     for key in ("result", "data"):
         value = data.get(key)
-        if isinstance(value, list) and _prometheus_mcp_flat_result_complete(value):
+        if isinstance(value, list) and _prometheus_mcp_flat_result_complete(value, data):
             return value
     return []
 
 
 def _prometheus_mcp_response_complete(data: object) -> bool:
     if _prometheus_result_complete(data):
-        return True
+        return bool(_prometheus_result(data)) or _prometheus_mcp_empty_result_verified(data)
     if not isinstance(data, dict):
         return False
     return any(
-        isinstance(data.get(key), list) and _prometheus_mcp_flat_result_complete(data[key])
+        isinstance(data.get(key), list) and _prometheus_mcp_flat_result_complete(data[key], data)
         for key in ("result", "data")
     )
 
 
-def _prometheus_mcp_flat_result_complete(value: list[object]) -> bool:
-    """Whether a Grafana MCP flat result is explicitly a metric vector."""
+def _prometheus_mcp_flat_result_complete(value: list[object], data: object) -> bool:
+    """Whether a Grafana MCP flat result is explicitly a metric vector.
+
+    A non-empty list validates itself: every item must look like a real
+    sample (``value``/``values``). An EMPTY list has no per-item shape left to
+    check -- on its own it is indistinguishable from a misrouted tool's
+    coincidentally-empty array under the same "result"/"data" key, a
+    truncated envelope, or a query that never actually ran. Fall back to the
+    one thing an empty body can still assert about itself: see
+    ``_prometheus_mcp_empty_result_verified``.
+    """
     if not value:
-        return True
+        return _prometheus_mcp_empty_result_verified(data)
     return all(
         isinstance(item, dict)
         and (
@@ -1403,6 +1534,25 @@ def _prometheus_mcp_flat_result_complete(value: list[object]) -> bool:
         )
         for item in value
     )
+
+
+def _prometheus_mcp_empty_result_verified(data: object) -> bool:
+    """Whether an EMPTY MCP result is a well-formed, complete, successful answer.
+
+    Direct transport requires ``status: success`` before trusting an empty
+    ``data.result`` at all (``require_success_status=True`` in
+    ``_collect_prometheus_direct``/``prom_query``, enforced via
+    ``_prometheus_api_error`` upstream of ``_prometheus_result_complete``).
+    MCP does not enforce that upstream -- ``_prometheus_api_error`` is called
+    there with ``require_success_status=False`` so a missing/"unknown" status
+    is tolerated, because the flat grafana-mcp fallback shape can legitimately
+    omit it on a genuine NON-empty answer (the per-item value/values shape is
+    proof enough there). An EMPTY result has no such per-item shape to lean
+    on, so it must not inherit that leniency: require explicitly what
+    "unknown" was letting slide, for both the native and flat envelope shapes
+    -- the envelope itself must assert the query ran and succeeded.
+    """
+    return isinstance(data, dict) and _prometheus_status(data) == "success"
 
 
 # --- Cross-collector deterministic follow-up -----------------------------------

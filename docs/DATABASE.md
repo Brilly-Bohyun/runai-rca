@@ -159,8 +159,9 @@ Schema: `agent/ontology/schema.tql` (TypeQL 3.x). Three layers.
 
 ### Infra layer — *populated by ingestion*
 `node`, `workload`, `service`, `pvc`, `control_plane_component`.
-GPU is modeled as attributes: `gpu_allocated` is owned only by `node`, while
-`gpu_requested` is declared but has no owning entity.
+GPU capacity is not modeled here. Two attributes for it were declared and never
+written — a reading of what a node holds right now cannot explain a past incident —
+so they were removed rather than left as a promise the schema does not keep.
 
 ### Incident / RCA layer — *populated by ingestion*
 `alert`, `incident` (owns `analysis_summary` so prior RCA is queryable),

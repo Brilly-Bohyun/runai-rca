@@ -82,6 +82,17 @@ def _ensure_xid_trigger(tx: Any, code: int, trigger: str) -> None:
     ).resolve()
 
 
+def _ensure_xid_linkage_note(tx: Any, code: int, note: str) -> None:
+    if not note or _exists(
+        tx, f'$x isa xid_error, has xid_code {code}, has linkage_note "{esc(note)}";'
+    ):
+        return
+    tx.query(
+        f'match $x isa xid_error, has xid_code {code}; '
+        f'insert $x has linkage_note "{esc(note)}";'
+    ).resolve()
+
+
 def _ensure_action(tx: Any, statement: str) -> None:
     if not _exists(tx, f'$x isa action, has statement "{esc(statement)}";'):
         tx.query(f'insert $x isa action, has statement "{esc(statement)}";').resolve()
@@ -181,6 +192,7 @@ def main() -> int:
                     str(entry.get("severity", "")),
                 )
                 _ensure_xid_trigger(tx, code, str(entry.get("trigger", "")).strip())
+                _ensure_xid_linkage_note(tx, code, str(entry.get("linkage_note", "")).strip())
                 _relate_indicates(tx, code)
                 n_xids += 1
                 for model in entry.get("gpu_models", []) or []:

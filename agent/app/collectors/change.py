@@ -231,6 +231,7 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
         observation_window=observation_window,
         historical_window=historical_window,
         causal_window=causal_evidence_time_range(target) if historical_window else None,
+        target=target,
     )
     return {
         "query": (
@@ -322,6 +323,7 @@ def _change_observation(
     observation_window: dict[str, str],
     historical_window: bool,
     causal_window: dict[str, str] | None = None,
+    target: AnalysisTarget | None = None,
 ) -> dict:
     """Project only safe change metadata; never copy Event or Secret bodies."""
     safe_changes = [_safe_change_metadata(change, namespace) for change in changes]
@@ -334,6 +336,16 @@ def _change_observation(
     )
     timed_changes = bool(evidence_window)
     invalid_timing = bool(safe_changes) and historical_window and not timed_changes
+    # _collector_change_target_scope's "no changes" branch trusts an EMPTY
+    # sweep as proof only because the main collector's own query is always
+    # comprehensive (every source, unfiltered) for the target. This ad-hoc
+    # tool lets the LLM narrow `source` to one kind and add an arbitrary
+    # `component` filter (see change_query above), so an empty result here
+    # proves nothing about the target's own identity -- only ask the scope
+    # function when it has actual records to check name/kind/namespace on.
+    target_scope_verified: bool | None = None
+    if target is not None and changes:
+        _, target_scope_verified = _collector_change_target_scope(changes, target)
     return {
         "schema_version": "v1",
         "kind": "change_query",
@@ -376,6 +388,22 @@ def _change_observation(
         "truncated_count": truncated,
         "body_included": False,
         "historical_window": historical_window,
+        **(
+            {
+                "target_scope_verified": target_scope_verified,
+                # investigator._attach_typed_artifacts only auto-attaches a
+                # present+scoped artifact when the collector itself confirms
+                # this specific target identity -- _collector_change_observation
+                # (the main collection path) has stamped this for a while;
+                # this ad-hoc drill-down tool builder never did, so a
+                # genuinely scoped change_query artifact could never
+                # auto-attach to a ledger hypothesis. Same boolean, same
+                # meaning.
+                "target_identity_verified": target_scope_verified,
+            }
+            if target_scope_verified is not None
+            else {}
+        ),
     }
 
 
@@ -1239,6 +1267,12 @@ def _collector_change_observation(
         observation["observed_entity"] = observed_entity
     if target_scope_verified is not None:
         observation["target_scope_verified"] = target_scope_verified
+        # investigator._attach_typed_artifacts only auto-attaches a present+
+        # scoped artifact when the collector itself confirms this specific
+        # target identity -- kubernetes.py has stamped this for a while;
+        # change.py never did, so a genuinely scoped change artifact could
+        # never auto-attach to a ledger hypothesis. Same boolean, same meaning.
+        observation["target_identity_verified"] = target_scope_verified
     return observation
 
 
