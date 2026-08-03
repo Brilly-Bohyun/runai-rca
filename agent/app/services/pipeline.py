@@ -21,10 +21,8 @@ from app.collectors.base import (
     CollectorResult,
     causal_evidence_time_range,
     condition_observations,
-    kubernetes_salient_markers,
     parse_incident_time,
     resolve_target,
-    salient_markers,
 )
 from app.collectors.base import artifact as make_artifact
 from app.collectors.registry import build_collectors, unknown_collector_names
@@ -115,16 +113,6 @@ _K8S_CONDITION_TYPES = frozenset(
         "ready",
     }
 )
-_SYNTHESIS_ASSERTION_CONDITIONAL = re.compile(
-    r"\b(?:check|verify|whether|hypothesis|possible|possibly|could|may|might|candidate|inconclusive)\b|"
-    r"(?:확인\s*(?:필요|대상|예정)|확인(?:하|해|해야)|점검|검증|검토|조사|미확보|미확인|불확실|여부|가설|가능성|의심|후보)",
-    re.IGNORECASE,
-)
-_SYNTHESIS_PRIVATE_FACT_CITATION = re.compile(
-    r"(?<![A-Za-z0-9_-])F-[0-9a-f]{8,64}(?![A-Za-z0-9_-])", re.IGNORECASE
-)
-_SYNTHESIS_PUBLIC_EVIDENCE_CITATION = re.compile(r"\[(E\d+)\]")
-
 _DISPOSITIVE_TYPED_REASONS: dict[str, frozenset[str]] = {
     "image_pull_error": frozenset(
         {"ImagePullBackOff", "ErrImagePull", "InvalidImageName", "ErrImageNeverPull"}
@@ -4193,197 +4181,6 @@ def _compact_synthesis_value(value: object, *, limit: int) -> str:
             text = str(value)
     return " ".join(text.split())[:limit]
 
-
-_SYNTHESIS_SIGNAL_TERMS: dict[str, tuple[str, ...]] = {
-    "networkunavailable": ("networkunavailable",),
-    "memorypressure": ("memorypressure",),
-    "diskpressure": ("diskpressure",),
-    "pidpressure": ("pidpressure",),
-    "preemption": ("preempt", "preemption", "선점", "프리엠션"),
-    "oomkilled": ("oomkill", "out of memory"),
-    "restart_loop": (
-        "crashloopbackoff",
-        "restart loop",
-        "restarting loop",
-        "재시작 루프",
-    ),
-    "unschedulable": ("unschedulable", "failedscheduling", "스케줄링 불가"),
-}
-
-
-def _synthesis_supported_signal_groups(
-    request: AlertAnalysisRequest,
-    results: list[CollectorResult],
-    evidence_eligibility: Mapping[str, object] | None,
-) -> set[str]:
-    """Return problem-signal groups backed by alert/support observations."""
-    markers = list(salient_markers(_alert_text(request), limit=20))
-    for result in results:
-        for artifact in result.artifacts:
-            payload = _synthesis_artifact_payload(
-                artifact, evidence_eligibility=evidence_eligibility
-            )
-            if payload.get("evidence_role") != "support":
-                continue
-            for check in payload.get("condition_checks") or []:
-                if isinstance(check, dict) and check.get("active") is True:
-                    markers.append(str(check.get("condition") or ""))
-            raw_result = getattr(artifact, "result", None)
-            extractor = (
-                kubernetes_salient_markers
-                if str(getattr(artifact, "agent", "") or "") == "kubernetes"
-                else salient_markers
-            )
-            markers.extend(extractor(raw_result, limit=20))
-
-    normalized = " ".join(markers).casefold()
-    supported: set[str] = set()
-    for group, terms in _SYNTHESIS_SIGNAL_TERMS.items():
-        if any(term.casefold() in normalized for term in terms):
-            supported.add(group)
-    return supported
-
-
-def _synthesis_claim_fragments(text: str) -> list[str]:
-    return [
-        fragment.strip()
-        for fragment in re.split(r"(?<=[.!?。！？])|[\r\n]+", text or "")
-        if fragment.strip()
-    ]
-
-
-_SYNTHESIS_CLAUSE_BREAK = re.compile(
-    r"[.;!?。！？\r\n]+|\b(?:but|however|though|yet)\b|(?:하지만|반면|지만)",
-    re.IGNORECASE,
-)
-
-
-def _synthesis_signal_mentions(
-    fragment: str, terms: tuple[str, ...]
-) -> list[tuple[int, int]]:
-    """Return every case-insensitive signal span in a report fragment."""
-    lowered = fragment.casefold()
-    spans: list[tuple[int, int]] = []
-    for term in terms:
-        needle = term.casefold()
-        start = 0
-        while needle:
-            index = lowered.find(needle, start)
-            if index < 0:
-                break
-            end = index + len(needle)
-            spans.append((index, end))
-            start = end
-    return spans
-
-
-_SYNTHESIS_ENUM_LEFT = frozenset("/,、(")
-_SYNTHESIS_ENUM_RIGHT = frozenset("/,、)")
-_SYNTHESIS_ENUM_SEPARATOR = frozenset("/,、")
-
-
-def _synthesis_mention_in_enumeration(fragment: str, start: int, end: int) -> bool:
-    """Whether the signal term is one item of a slash/comma enumeration.
-
-    A condition named inside a list to inspect — ``(MemoryPressure/DiskPressure/
-    NetworkUnavailable)`` or ``(quota/gang/preempt/reclaim)`` — is not an
-    assertion that the condition occurred, so it must not reject the synthesis.
-    """
-    left = start - 1
-    while left >= 0 and fragment[left].isspace():
-        left -= 1
-    right = end
-    length = len(fragment)
-    while right < length and fragment[right].isspace():
-        right += 1
-    left_char = fragment[left] if left >= 0 else ""
-    right_char = fragment[right] if right < length else ""
-    if left_char in _SYNTHESIS_ENUM_LEFT and right_char in _SYNTHESIS_ENUM_RIGHT:
-        return left_char in _SYNTHESIS_ENUM_SEPARATOR or right_char in _SYNTHESIS_ENUM_SEPARATOR
-    return False
-
-
-def _synthesis_mention_in_code_span(fragment: str, start: int) -> bool:
-    """Whether the mention falls inside a backtick-delimited command/code span.
-
-    A signal word inside a suggested probe (``kubectl ... preempt``) is a thing
-    to look for, not a claim that it happened.
-    """
-    return fragment.count("`", 0, start) % 2 == 1
-
-
-def _synthesis_fragment_asserts_signal(fragment: str, start: int, end: int) -> bool:
-    """Whether one signal mention is asserted rather than negated or conditional.
-
-    Polarity must be evaluated around the specific signal. A whole-fragment
-    check reverses Korean statements such as ``MemoryPressure가 아닌 ...`` and
-    can also let a different positive signal hide behind an unrelated negation.
-    An enumeration item, or a token inside a probe command, names a thing to
-    inspect rather than a condition claimed to have occurred.
-    """
-    lowered = fragment.casefold()
-    if _keyword_negated(lowered, start, end):
-        return False
-    if _synthesis_mention_in_enumeration(fragment, start, end):
-        return False
-    if _synthesis_mention_in_code_span(fragment, start):
-        return False
-
-    prefix = fragment[:start]
-    suffix = fragment[end:]
-    local_prefix = _SYNTHESIS_CLAUSE_BREAK.split(prefix)[-1]
-    local_suffix = _SYNTHESIS_CLAUSE_BREAK.split(suffix, maxsplit=1)[0]
-    local_clause = f"{local_prefix}{fragment[start:end]}{local_suffix}"
-    if _SYNTHESIS_ASSERTION_CONDITIONAL.search(local_clause):
-        return False
-    return True
-
-
-def _synthesis_semantic_conflict(
-    summary: str,
-    detail: str,
-    *,
-    request: AlertAnalysisRequest,
-    results: list[CollectorResult],
-    evidence_eligibility: Mapping[str, object] | None,
-) -> str:
-    """Reject free-form prose that reverses typed evidence truth.
-
-    This is deliberately a rejection guard, not a prose rewriter.  On conflict
-    the pipeline keeps its deterministic report rather than trying to repair a
-    causal statement with another unconstrained model call.
-    """
-    text = f"{summary}\n{detail}"
-    if _SYNTHESIS_PRIVATE_FACT_CITATION.search(text):
-        return "private F-* evidence citation escaped into the report"
-
-    known_evidence_ids = {
-        str(getattr(artifact, "evidence_id", "") or "")
-        for result in results
-        for artifact in result.artifacts
-        if str(getattr(artifact, "evidence_id", "") or "")
-    }
-    unknown_citations = sorted(
-        {
-            match.group(1)
-            for match in _SYNTHESIS_PUBLIC_EVIDENCE_CITATION.finditer(text)
-            if match.group(1) not in known_evidence_ids
-        }
-    )
-    if unknown_citations:
-        return f"unknown evidence citation(s): {', '.join(unknown_citations)}"
-
-    supported = _synthesis_supported_signal_groups(
-        request, results, evidence_eligibility
-    )
-    for fragment in _synthesis_claim_fragments(text):
-        for group, terms in _SYNTHESIS_SIGNAL_TERMS.items():
-            if group in supported:
-                continue
-            for start, end in _synthesis_signal_mentions(fragment, terms):
-                if _synthesis_fragment_asserts_signal(fragment, start, end):
-                    return f"unsupported positive {group} claim: {fragment[:180]}"
-    return ""
 
 
 def _quality_from(results: list[CollectorResult]) -> str:
