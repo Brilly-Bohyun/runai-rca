@@ -1859,7 +1859,10 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     )
     state.xid_codes = _xid_codes_from_results(
         state.results,
-        _alert_text(request),
+        # An XID code found here is dispositive (_promote_xid_cause forces the
+        # score to 10.0 with no further gate), so this must be the narrow text
+        # — an operator musing "xid 79?" must not mint a hardware-fault cause.
+        _alert_signature_text(request),
         eligible_support_ids=eligible_support_ids,
     )
     # TypeDB is the runtime source of truth. The version-controlled YAML matcher
@@ -1955,8 +1958,12 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     # informs, never headlines: promotion below stays exact-signature-only (a
     # statistical hit is not "a specific signature that names the cause family"
     # — e.g. NodeDiskPressure's disk+pressure tokens must not promote a
-    # database-disk known issue), while the playbook/actions/verify surfaces
-    # use fuzzy matches as candidates the LLM verify pass can still refute.
+    # database-disk known issue). ``state.alert_fuzzy`` only ever reaches the
+    # self-check verify pass below (synthesize_stage), which can only REMOVE a
+    # candidate, never add one, so the permissive text is safe there. The
+    # actions/playbook/knowledge-base surfaces that can RENDER a fuzzy match's
+    # actions into the report recompute their own fuzzy text from
+    # ``_alert_signature_text`` instead — see that function's docstring.
     state.alert_fuzzy = _alert_text(request)
     known_issue_matches = match_runai_known_issues(state.known_issues, state.observed)
     symptom_matches = _gate_lifecycle_symptoms(
@@ -2559,7 +2566,11 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         if ki_matches:
             verify_known_kwargs: dict[str, object] = {}
             if _accepts_keyword(verify_known_issues, "declared_alert"):
-                verify_known_kwargs["declared_alert"] = _alert_text(request)
+                # The self-check prompt tells the LLM "an explicit positive
+                # signature [in the declared alert] may support a match" — the
+                # narrow text, or operator/runbook prose could talk it out of
+                # refuting a match that should never have been made.
+                verify_known_kwargs["declared_alert"] = _alert_signature_text(request)
             refuted = await verify_known_issues(
                 settings,
                 ki_matches,
@@ -2592,7 +2603,9 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 "subject": "matched symptom or GPU XID"
             }
             if _accepts_keyword(verify_matches, "declared_alert"):
-                verify_match_kwargs["declared_alert"] = _alert_text(request)
+                # Same reasoning as verify_known_issues above: this text can
+                # talk the LLM out of refuting a match, so it must be narrow.
+                verify_match_kwargs["declared_alert"] = _alert_signature_text(request)
             refuted = await verify_matches(
                 settings,
                 ev_candidates,
@@ -3589,7 +3602,9 @@ async def _reanalyze_once(
             candidates,
             _xid_codes_from_results(
                 merged_results,
-                _alert_text(state.request),
+                # Same reasoning as rank_stage: XID promotion is dispositive and
+                # ungated, so the re-rank must use the narrow (signature) text too.
+                _alert_signature_text(state.request),
                 eligible_support_ids=eligible_support_ids,
             ),
             known_issue_matches,
@@ -4705,8 +4720,12 @@ def _detail_from(
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
     lines.extend(
+        # This section headlines "Recognised known issue: **X**" as settled fact
+        # (not a hedged suggestion), so its fuzzy_query must be the narrow text —
+        # match_runai_known_issues ignores fuzzy_query today, but this call site
+        # should not depend on that staying true to remain safe.
         _known_issue_cause_lines(
-            known_issues, observed_text, language, _alert_text(request)
+            known_issues, observed_text, language, _alert_signature_text(request)
         )
     )
     supporting = _supporting_evidence(results, eligible_support_ids=eligible_support_ids)
@@ -4763,11 +4782,14 @@ def _detail_from(
     lines.extend(["", h["appendix"]])
     lines.extend(_investigation_plan_lines(plan))
     lines.extend(
+        # fuzzy_query here reaches match_failure_mode_symptoms's BM25 recall and
+        # can render "Matched symptom **X**; known fixes ..." unconditionally —
+        # the narrow text, not investigation-order guidance.
         _knowledge_base_lines(
             kg_context,
             root_cause_candidates,
             observed_text,
-            _alert_text(request),
+            _alert_signature_text(request),
             masker,
             allow_remediation=allow_cause_specific_actions,
         )
@@ -4807,13 +4829,16 @@ def _detail_from(
     lines.extend(_affected_pods_lines(request, language))
     lines.extend(["", "### Troubleshooting Playbook", ""])
     lines.extend(
+        # Same reasoning as _knowledge_base_lines above: a fuzzy hit here can
+        # become the headline playbook entry (including the exclusive_actions
+        # short-circuit), so it must not be sourced from operator/runbook prose.
         _playbook_lines(
             root_cause_candidates,
             observed_text,
             failure_modes or {},
             troubleshooting_cases,
             known_issues or [],
-            _alert_text(request),
+            _alert_signature_text(request),
             components,
             masker,
             component=getattr(plan, "component", "") if plan is not None else "",
@@ -5292,18 +5317,21 @@ def _promote_signature_cause(
     A non-catalog family additionally requires the keyword to appear in
     ``evidence_text`` (observed EVIDENCE, no alert text) -- an unvalidated
     label needs more than the alert's own word for it (S7's non-catalog case,
-    unchanged). A CATALOG family does not: ``_alert_text`` is a first-class
-    signature source everywhere else in this pipeline (its own docstring: "it
-    often carries the signature ... even when every collector comes back
-    empty"), proven by dozens of tests where an alert's summary/description
-    alone must reach the correct catalog family with zero collector evidence
-    -- gating catalog promotion on non-alert evidence would kill exactly the
-    promotions S7's own guardrail protects ("must not kill a promotion whose
-    keyword IS in the evidence" -- alert text, by this codebase's own
-    definition, counts). The real fix for S7's confirmed harm (a non-evidence
-    alert FIELD like runbook_url contaminating the match) is S1, which keeps
-    that text out of ``_alert_text``/``state.observed`` in the first place;
-    S2 additionally stops a support-less promotion (catalog or not) from
+    unchanged). A CATALOG family does not: the alert's own text is a
+    first-class signature source everywhere else in this pipeline
+    (``_alert_signature_text``'s docstring: "it often carries the signature
+    ... even when every collector comes back empty"), proven by dozens of
+    tests where an alert's summary/description alone must reach the correct
+    catalog family with zero collector evidence -- gating catalog promotion
+    on non-alert evidence would kill exactly the promotions S7's own
+    guardrail protects ("must not kill a promotion whose keyword IS in the
+    evidence" -- alert text, by this codebase's own definition, counts). The
+    real fix for S7's confirmed harm (a non-evidence alert FIELD like
+    runbook_url contaminating the match) is S1, which keeps that text out of
+    ``state.observed`` in the first place by building it from
+    ``_alert_signature_text`` rather than the permissive ``_alert_text``
+    (see that pair's docstrings for the guidance-vs-promotion boundary); S2
+    additionally stops a support-less promotion (catalog or not) from
     outranking a stronger evidence-backed one.
 
     A promotion may also not displace a candidate that already scores higher
@@ -5991,7 +6019,11 @@ def _numbered_actions(
         allow_cause_specific_actions = allow_graph_remediation
     ordered: list[str] = []
     specific_actions = 0
-    fuzzy = _alert_text(request)
+    # NOT ``_alert_text``: this fuzzy-matches a symptom whose actions get
+    # rendered straight into the numbered list below (including the
+    # exclusive_actions short-circuit) with no LLM verify gate in front of it
+    # here, so it must be the narrow, non-evidence-field-free text.
+    fuzzy = _alert_signature_text(request)
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
     symptom_matches = _actionable_failure_mode_matches(
@@ -7550,31 +7582,23 @@ def _catalog_only_knowledge(
 
 # A link says where to READ about an alert; it never observes one. Every
 # kube-prometheus-stack rule ships runbook_url=https://runbooks.prometheus-
-# operator.dev/..., so leaving it in made the vendor's own documentation host a
-# matchable signature: INC-…-000001 headlined observability_accuracy ("this
-# alert is a false alarm", 7.0/medium, zero supporting evidence) on the single
-# keyword "prometheus-operator" taken from that URL. Same rule as the ranker's
-# METADATA_VALUE_KEYS — what we ASKED or where to look is not what came back.
-# Kept as a secondary strip for a link embedded INSIDE an otherwise-evidence
-# value; the primary gate is now ``_ALERT_NON_EVIDENCE_FIELD_RE`` (S1) — the
-# same field filter ``_asserted_alert_texts`` already applies, so a whole
-# non-evidence field (runbook_url, or the operator's own chat speculation in
-# operator_prompt) is dropped outright instead of merely having its URL cut.
+# operator.dev/..., so leaving a raw link in made the vendor's own
+# documentation host a matchable signature: INC-…-000001 headlined
+# observability_accuracy ("this alert is a false alarm", 7.0/medium, zero
+# supporting evidence) on the single keyword "prometheus-operator" taken from
+# that URL. Same rule as the ranker's METADATA_VALUE_KEYS — what we ASKED or
+# where to look is not what came back. A URL is never a signal either way
+# (guidance has no use for a doc host name any more than the matcher does), so
+# both ``_alert_text`` and ``_alert_signature_text`` below strip it out of
+# annotation prose while keeping the human-readable text around it.
 _ALERT_LINK_RE = re.compile(r"https?://\S+", re.I)
 
 
-def _alert_text(request: AlertAnalysisRequest) -> str:
-    """The alert's own labels+annotations text — it often carries the signature
-    (e.g. 'XID 79 ... GPU has fallen off the bus') even when every collector
-    comes back empty.  Non-evidence fields (runbook/operator_prompt/query/...,
-    see ``_ALERT_NON_EVIDENCE_FIELD_RE``) are excluded entirely: operator
-    guidance may steer investigation order but must never promote a cause."""
-    alert = request.alert
-    labels = {
-        key: value
-        for key, value in (alert.labels or {}).items()
-        if not _ALERT_NON_EVIDENCE_FIELD_RE.search(str(key))
-    }
+def _compose_alert_text(labels: dict[str, Any], annotations: dict[str, Any]) -> str:
+    """Shared assembly for ``_alert_text``/``_alert_signature_text``: recompose
+    Boolean condition/status label pairs, then append the remaining label and
+    annotation values (links stripped out of the latter). Callers choose what
+    goes IN via ``labels``/``annotations`` — this function only renders it."""
     # Prometheus/Kubernetes alerts commonly encode a Boolean condition across
     # two independent labels (for example condition=DiskPressure,status=false).
     # Flattening mapping values preserves sender insertion order, so a false
@@ -7609,11 +7633,51 @@ def _alert_text(request: AlertAnalysisRequest) -> str:
     )
     parts.extend(
         stripped
-        for key, value in (alert.annotations or {}).items()
-        if not _ALERT_NON_EVIDENCE_FIELD_RE.search(str(key))
-        and (stripped := _ALERT_LINK_RE.sub(" ", str(value)).strip())
+        for value in annotations.values()
+        if (stripped := _ALERT_LINK_RE.sub(" ", str(value)).strip())
     )
     return " ".join(parts)
+
+
+def _alert_text(request: AlertAnalysisRequest) -> str:
+    """The alert's own labels+annotations text, permissively — every field
+    (including ``runbook_url`` and the operator's own ``operator_prompt``
+    speculation) is available here. This feeds investigation ORDER: component
+    identification, fuzzy recall, and the non-diagnostic guidance block, where
+    the operator saying "check CoreDNS" should steer what gets shown. It must
+    never be used as the haystack a signature/symptom match can be PROMOTED
+    from — that is ``_alert_signature_text``, the deliberately narrower
+    sibling below. (A bare link is still stripped out of annotation prose: a
+    URL is not useful investigation-order signal either, and dropping it keeps
+    the human-readable text around it.)"""
+    alert = request.alert
+    return _compose_alert_text(alert.labels or {}, alert.annotations or {})
+
+
+def _alert_signature_text(request: AlertAnalysisRequest) -> str:
+    """The alert's own text, narrowed to what may support a signature/symptom
+    match — it often carries the signature (e.g. 'XID 79 ... GPU has fallen
+    off the bus') even when every collector comes back empty. Non-evidence
+    fields (runbook/operator_prompt/query/..., see
+    ``_ALERT_NON_EVIDENCE_FIELD_RE``) are excluded entirely: operator guidance
+    may steer investigation order (``_alert_text``) but must never promote a
+    cause. Feeds ``_observed_text``'s alert branch (state.observed, XID
+    extraction, self-check's declared-alert, and the actions/playbook/
+    knowledge-base fuzzy recall that can render a matched symptom's actions
+    into the report) — every consumer that can turn a match into rendered
+    output, as opposed to a conditional suggestion."""
+    alert = request.alert
+    labels = {
+        key: value
+        for key, value in (alert.labels or {}).items()
+        if not _ALERT_NON_EVIDENCE_FIELD_RE.search(str(key))
+    }
+    annotations = {
+        key: value
+        for key, value in (alert.annotations or {}).items()
+        if not _ALERT_NON_EVIDENCE_FIELD_RE.search(str(key))
+    }
+    return _compose_alert_text(labels, annotations)
 
 
 def _observed_text(
@@ -7628,8 +7692,10 @@ def _observed_text(
     if request is not None:
         # The alert message itself is evidence: signature matching (symptoms, known
         # issues, XIDs) must see it, or an alert whose collectors all came back
-        # empty matches NOTHING even though its own text names the fault.
-        parts.append(_alert_text(request))
+        # empty matches NOTHING even though its own text names the fault. Use the
+        # NARROW alert text here (not ``_alert_text``): this haystack feeds
+        # ``state.observed``, which promotes causes — see ``_alert_signature_text``.
+        parts.append(_alert_signature_text(request))
     for result in results:
         if not _collector_is_evidence(result):
             continue
