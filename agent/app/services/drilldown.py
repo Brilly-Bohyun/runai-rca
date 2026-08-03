@@ -1716,7 +1716,7 @@ def _implicated_architecture(
     runai_architecture.yaml, no knowledge-graph round-trip. Empty for pure
     user-workload incidents (correct: a user's training job is not a platform
     component)."""
-    from app.knowledge import dependency_path, load_architecture
+    from app.knowledge import dependency_path, dependency_path_text, load_architecture
 
     components = load_architecture(getattr(settings, "architecture_file", ""))
     if not components:
@@ -1750,7 +1750,9 @@ def _implicated_architecture(
     for name in implicated[:3]:
         chain = dependency_path(components, name)
         if len(chain) > 1:
-            lines.append(f"{name} check order: " + " → ".join(chain))
+            lines.append(
+                f"{name} check order: " + dependency_path_text(components, chain)
+            )
         for dep in chain[:4]:
             if dep in seen:
                 continue

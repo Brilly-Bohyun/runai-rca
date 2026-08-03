@@ -776,9 +776,26 @@ def component_action_lines(components: dict[str, dict[str, Any]], name: str) -> 
         lines.append(f"({name}) {effect}")
     chain = dependency_path(components, name)
     if len(chain) > 1:
-        lines.append(f"Check order for {name}: " + " → ".join(chain))
+        lines.append(f"Check order for {name}: " + dependency_path_text(components, chain))
     lines.extend(str(check) for check in (entry.get("checks") or [])[:3])
     return lines
+
+
+def dependency_path_text(components: dict[str, dict[str, Any]], path: list[str]) -> str:
+    """Join a check order, claiming a chain only when the graph proves one.
+
+    ``dependency_path`` flattens a BFS, so consecutive entries are usually
+    SIBLINGS rather than links. "→" reads as "depends on", and using it on a
+    flattened level order invents edges: ``binder → runai-scheduler-default →
+    runai-container-toolkit`` says the scheduler needs the toolkit when both
+    are direct dependencies of binder. 18 of the 47 rendered check orders were
+    that shape. Keep the arrow for a real spine; otherwise list the components.
+    """
+    spine = all(
+        path[index + 1] in ((components.get(path[index]) or {}).get("depends_on") or [])
+        for index in range(len(path) - 1)
+    )
+    return (" → " if spine else ", ").join(path)
 
 
 def dependency_path(
@@ -821,7 +838,7 @@ def component_check_lines(components: dict[str, dict[str, Any]], name: str) -> l
         lines.append(f"  - Component `{name}`: {effect}")
     chain = dependency_path(components, name)
     if len(chain) > 1:
-        lines.append("  - Check order: " + " → ".join(chain))
+        lines.append("  - Check order: " + dependency_path_text(components, chain))
     lines.extend(f"  - `{check}`" for check in (entry.get("checks") or [])[:3])
     return lines
 
