@@ -41,7 +41,9 @@ while IFS= read -r name; do
     [ -n "$hit" ] || continue
     file=${hit%%:*}
     if ! allowed "$file:$name" "$name"; then
-      echo "REMOVED ONTOLOGY NAME: $hit"
+      # Name it explicitly: a hit line often backticks several names, and the
+      # offending one is rarely the first.
+      echo "REMOVED ONTOLOGY NAME '$name': $hit"
       status=1
     fi
   done < <(find docs -type f -name '*.md' -exec grep -n -F "$needle" {} + || true)
