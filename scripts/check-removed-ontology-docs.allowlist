@@ -1,2 +1,8 @@
 # Deliberate historical mentions of removed ontology names.
 # Entries are either `name` or `path:name`; blank lines and # comments are ignored.
+
+# knowledge_events is a Postgres table (backend/internal/server/store_postgres.go),
+# documented as such in DATABASE.md's relational section. It shares a name with an
+# ontology entity that was removed earlier; the docs are about the table, not the
+# entity, so the mention is correct.
+knowledge_events
