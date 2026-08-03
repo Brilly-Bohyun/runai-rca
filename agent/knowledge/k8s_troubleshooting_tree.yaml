@@ -419,6 +419,12 @@ nodes:
           any: [rollout, rollingupdate, "helm upgrade", "revision change", "container creating"]
         next: rollout_or_lifecycle
       - match:
+          any: ["administrator prohibited modifying", "notification settings missing"]
+        next: known_platform_version_bug
+      - match:
+          any: ["completed after reboot"]
+        next: known_expected_behavior
+      - match:
           always: true
         next: insufficient_k8s_evidence
 
@@ -2171,3 +2177,70 @@ nodes:
       confidence: "high only when read-only, I/O, Ceph health, or latency evidence is scoped to the affected backend/path during the incident"
       disconfirm: ["The backend is healthy for the same path and an earlier PVC, mount, network, or application signal explains the failure."]
       next_steps: ["Capture backend health and latency for the affected pool/export/path.", "Resolve read-only, capacity, quorum, or latency condition through the storage owner.", "Verify bounded I/O on the target path before retrying the workload."]
+
+  - id: known_platform_version_bug
+    question: "Does the incident text match the exact UI/behavior signature of a documented Run:ai regression from runai_known_issues.yaml, rather than a live cluster fault? A healthy, already-patched Run:ai install never emits this exact signature. If it matches and the installed version falls in the affected range, the fix is a version upgrade, not further on-cluster diagnosis."
+    verify: "Compare the exact observed phrase against runai_known_issues.yaml and confirm the cluster's installed Run:ai version against that entry's affected version range."
+    interpretation: "A documented regression signature is causal once the installed version is confirmed affected; re-deriving the fault from scheduler/kubelet/storage evidence adds nothing once that is confirmed."
+    avoid: "Do not keep drilling into cluster subsystems once the known-issue signature and affected version are confirmed; do not claim this family without checking the installed version against the entry."
+    probes:
+      - id: k8s_troubleshooting:known_platform_version_bug:p01
+        tool: logql_query
+        arguments_template:
+          query: '{namespace="runai"} |~ "(?i)(administrator prohibited modifying|notification settings missing)"'
+        incident_time_window: incident
+        expected_result_shape: "timestamped Run:ai backend/UI log lines matching the known-issue signature"
+        supports_when: ["the exact known-issue phrase appears in the Run:ai backend/UI logs during the incident"]
+        refutes_when: ["the phrase is absent and a distinct scoped cluster fault explains the incident instead"]
+        support_signal_any: ["administrator prohibited modifying", "notification settings missing"]
+        refute_signal_any: ["FailedScheduling", "CrashLoopBackOff"]
+        source_group: loki
+    match:
+      any: ["administrator prohibited modifying", "notification settings missing"]
+    conclusion:
+      family: platform_version_bug
+      summary: "The incident matches a documented Run:ai version regression rather than a cluster-local fault."
+      confidence: "high only when the exact known-issue phrase is confirmed and the installed Run:ai version falls inside the affected range"
+      disconfirm:
+        - "The installed Run:ai version already includes the fix, or the phrase is coincidental and a distinct scoped cluster fault explains the incident."
+      next_steps:
+        - "Confirm the installed Run:ai version against the affected range in runai_known_issues.yaml."
+        - "If affected, schedule the upgrade to the patched version instead of continuing on-cluster RCA."
+        - "If already patched or out of range, re-enter the tree from the first scoped cluster event instead."
+    alternatives:
+      - {family: runai_control_plane_error, reason: "A live backend/reconcile fault can produce a similar-looking UI or notification error.", discriminator: "A reconcile/cluster-sync failure in the controller logs, rather than the exact known-issue phrase, identifies a live control-plane fault instead."}
+      - {family: workload_startup_error, reason: "An unrelated local startup failure can coincide with an upgrade window.", discriminator: "A typed container waiting/terminated reason, rather than the UI rejection text, identifies workload startup failure instead."}
+
+  - id: known_expected_behavior
+    question: "Did the workload reach a non-failure terminal phase immediately after a node reboot or another documented by-design Run:ai/Kubernetes behavior, rather than an actual failure? A healthy by-design transition carries no crash or error reason. If the workload's own state instead shows a failure reason, treat it as a real fault."
+    verify: "Compare the target node's reboot/condition transition timestamp with the workload's final phase and reason; confirm the workload reached a non-failure terminal phase (e.g. Succeeded/Completed), not Failed."
+    interpretation: "A workload finishing because of an already-documented product behavior is not a fault; only continue investigating when the terminal state or timing does not match the documented behavior."
+    avoid: "Do not treat this as a startup or scheduling fault, and do not restart the workload, once the reboot correlation and non-failure terminal state are confirmed."
+    probes:
+      - id: k8s_troubleshooting:known_expected_behavior:p01
+        tool: k8s_read
+        arguments_template:
+          kind: nodes
+          name: "{{node}}"
+        incident_time_window: incident
+        expected_result_shape: "target Node reboot/condition transition and the workload's terminal phase and reason"
+        supports_when: ["the workload reached a non-failure terminal phase immediately after the target node's reboot/NotReady-to-Ready transition"]
+        refutes_when: ["the workload's terminal phase is Failed, or no node reboot precedes the state change"]
+        support_signal_any: ["completed after reboot", "Succeeded"]
+        refute_signal_any: ["Failed", "CrashLoopBackOff"]
+        source_group: kubernetes_api
+    match:
+      any: ["completed after reboot"]
+    conclusion:
+      family: expected_known_behavior
+      summary: "The workload's terminal state matches a documented by-design Run:ai/Kubernetes behavior, not a fault."
+      confidence: "high only when the workload's non-failure terminal phase is confirmed to immediately follow the documented trigger (e.g. node reboot)"
+      disconfirm:
+        - "The workload's terminal phase is Failed, or no documented trigger precedes the state change."
+      next_steps:
+        - "Confirm the node reboot/condition transition timestamp against the workload's terminal phase and reason."
+        - "If the workload's own state is a non-failure completion, record this as expected behavior and stop searching for a fault."
+        - "If the terminal phase is Failed or no trigger precedes it, re-enter the tree from the first scoped failure event instead."
+    alternatives:
+      - {family: node_kubelet_pressure, reason: "A real node disruption can also stop a workload from running around a reboot.", discriminator: "A MemoryPressure/DiskPressure eviction reason, rather than a clean reboot-and-Completed transition, identifies node pressure instead."}
+      - {family: workload_startup_error, reason: "A coincidental startup fault can be misread as reboot-driven completion.", discriminator: "A typed container waiting/terminated failure reason after the restart, rather than a non-failure Completed phase, identifies a real startup fault instead."}

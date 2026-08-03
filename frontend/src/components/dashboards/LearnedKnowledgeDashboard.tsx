@@ -397,7 +397,7 @@ export function CandidateDetail({
         <Status value={candidate.status} />
       </div>
       <div className="knowledge-detail-content">
-        <p className="knowledge-summary">{candidate.summary || 'No candidate summary was reported.'}</p>
+        <p className="knowledge-summary">{candidate.summary || '후보 요약이 보고되지 않았습니다.'}</p>
         {catalogReviewDue(candidate) && (
           // A novel family can never headline an RCA, by design. Once the same
           // mechanism keeps recurring that ceiling starts costing accuracy, and

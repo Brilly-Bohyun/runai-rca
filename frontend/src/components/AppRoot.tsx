@@ -80,7 +80,7 @@ import {
 } from '../models/appTypes';
 import { AlertRecord, AnalysisProgressEntry, AnalysisRun, Artifact, Incident } from '../types';
 import { buildAnalysisRecords } from '../utils/analytics';
-import { collectorEvidencePresentation, shouldPresentRunArtifacts } from '../utils/analysisPresentation';
+import { collectorEvidencePresentation, rcaSummaryText, shouldPresentRunArtifacts } from '../utils/analysisPresentation';
 import { artifactForPresentation } from '../utils/artifactPresentation';
 import { alertFiltersForAPI, incidentFiltersForAPI, incidentViewForMainView, matchesAlertFilters, matchesIncidentFilters } from '../utils/filters';
 import { agentTabs, isNoEvidenceArtifact } from '../utils/agentTrail';
@@ -424,7 +424,7 @@ function App() {
           status: artifact.status || 'ok',
           confidence: artifact.confidence || 'medium',
           target: `${run.target_type} / ${run.target_id}`,
-          summary: artifact.summary || 'Evidence was collected without a summary.',
+          summary: artifact.summary || '증거는 수집되었으나 요약이 제공되지 않았습니다.',
           query: artifact.query,
           result: artifact.result,
           alertID: run.alert_id,
@@ -1410,13 +1410,7 @@ function UnifiedWorkspace({
               </div>
             )}
           </div>
-          <p>
-            {isAnalyzing
-              ? summary
-                ? 'Re-analysis is running. The previous RCA is preserved and the new result will replace it when complete.'
-                : 'Analysis is running. New RCA content will appear when the agent finishes.'
-              : summary || 'Analysis is pending. The Collector Evidence Trail will populate as collectors finish.'}
-          </p>
+          <p>{rcaSummaryText(isAnalyzing, summary ?? '')}</p>
           <div className="rca-feedback-strip">
             <span><ThumbsUp size={15} /> {positiveFeedback}</span>
             <span><ThumbsDown size={15} /> {negativeFeedback}</span>

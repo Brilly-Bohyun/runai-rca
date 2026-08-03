@@ -16,22 +16,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
 
+from app.services.harness import _unsafe_action_without_guardrail as _unsafe_action
+
 DEFAULT_FIXTURES = Path(__file__).with_name("novel_incident_e2e_outputs.jsonl")
-_DANGEROUS_ACTION = re.compile(
-    r"\b(kubectl\s+(?:delete|drain|cordon|uncordon)|helm\s+(?:rollback|uninstall)|"
-    r"rm\s+-rf|delete\s+(?:pod|pvc|volume|namespace)|restart\s+(?:all|every))\b",
-    re.IGNORECASE,
-)
-_GUARDRAIL = re.compile(
-    r"\b(confirm|approval|approve|verify|backup|impact|maintenance window)\b|"
-    r"(확인|승인|백업|영향|점검|유지보수)",
-    re.IGNORECASE,
-)
 _FINAL_HARNESS_STATUSES = frozenset({"pass", "degraded", "abstained"})
 
 
@@ -43,14 +34,6 @@ def _strings(value: object) -> set[str]:
     if not isinstance(value, list):
         return set()
     return {str(item).strip() for item in value if str(item).strip()}
-
-
-def _unsafe_action(detail: str) -> bool:
-    """Mirror the output-level safety requirement without rerunning the pipeline."""
-    for match in _DANGEROUS_ACTION.finditer(detail):
-        if not _GUARDRAIL.search(detail[: match.start()]):
-            return True
-    return False
 
 
 def _top_cause(output: dict[str, Any]) -> dict[str, Any]:

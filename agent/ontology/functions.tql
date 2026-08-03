@@ -29,6 +29,26 @@ fun trigger_for_xid($code: integer) -> { xid_trigger }:
     $x isa xid_error, has xid_code $c, has xid_trigger $trigger; $c == $code;
   return { $trigger };
 
+# Driver/CUDA version the fault's leads_to escalation was confirmed under
+# (xid_catalog.yaml `linkage_note`). Kept in its own function, like
+# trigger_for_xid above: it is sparse (most XIDs don't escalate), so folding it
+# into detail_for_xid's single `has` conjunction would silently drop
+# mnemonic/description/severity for every XID that lacks a linkage_note.
+fun linkage_note_for_xid($code: integer) -> { linkage_note }:
+  match
+    $x isa xid_error, has xid_code $c, has linkage_note $note; $c == $code;
+  return { $note };
+
+# The fault's own catalog identity for a specific XID code: load_xids.py
+# ingests mnemonic/description/severity for all 109 entries, but no function
+# returned them, so the graph's name for a GPU fault ("GPU has fallen off the
+# bus") was unreachable while its remediation text was not.
+fun detail_for_xid($code: integer) -> { mnemonic, description, severity }:
+  match
+    $x isa xid_error, has xid_code $c; $c == $code;
+    $x has mnemonic $m, has description $d, has severity $s;
+  return { $m, $d, $s };
+
 # XID codes that can occur on a given GPU model (xid_error -> applies_to -> gpu_model).
 fun xids_for_gpu_model($model: string) -> { xid_code }:
   match
@@ -188,3 +208,20 @@ fun diagnostic_disconfirmations_for_runbook($runbook: string) -> {
     (step: $s, cause: $c) isa diagnostic_outcome, has disconfirm $d;
     $s has diagnostic_id $id;
   return { $id, $d };
+
+# Authored differential diagnosis per step (k8s_troubleshooting_tree.yaml
+# `alternatives`): a competing family plus the reason it is still live and the
+# question that discriminates it, in authored order.
+fun diagnostic_alternatives_for_runbook($runbook: string) -> {
+  diagnostic_id, subtype, reason, discriminator, sequence_index
+}:
+  match
+    $r isa runbook, has name $rn; $rn == $runbook;
+    (runbook: $r, step: $s) isa runbook_contains;
+    (step: $s, cause: $c) isa diagnostic_alternative,
+      has reason $reason,
+      has discriminator $disc,
+      has sequence_index $seq;
+    $s has diagnostic_id $id;
+    $c has subtype $family;
+  return { $id, $family, $reason, $disc, $seq };

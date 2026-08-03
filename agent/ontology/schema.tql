@@ -4,8 +4,12 @@
 # entities + relations + a root_cause taxonomy (5 families as sub-types).
 # Apply with:  python -m ontology.load_schema   (see agent/ontology/load_schema.py)
 #
-# ponytail: GPU capacity/demand are attributes on node/queue/project, not a
-# first-class `gpu` entity. Promote to an entity only if per-GPU facts are needed.
+# ponytail: GPU capacity/demand are NOT modelled here at all (no `gpu` entity,
+# no gpu_allocated/gpu_requested attribute) — the collector's own node-GPU
+# snapshot is explicitly a live sample that "cannot explain a historical
+# incident" (collectors/kubernetes.py), so durably storing it would misrepresent
+# a point-in-time read as a graph fact. Add an attribute (or entity, for
+# per-GPU facts) only once a query needs to compare it across incidents.
 
 define
 
@@ -26,13 +30,15 @@ attribute reason, value string;
 attribute reason_ko, value string;
 attribute name_ko, value string;
 attribute component, value string;
+# Node's cause-bearing condition (DiskPressure/MemoryPressure/PIDPressure/
+# NetworkUnavailable) observed PRESENT during an incident (ingest.py, from the
+# kubernetes_node_condition artifact). Single latest value only — a node
+# hitting two pressure conditions at once is rare enough not to model
+# @card(0..) here; widen if that ever needs to be queryable.
 attribute condition_type, value string;
 attribute keyword, value string;
 attribute workload_type, value string;
-attribute workload_id, value string;
 attribute workload_uid, value string;
-attribute gpu_allocated, value double;
-attribute gpu_requested, value double;
 attribute cluster_name, value string;
 attribute namespace_name, value string;
 attribute project_name, value string;
@@ -42,22 +48,27 @@ attribute source, value string;
 attribute summary, value string;
 attribute confidence, value string;
 attribute confidence_score, value double;
-attribute blast_radius, value string;
 attribute subtype, value string;
 attribute statement, value string;
 attribute statement_ko, value string;
 attribute exclusive_actions, value boolean;
+# Rollout-flavored lifecycle symptoms match the change collector's generic
+# text; the pipeline's _gate_lifecycle_symptoms only promotes them while an
+# active rollout signal exists (see knowledge/failure_modes.yaml).
+attribute requires_lifecycle_signal, value boolean;
 # Stamped ONLY on symptoms the package mirror wrote from an approved knowledge
 # package. It is the retraction key: when the package is retired the mirror
 # removes exactly what it created, and an untagged (curated) symptom of the
 # same name is never touched.
 attribute learned_package_id, value string;
-attribute created_at, value datetime;
 # --- XID GPU-error catalog attributes ---
 attribute xid_code, value integer;
 attribute xid_trigger, value string;
 attribute mnemonic, value string;
 attribute description, value string;
+# Driver/CUDA version a leads_to escalation was confirmed under (xid_catalog.yaml
+# `linkage_note`, sparse like xid_trigger — not every XID escalates).
+attribute linkage_note, value string;
 # --- platform-architecture attributes (control_plane_component) ---
 attribute layer, value string;           # cluster | control_plane | external
 attribute k8s_namespace, value string;
@@ -98,6 +109,7 @@ attribute sequence_index, value integer;
 attribute source_url, value string;
 attribute principle, value string;
 attribute disconfirm, value string;
+attribute discriminator, value string;
 attribute probe_template, value string;
 # --- incident-derived diagnostic trace (v3) -------------------------------
 # These are deliberately separate from the legacy `probe_template` JSON. The
@@ -146,14 +158,12 @@ entity node,
     owns name @key,
     owns cluster_name,
     owns condition_type,
-    owns gpu_allocated,
     plays runs_on:host;
 
 entity workload,
     owns name,
     owns workload_uid @key,
     owns workload_type,
-    owns workload_id,
     owns namespace_name,
     owns project_name,
     owns queue_name,
@@ -216,7 +226,6 @@ entity incident,
     owns title,
     owns severity,
     owns status,
-    owns created_at,
     owns approved_at,
     plays grouped_into:incident,
     plays has_symptom:incident,
@@ -244,7 +253,7 @@ entity symptom sub signal,
     owns name_ko @card(0..1),
     owns component @card(0..1),
     owns exclusive_actions @card(0..1),
-    owns condition_type,
+    owns requires_lifecycle_signal @card(0..1),
     # A symptom matches on many keywords. TypeDB 3.x defaults ownership to
     # @card(0..1), so this MUST be explicit or multi-keyword insert fails at
     # commit ([CNT5] @card(0..1) violated).
@@ -264,12 +273,12 @@ entity symptom sub signal,
 entity root_cause,
     owns subtype,
     owns confidence,
-    owns blast_radius,
     owns statement,
     plays indicates:cause,
     plays supported_by:claim,
     plays diagnosis:cause,
-    plays diagnostic_outcome:cause;
+    plays diagnostic_outcome:cause,
+    plays diagnostic_alternative:cause;
 
 # A run-specific, open-world mechanism. Unlike the fixed catalog family types,
 # this is an entity with a stable data key, so a novel mechanism is never
@@ -398,7 +407,8 @@ entity diagnostic_step,
     plays diagnostic_transition:next,
     plays diagnostic_outcome:step,
     plays diagnostic_recommendation:step,
-    plays probe_template_for:step;
+    plays probe_template_for:step,
+    plays diagnostic_alternative:step;
 
 # Stable IDs are authored in k8s_troubleshooting_tree.yaml. The loader also
 # keeps the complete canonical template for consumers that cannot interpret the
@@ -490,6 +500,16 @@ relation diagnostic_recommendation,
     relates step,
     relates remedy,
     owns sequence_index;
+# Authored differential diagnosis (k8s_troubleshooting_tree.yaml `alternatives`):
+# a competing family this step's own evidence does not yet rule out, plus the
+# question that discriminates it. Distinct from the runtime "competing branch"
+# alternatives decision_tree.walk_tree derives from sibling branch matches.
+relation diagnostic_alternative,
+    relates step,
+    relates cause,
+    owns reason,
+    owns discriminator,
+    owns sequence_index;
 
 # Trace-v3's exact graph edges. Multiple hypotheses/evidence records attach to
 # a single execution without inventing a cartesian-product relation.
@@ -513,6 +533,7 @@ relation package_has_template, relates package, relates template, relates bindin
 entity xid_error sub signal,
     owns xid_code @key,
     owns xid_trigger @card(0..1),
+    owns linkage_note @card(0..1),
     owns mnemonic,
     owns description,
     owns severity,

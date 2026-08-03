@@ -19,8 +19,10 @@ def test_default_deadline_reserves_finalization_after_shared_evidence_budget() -
     settings = replace(make_settings(), analysis_deadline_seconds=900)
     state = SimpleNamespace(settings=settings, analysis_started_at=100.0)
 
-    assert _finalization_reserve_seconds(900) == 360.0
-    assert _evidence_deadline_monotonic(state) == 640.0
+    # The reserve was reclaimed from a flat 360s (see
+    # tests/test_finalization_reserve_reclaim.py for the teeth on this number).
+    assert _finalization_reserve_seconds(900) == 150.0
+    assert _evidence_deadline_monotonic(state) == 850.0
 
 
 def test_optional_budget_stop_is_trace_metadata_not_operator_warning() -> None:

@@ -767,7 +767,13 @@ def test_confidence_tier_precedes_raw_score_in_candidate_order() -> None:
     assert ranked[0] is corroborated
 
 
-def test_typed_fact_counts_once_and_scoped_contradiction_blocks_conclusion() -> None:
+def test_typed_fact_counts_once_and_scoped_contradiction_reaches_the_ranked_top() -> None:
+    """G4: a contradicted candidate stays low confidence (never a confident
+    headline) but must still land at ``ranked[0]`` -- that is the only slot
+    harness.evaluate inspects, and its ``unresolved_contradiction`` gate is
+    what turns this into a visible abstain. Silently substituting
+    ``insufficient_evidence`` here would erase the contradiction instead of
+    surfacing it."""
     support = artifact(
         agent="kubernetes",
         source="kubernetes",
@@ -803,7 +809,7 @@ def test_typed_fact_counts_once_and_scoped_contradiction_blocks_conclusion() -> 
     assert image.confidence == "low"
     assert image.support_evidence_ids == ["E01"]
     assert image.contradiction_evidence_ids == ["E02"]
-    assert ranked[0].family == "insufficient_evidence"
+    assert ranked[0] is image
 
 
 def test_postgres_prior_history_cannot_create_current_catalog_cause() -> None:
@@ -974,9 +980,13 @@ def test_trigger_facet_survives_signature_promotion() -> None:
         },
     )
 
+    # S7: promotion requires the keyword to have been OBSERVED (evidence_text),
+    # not merely asserted by the match itself.
     # Path A: lifecycle family is already the ranker's top → _with_signature_support.
     top_first = [lifecycle_cause, *[c for c in ranked if c.family != "platform_lifecycle_change"]]
-    promoted_a = _promote_signature_cause(top_first, [], [], [symptom])
+    promoted_a = _promote_signature_cause(
+        top_first, [], [], [symptom], evidence_text="mid-rollout"
+    )
     assert promoted_a[0].family == "platform_lifecycle_change"
     assert promoted_a[0].trigger == lifecycle_cause.trigger
     assert promoted_a[0].as_dict()["trigger"] == lifecycle_cause.trigger
@@ -984,7 +994,9 @@ def test_trigger_facet_survives_signature_promotion() -> None:
     # Path B: a different family leads → fresh lead RankedCause for the lifecycle family.
     other = next(c for c in ranked if c.family != "platform_lifecycle_change")
     top_other = [other, *[c for c in ranked if c.family != other.family]]
-    promoted_b = _promote_signature_cause(top_other, [], [], [symptom])
+    promoted_b = _promote_signature_cause(
+        top_other, [], [], [symptom], evidence_text="mid-rollout"
+    )
     assert promoted_b[0].family == "platform_lifecycle_change"
     assert promoted_b[0].trigger == lifecycle_cause.trigger
 
@@ -1021,6 +1033,7 @@ def test_signature_floor_refreshes_score_gates_without_overriding_contradiction(
                 },
             )
         ],
+        evidence_text="imagepullbackoff",
     )[0]
 
     assert promoted.score == 7.0

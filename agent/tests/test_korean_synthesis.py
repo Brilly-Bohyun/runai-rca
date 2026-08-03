@@ -34,6 +34,7 @@ from app.services.pipeline import (
     _translatable_report_lines,
     _translate_report_lines_ko,
     _xid_codes_from_results,
+    _xid_diagnostic_guidance_lines,
 )
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import RankedCause
@@ -156,6 +157,68 @@ def test_graph_remediation_lines_render() -> None:
     assert _graph_remediation_lines(GraphRemediation()) == []
 
 
+def test_graph_remediation_lines_name_the_xid() -> None:
+    """A report must say what XID 79 IS ("GPU has fallen off the bus"), not
+    just what to do about it -- the graph carries the catalog's own mnemonic/
+    description/severity (kg_enrichment._fill_xid_detail) but nothing rendered
+    them yet."""
+    fixes = GraphRemediation(
+        xid_fixes={79: ["Restart the baremetal host."]},
+        xid_triggers={79: "Check for PCIe link errors before reset."},
+        xid_mnemonics={79: "ROBUST_CHANNEL_GPU_HAS_FALLEN_OFF_THE_BUS"},
+        xid_descriptions={79: "GPU has fallen off the bus"},
+        xid_severities={79: "fatal"},
+    )
+    text = "\n".join(_graph_remediation_lines(fixes))
+    assert "GPU has fallen off the bus" in text
+    assert "fatal" in text
+
+    en_lines = _xid_diagnostic_guidance_lines(fixes, "en")
+    assert en_lines and "GPU has fallen off the bus" in en_lines[0]
+    assert "fatal" in en_lines[0]
+
+
+def test_graph_remediation_lines_no_mnemonic_stays_clean() -> None:
+    """An XID with fixes/triggers but no catalog entry anywhere -- not in the
+    graph, and (code 999999 does not exist) not in the local xid_catalog.yaml
+    fallback either -- must not invent a name, and must not leave a dangling
+    empty clause (" -- ", "()") behind."""
+    fixes = GraphRemediation(
+        xid_fixes={999999: ["Run the app under compute-sanitizer."]},
+        xid_triggers={999999: "GPU memory page fault."},
+    )
+    text = "\n".join(_graph_remediation_lines(fixes))
+    assert text == (
+        "- Knowledge-graph derived remediation:\n"
+        "  - NVIDIA Xid 999999:\n"
+        "    - Run the app under compute-sanitizer.\n"
+        "  - Diagnostic guidance (XID 999999): GPU memory page fault."
+    )
+    assert " — " not in text
+    assert "()" not in text
+
+    en_lines = _xid_diagnostic_guidance_lines(fixes, "en")
+    assert en_lines == ["- Diagnostic guidance (XID 999999): GPU memory page fault."]
+
+
+def test_xid_identity_falls_back_to_local_catalog_without_typedb() -> None:
+    """A graph outage must degrade the wording, not delete it: with fixes/
+    triggers present (e.g. from a stale ingest) but no detail_for_xid() result
+    -- the same shape TypeDB being fully disabled produces -- the identity
+    clause must still resolve from the shipped knowledge/xid_catalog.yaml."""
+    fixes = GraphRemediation(
+        xid_fixes={79: ["Restart the baremetal host."]},
+        xid_triggers={79: "Check for PCIe link errors before reset."},
+        # xid_mnemonics/xid_descriptions/xid_severities intentionally empty.
+    )
+    text = "\n".join(_graph_remediation_lines(fixes))
+    assert "GPU has fallen off the bus" in text
+    assert "fatal" in text
+
+    en_lines = _xid_diagnostic_guidance_lines(fixes, "en")
+    assert en_lines and "GPU has fallen off the bus" in en_lines[0]
+
+
 # --- synthesis waits for ALL collectors + Korean LLM synthesis ----------------
 
 
@@ -190,7 +253,21 @@ async def test_korean_llm_synthesis_localizes_english_lines(monkeypatch) -> None
     sent: list[dict] = []
 
     async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
-        pending = json.loads(json_body["messages"][-1]["content"])
+        content = json_body["messages"][-1]["content"]
+        try:
+            pending = json.loads(content)
+        except json.JSONDecodeError:
+            pending = None
+        # A Korean-translation batch is specifically dict[str, str]. Other
+        # LLM-gated calls sharing this mock (plan refine's prose, operator-
+        # question sharpening's dict[str, list]) are irrelevant here -- reply
+        # harmlessly instead of forcing every caller through this shape.
+        if not isinstance(pending, dict) or not all(
+            isinstance(value, str) for value in pending.values()
+        ):
+            return SimpleNamespace(
+                ok=True, data={"choices": [{"message": {"content": "{}"}}]}
+            )
         sent.append(pending)
         # Echo every requested line, keeping backtick spans verbatim.
         translated = {key: f"[번역] {value}" for key, value in pending.items()}

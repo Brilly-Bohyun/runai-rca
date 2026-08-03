@@ -13,14 +13,6 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
-class RootCause(BaseModel):
-    category: str = ""        # validated against knowledge/families.yaml by ingest
-    subtype: str = ""
-    confidence: str = "low"   # low | medium | high
-    blast_radius: str = ""    # node | queue | workload | ""
-    statement: str = ""
-
-
 class OntologyIncident(BaseModel):
     incident_id: str
     alert_id: str = ""
@@ -63,7 +55,6 @@ class OntologyIncident(BaseModel):
     fingerprint: str = ""
     occurrence_count: int = 0
     occurrence_pods: list[str] = Field(default_factory=list)
-    root_cause: RootCause | None = None
     # Backend-persisted top root-cause family (empty for legacy rows).
     root_cause_family: str = ""
     # Explicit operator approval timestamp (dashboard Approve button); "" = not approved.

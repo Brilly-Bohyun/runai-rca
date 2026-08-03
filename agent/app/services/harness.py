@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -29,15 +30,29 @@ from app.services.root_cause_ranking import (
     artifact_supports_family,
 )
 
+_log = logging.getLogger(__name__)
+
 _USABLE = {"ok", "partial"}
 _DANGEROUS_ACTION = re.compile(
     r"\b(kubectl\s+(?:delete|drain|cordon|uncordon)|helm\s+(?:rollback|uninstall)|"
     r"rm\s+-rf|delete\s+(?:pod|pvc|volume|namespace)|restart\s+(?:all|every))\b",
     re.IGNORECASE,
 )
+# Deliberately narrower than "any safety-adjacent word". ``impact``/``영향``,
+# ``확인``, and ``점검`` are also the report builder's own fixed section labels
+# ("Impact"/"영향" in Section 1, "## 추가 확인 요청", "다음 확인",
+# "## 일반 점검 가이드") that appear in most reports regardless of whether any
+# action is actually guarded. With those in the set, the FIRST such heading in
+# the document (as early as offset ~600 in a real report) satisfied
+# ``_unsafe_action_without_guardrail``'s search and silenced the gate for
+# every dangerous command anywhere later in the document. The remaining
+# tokens are not used as structural headings elsewhere in the report, so an
+# earlier occurrence of one of them is still trusted as a real guardrail --
+# ``apply_safety_guardrail`` relies on that to cover an action far below the
+# single banner it prepends (see ``test_safety_guardrail_covers_a_long_report``).
 _GUARDRAIL = re.compile(
-    r"\b(confirm|approval|approve|verify|backup|impact|maintenance window)\b|"
-    r"(확인|승인|백업|영향|점검|유지보수)",
+    r"\b(confirm|approval|approve|verify|backup|maintenance window)\b|"
+    r"(승인|백업|유지보수)",
     re.IGNORECASE,
 )
 _WEIGHTS = {
@@ -369,6 +384,19 @@ def evaluate(
         # earlier stage labelled the candidate medium or high.  Restricting this
         # gate to high let contradicted medium conclusions retain remediation
         # authority.
+        #
+        # This gate was inert for a long time and is no longer: the ranker used
+        # to force confidence to "low" the moment a candidate carried any
+        # contradiction, and ``live_ranked`` then required medium/high, so a
+        # contradicted candidate could never BE ``candidates[0]`` -- the only
+        # slot this function inspects. "Not confident enough to headline" and
+        # "not allowed to reach the harness at all" had been collapsed into one
+        # test. They are separate now: the contradiction still forces "low", and
+        # a low candidate that carries one is admitted anyway so the
+        # contradiction can travel here and be reported instead of quietly
+        # sinking the candidate. See
+        # test_unresolved_contradiction_gate_reaches_harness.py for the
+        # end-to-end path.
         "unresolved_contradiction": bool(not insufficient and contradiction_ids),
         # Generic state alerts (non-ready / waiting / replicas-mismatch class)
         # describe a symptom shared by many causes. Naming a specific family
@@ -401,6 +429,14 @@ def evaluate(
         ],
         "evidence_link_errors": link_errors,
     }
+    # G5: this is the only writer of ``context["evidence_links"]`` anywhere in
+    # the codebase. Without it, ``analysis_hash`` always hashed a constant
+    # ``null`` for this field (its own docstring claims snapshot identity
+    # must change when evidence links change -- it structurally could not),
+    # and the ``_supplied_evidence_links`` context-fallback branch below had
+    # nothing to ever read. Written on every call so it always reflects the
+    # verdict just computed, including a repair-loop re-evaluation.
+    response.context["evidence_links"] = claim["evidence_links"]
     trace = [
         _trace_item(item)
         for item in _unique_artifacts(
@@ -462,6 +498,7 @@ def _trace_item(item: object) -> dict[str, str]:
     the same normalizer that the evidence-link gate trusts so the display never
     invents a stronger verdict than the RCA engine accepted.
     """
+    evidence_id = str(getattr(item, "evidence_id", ""))
     polarity, coverage = "unknown", "partial"
     try:
         from app.services.evidence_blackboard import normalize_artifact
@@ -473,9 +510,14 @@ def _trace_item(item: object) -> dict[str, str]:
         polarity = str(fact.polarity)
         coverage = str(fact.coverage)
     except Exception:  # noqa: BLE001 - trace rendering must not block the RCA.
-        pass
+        _log.warning(
+            "trace normalization failed for evidence_id=%s; showing 'context only · "
+            "partial' instead of the real verdict",
+            evidence_id,
+            exc_info=True,
+        )
     return {
-        "evidence_id": str(getattr(item, "evidence_id", "")),
+        "evidence_id": evidence_id,
         "source": str(getattr(item, "source", "")),
         "summary": _single_line(getattr(item, "summary", ""), 220),
         "polarity": polarity,
@@ -744,6 +786,12 @@ def _artifact_eligibility(artifacts: Iterable[object]) -> dict[str, object]:
                 item, require_typed_observation=True
             ).eligibility
         except Exception:  # noqa: BLE001 - malformed evidence must not become proof
+            _log.warning(
+                "artifact eligibility normalization failed for evidence_id=%s; "
+                "excluded from the eligible set",
+                evidence_id,
+                exc_info=True,
+            )
             continue
     return eligible
 
@@ -775,11 +823,17 @@ def _independence_key(item: object) -> str:
 
         return str(normalize_artifact(item).independence_group)
     except Exception:  # noqa: BLE001 - malformed artifacts are not independent proof
-        return str(
+        fallback = str(
             getattr(item, "independence_group", "")
             or getattr(item, "source", "")
             or getattr(item, "agent", "")
         )
+        _log.warning(
+            "independence-group normalization failed; falling back to %r",
+            fallback,
+            exc_info=True,
+        )
+        return fallback
 
 
 def _unsafe_action_without_guardrail(detail: str) -> bool:

@@ -4,7 +4,9 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
+import textwrap
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
@@ -19,10 +21,8 @@ from app.collectors.base import (
     CollectorResult,
     causal_evidence_time_range,
     condition_observations,
-    kubernetes_salient_markers,
     parse_incident_time,
     resolve_target,
-    salient_markers,
 )
 from app.collectors.base import artifact as make_artifact
 from app.collectors.registry import build_collectors, unknown_collector_names
@@ -41,7 +41,9 @@ from app.knowledge import (
     load_family_catalog,
     load_runai_known_issues,
     load_troubleshooting_cases,
+    load_xid_catalog,
     localized_failure_mode_actions,
+    localized_failure_mode_name,
     match_failure_mode_symptoms,
     match_runai_known_issues,
     merge_runtime_failure_modes,
@@ -111,16 +113,6 @@ _K8S_CONDITION_TYPES = frozenset(
         "ready",
     }
 )
-_SYNTHESIS_ASSERTION_CONDITIONAL = re.compile(
-    r"\b(?:check|verify|whether|hypothesis|possible|possibly|could|may|might|candidate|inconclusive)\b|"
-    r"(?:확인\s*(?:필요|대상|예정)|확인(?:하|해|해야)|점검|검증|검토|조사|미확보|미확인|불확실|여부|가설|가능성|의심|후보)",
-    re.IGNORECASE,
-)
-_SYNTHESIS_PRIVATE_FACT_CITATION = re.compile(
-    r"(?<![A-Za-z0-9_-])F-[0-9a-f]{8,64}(?![A-Za-z0-9_-])", re.IGNORECASE
-)
-_SYNTHESIS_PUBLIC_EVIDENCE_CITATION = re.compile(r"\[(E\d+)\]")
-
 _DISPOSITIVE_TYPED_REASONS: dict[str, frozenset[str]] = {
     "image_pull_error": frozenset(
         {"ImagePullBackOff", "ErrImagePull", "InvalidImageName", "ErrImageNeverPull"}
@@ -185,6 +177,13 @@ class PipelineState:
     self_check_confidence_before: str = ""
     self_check_confidence_after: str = ""
     reanalysis_note: str = ""
+    # The family the LAST reanalysis-round note asserted as its conclusion
+    # (R1) -- captured so harness_stage can tell, once it knows the FINAL
+    # published family, whether the Self-Check text it already wrote into
+    # state.detail is now stale (a later harness repair/abstain, or the
+    # refuted-top fallback, can change the headline after this note was
+    # written).
+    reanalysis_note_family: str = ""
     synthesis_status: str = "not_requested"
     synthesis_error: str = ""
     synthesis_duration: float | None = None
@@ -272,12 +271,29 @@ def _finalization_reserve_seconds(total_seconds: int) -> float:
     """Automatically reserve time for rank/self-check/synthesis/harness.
 
     At the default 900s deadline, evidence gathering (investigation plus every
-    drill-down) shares 540s and finalization keeps 360s. Short test/operator
-    deadlines reserve at most half so evidence still gets a useful window.
+    drill-down) now shares 750s and finalization keeps a 150s floor. Deadlines
+    under ~375s are unaffected -- 40% of them was already below this floor, so
+    short test/operator deadlines still reserve at most half, same as before.
+
+    The floor used to be a flat 360s (40% of 900s) grounded in the
+    ``llm_synthesis_max_tokens`` comment in config.py: one call legally
+    spending 300-450s on a 16384-token completion. That call no longer
+    exists. Since 2026-07-22 Korean "synthesis" only translates the
+    already-decided deterministic report (owner directive: never re-analyze),
+    in concurrency-4 batches of ~2000 source chars each
+    (``_TRANSLATION_BATCH_CHARS`` / ``_TRANSLATION_BATCH_CONCURRENCY``), so one
+    batch's own cap is ~3072 tokens (``_translate_line_batch``), not 16384. A
+    real run measured the whole finalization phase (rank + self-check +
+    synthesis + harness) at 67.5s against the old 360s floor -- 292.5s
+    reserved but never spent, while evidence gathering was cut off early with
+    real drill-downs still queued (stop_reason ``analysis_budget_exhausted``
+    at 605s of a 900s deadline). 150s is a bit over 2x that measurement: room
+    for a genuinely slow batch/self-check round plus a retry, without pinning
+    the 16k-token budget the translate-only path no longer spends.
     """
     if total_seconds <= 0:
         return 0.0
-    return min(360.0, max(30.0, total_seconds * 0.40), total_seconds * 0.50)
+    return min(150.0, max(30.0, total_seconds * 0.40), total_seconds * 0.50)
 
 
 def _evidence_deadline_monotonic(state: PipelineState) -> float | None:
@@ -431,7 +447,17 @@ def _apply_effective_target(state: PipelineState) -> AnalysisTarget:
 
     if state.declared_target is None:
         state.declared_target = state.target
-    state.target = _scope_target(state.declared_target, state.plan)
+    scoped = _scope_target(state.declared_target, state.plan)
+    # ``plan.namespaces`` is an investigation SCOPE and may lead with a platform
+    # component's home namespace (the planner puts it first so the component is
+    # read). An alert that declares its own namespace has already stated the
+    # target's identity, and evidence eligibility compares every observation
+    # against it — so the plan may ADD namespaces to read, never move the target
+    # out of the namespace the alert named. Per-probe scoping keeps using
+    # ``_scope_target`` directly and is unaffected.
+    if state.declared_target.namespace:
+        scoped = replace(scoped, namespace=state.declared_target.namespace)
+    state.target = scoped
     return state.target
 
 
@@ -1535,7 +1561,15 @@ def _public_v3_hypothesis(
         "hypothesis_id": str(item.get("id") or ""),
         "family": str(item.get("family") or ""),
         "mechanism": str(item.get("mechanism") or item.get("statement") or ""),
-        "status": str(item.get("status") or "uncertain"),
+        # The ledger's own status is not eligibility-aware: a hypothesis can be
+        # marked ``supported`` from citations this serializer then drops. Publish
+        # the reconciled state so a reader never sees "supported" with nothing
+        # supporting it.
+        "status": (
+            "testing"
+            if str(item.get("status") or "") == "supported" and not evidence_for
+            else str(item.get("status") or "uncertain")
+        ),
         "confidence": item.get("confidence"),
         "evidence_for": list(dict.fromkeys(evidence_for)),
         "evidence_against": list(dict.fromkeys(evidence_against)),
@@ -1813,7 +1847,10 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     )
     state.xid_codes = _xid_codes_from_results(
         state.results,
-        _alert_text(request),
+        # An XID code found here is dispositive (_promote_xid_cause forces the
+        # score to 10.0 with no further gate), so this must be the narrow text
+        # — an operator musing "xid 79?" must not mint a hardware-fault cause.
+        _alert_signature_text(request),
         eligible_support_ids=eligible_support_ids,
     )
     # TypeDB is the runtime source of truth. The version-controlled YAML matcher
@@ -1909,8 +1946,12 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     # informs, never headlines: promotion below stays exact-signature-only (a
     # statistical hit is not "a specific signature that names the cause family"
     # — e.g. NodeDiskPressure's disk+pressure tokens must not promote a
-    # database-disk known issue), while the playbook/actions/verify surfaces
-    # use fuzzy matches as candidates the LLM verify pass can still refute.
+    # database-disk known issue). ``state.alert_fuzzy`` only ever reaches the
+    # self-check verify pass below (synthesize_stage), which can only REMOVE a
+    # candidate, never add one, so the permissive text is safe there. The
+    # actions/playbook/knowledge-base surfaces that can RENDER a fuzzy match's
+    # actions into the report recompute their own fuzzy text from
+    # ``_alert_signature_text`` instead — see that function's docstring.
     state.alert_fuzzy = _alert_text(request)
     known_issue_matches = match_runai_known_issues(state.known_issues, state.observed)
     symptom_matches = _gate_lifecycle_symptoms(
@@ -1980,6 +2021,119 @@ def _merge_open_world_candidates(
         candidate for candidate in merged if candidate.novelty == "open_world"
     ]
     return merged
+
+
+def _evidence_gap_report_line(dominant: str, count: int, total: int, language: str) -> str:
+    """One line telling the operator WHY there is no cause, not just THAT there
+    isn't one.
+
+    ``analysis_summary`` already says insufficient evidence; without this an
+    operator reading the report cannot tell a quiet cluster from a
+    misconfigured agent. Only reached from the single call site inside
+    ``_warn_on_starved_evidence`` that fires while ``final_family ==
+    "insufficient_evidence"``, so a run that concluded a cause never carries
+    it.
+    """
+    if language == "ko":
+        return (
+            f"- **증거가 부족한 이유**: 수집된 관측 {total}건 중 {count}건이 유효한 증거로 "
+            f"이어지지 못했습니다 (가장 흔한 사유: {dominant})."
+        )
+    return (
+        f"- **Why evidence is insufficient**: {count} of {total} observation(s) "
+        f"never became usable evidence (most common reason: {dominant})."
+    )
+
+
+def _warn_on_starved_evidence(state: PipelineState, response: AlertAnalysisResponse) -> None:
+    """Zero eligible support beside scoped positive facts is a TARGET bug.
+
+    Eligibility answers "is this observation about the incident we are analysing".
+    When it rejects every scoped positive fact on the board, the wrong thing is
+    almost never the evidence — it is the identity/window the run is comparing
+    against (INC-…-000001: 94 facts, 0 eligible, because the plan had moved the
+    target to the ``runai`` namespace). That is invisible to
+    ``rejected_evidence_links``, which only records links somebody tried to cite.
+
+    A board that never produced a single present+scoped fact is the more common
+    shape (a real run: 121 artifacts, 3 usable) and used to stay silent as an
+    "honest evidence gap" even when every fact carried a ``demotion_reason``
+    (see ``evidence_blackboard.EvidenceFact``) explaining exactly why it never
+    became evidence. Diagnose by absence only when there is truly nothing to
+    explain -- no facts at all, or facts with no identifiable reason.
+    """
+    facts_method = getattr(state.blackboard, "facts", None)
+    if not callable(facts_method):
+        return
+    try:
+        all_facts = list(facts_method())
+    except Exception:  # noqa: BLE001 - a diagnostic signal is never fatal
+        return
+    usable = [
+        fact
+        for fact in all_facts
+        if str(getattr(fact, "polarity", "")) == "present"
+        and str(getattr(fact, "coverage", "")) == "scoped"
+    ]
+    if not usable:
+        demoted = [fact for fact in all_facts if getattr(fact, "demotion_reason", "")]
+        if not demoted:
+            return  # honest gap: nothing to explain
+        reasons = Counter(getattr(fact, "demotion_reason", "") for fact in demoted)
+        dominant, count = reasons.most_common(1)[0]
+        message = (
+            f"no observation ever reached present+scoped: {count} of {len(all_facts)} "
+            f"fact(s) were demoted, most commonly ({dominant})"
+        )
+        _log.warning("evidence: %s", message)
+        response.warnings = sorted(set(response.warnings) | {message})
+        response.analysis_detail = _insert_before_appendix(
+            response.analysis_detail,
+            _evidence_gap_report_line(
+                dominant, count, len(all_facts), getattr(state.settings, "language", "en")
+            ),
+        )
+        return
+    eligibility = _blackboard_eligibility(state)
+    if any(getattr(item, "support", False) for item in eligibility.values()):
+        return
+    reasons = Counter(
+        str(getattr(eligibility.get(str(getattr(fact, "fact_id", ""))), "reason", ""))
+        for fact in usable
+    )
+    dominant = next((reason for reason, _ in reasons.most_common() if reason), "ineligible")
+    message = (
+        f"no observation was eligible to support a cause: all {len(usable)} scoped "
+        f"positive fact(s) were rejected ({dominant}) — check the analysis target "
+        f"identity, not the evidence"
+    )
+    _log.warning("evidence: %s", message)
+    response.warnings = sorted(set(response.warnings) | {message})
+
+
+def _warn_on_discarded_support(state: PipelineState, response: AlertAnalysisResponse) -> None:
+    """Concluding nothing WHILE discarding support links is a wiring bug.
+
+    ``rejected_evidence_links`` was recorded in the v3 trace and read by nobody,
+    so a run could spend ten minutes reporting "no evidence" about evidence it
+    was holding (INC-…-000001: every runai-test1 observation dropped because the
+    plan had moved the target to the ``runai`` namespace).  Only fires when the
+    run concluded nothing — an ordinary run with a real cause stays silent.
+    """
+    trace = state.investigation_context.get("reasoning_trace_v3")
+    links = trace.get("rejected_evidence_links") or [] if isinstance(trace, dict) else []
+    rejected = [
+        item for item in links if isinstance(item, dict) and item.get("role") == "support"
+    ]
+    if not rejected:
+        return
+    reasons = sorted({str(item.get("reason") or "") for item in rejected if item.get("reason")})
+    message = (
+        f"concluded without a cause while discarding {len(rejected)} support link(s) "
+        f"as ineligible: {', '.join(reasons[:2])}"
+    )
+    _log.warning("evidence: %s", message)
+    response.warnings = sorted(set(response.warnings) | {message})
 
 
 def _refresh_public_reasoning_trace(state: PipelineState) -> None:
@@ -2400,7 +2554,11 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         if ki_matches:
             verify_known_kwargs: dict[str, object] = {}
             if _accepts_keyword(verify_known_issues, "declared_alert"):
-                verify_known_kwargs["declared_alert"] = _alert_text(request)
+                # The self-check prompt tells the LLM "an explicit positive
+                # signature [in the declared alert] may support a match" — the
+                # narrow text, or operator/runbook prose could talk it out of
+                # refuting a match that should never have been made.
+                verify_known_kwargs["declared_alert"] = _alert_signature_text(request)
             refuted = await verify_known_issues(
                 settings,
                 ki_matches,
@@ -2433,7 +2591,9 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 "subject": "matched symptom or GPU XID"
             }
             if _accepts_keyword(verify_matches, "declared_alert"):
-                verify_match_kwargs["declared_alert"] = _alert_text(request)
+                # Same reasoning as verify_known_issues above: this text can
+                # talk the LLM out of refuting a match, so it must be narrow.
+                verify_match_kwargs["declared_alert"] = _alert_signature_text(request)
             refuted = await verify_matches(
                 settings,
                 ev_candidates,
@@ -2535,6 +2695,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 state.target,
                 state.self_check_next,
                 _executed_evidence_queries(state.artifacts),
+                _held_evidence_summaries(state.artifacts, eligible_support_ids),
             )
         except Exception:  # noqa: BLE001 - questions are best-effort
             questions = []
@@ -2561,6 +2722,13 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         state.detail, untranslated = await _translate_report_lines_ko(
             settings, state.detail, synthesis_diagnostics
         )
+        # Warnings are a flat list, not part of the markdown document above --
+        # without this they shipped English verbatim in an otherwise-Korean
+        # report (a real run: 9/9 warnings stayed English).
+        state.warnings, untranslated_warnings = await _translate_warnings_ko(
+            settings, state.warnings, synthesis_diagnostics
+        )
+        untranslated += untranslated_warnings
         state.synthesis_duration = round(time.monotonic() - started_at, 3)
         if untranslated:
             state.synthesis_status = "failed"
@@ -2678,6 +2846,18 @@ GENERIC_STATE_ALERTS = frozenset(
 )
 
 
+def _final_conclusion_line(final_family: str, settings: Settings) -> str:
+    """R1: restate the FINAL published family once more, placed as the very
+    last content before the appendix, so a later harness decision that moved
+    the headline off a reanalysis round's own conclusion cannot leave that
+    round's "결론: X" / "conclusion: X" line as the last thing the operator
+    reads. The per-round trail above it is left intact -- it is an honest
+    history of how the run got here, not a wrong statement to scrub."""
+    if getattr(settings, "language", "en") == "ko":
+        return f"- **최종 결론** (위 재분석 메모를 대체함): {final_family}"
+    return f"- **Final conclusion** (supersedes the re-analysis note above): {final_family}"
+
+
 async def harness_stage(state: PipelineState) -> PipelineState:
     """Validate the already-synthesized RCA and make bounded safe repairs."""
     from app.services.harness import (
@@ -2769,14 +2949,27 @@ async def harness_stage(state: PipelineState) -> PipelineState:
                 response.analysis_detail, carried_guidance
             )
             response.analysis = response.analysis_detail
-        verdict = evaluate(
-            response,
-            state.results,
-            state.root_cause_candidates,
-            next_check=state.self_check_next,
-            evidence_eligibility=_public_evidence_eligibility(state),
-            known_issues=state.known_issues,
-            generic_state_alert=state.target.alert_name in GENERIC_STATE_ALERTS,
+        # Re-scoring the REWRITTEN document is right — the abstain stub is not
+        # the document that was gated. Its gate map is not: every gate in
+        # evaluate() is guarded by ``not insufficient``, and abstain() just set
+        # the family to insufficient_evidence, so a fresh verdict reports every
+        # hard gate as False. Persisting that erased WHY the run abstained, and
+        # the backend's knowledge-promotion veto (harnessHardGatesPassed) reads
+        # exactly this map — it could only ever fail on a missing/empty harness,
+        # never on a real violation. Keep the score from the rewritten document
+        # and the gates from the document that actually failed.
+        gated_verdict = verdict
+        verdict = replace(
+            evaluate(
+                response,
+                state.results,
+                state.root_cause_candidates,
+                next_check=state.self_check_next,
+                evidence_eligibility=_public_evidence_eligibility(state),
+                known_issues=state.known_issues,
+                generic_state_alert=state.target.alert_name in GENERIC_STATE_ALERTS,
+            ),
+            gates=dict(gated_verdict.gates),
         )
         status = "abstained"
     elif verdict.score < state.settings.rca_harness_pass_score:
@@ -2800,6 +2993,8 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     # mechanism sentence beside ``insufficient_evidence``.
     final_family = response.root_cause_family
     if final_family == "insufficient_evidence":
+        _warn_on_discarded_support(state, response)
+        _warn_on_starved_evidence(state, response)
         response.analysis_summary = _short_sentence(
             _ranked_root_cause_statement(
                 [RankedCause("insufficient_evidence", "low", 0.0)],
@@ -2818,6 +3013,19 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             eligible_support_ids=_eligible_support_ids_for_output(state),
         )
     state.summary = response.analysis_summary
+    # R1: the Self-Check section was already written into analysis_detail (in
+    # synthesize_stage) from state.reanalysis_note -- a per-round trail that
+    # can go stale by the time the harness finishes: a later repair/abstain
+    # here, or the refuted-top fallback before synthesis, can change the
+    # headline AFTER that trail's last line asserted a different conclusion
+    # (real report: headline insufficient_evidence, Self-Check's last line
+    # "...결론: observability_accuracy"). The trail itself stays -- it is an
+    # honest per-round history -- but the last thing the operator reads must
+    # not contradict the headline.
+    if state.reanalysis_note_family and state.reanalysis_note_family != final_family:
+        response.analysis_detail = _insert_before_appendix(
+            response.analysis_detail, _final_conclusion_line(final_family, state.settings)
+        )
     response.context["root_cause_candidates"] = [
         candidate.as_dict() for candidate in state.root_cause_candidates
     ]
@@ -2940,6 +3148,10 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         )
         state.self_check_caveat = outcome.caveat
         state.reanalysis_note = _append_reanalysis_note(state.reanalysis_note, outcome.note)
+        if outcome.note:
+            state.reanalysis_note_family = (
+                outcome.candidates[0].family if outcome.candidates else "insufficient_evidence"
+            )
         state.self_check_refuted = outcome.refuted
         state.self_check_next = outcome.next_check
         _aggregate_evidence(state)
@@ -3378,7 +3590,9 @@ async def _reanalyze_once(
             candidates,
             _xid_codes_from_results(
                 merged_results,
-                _alert_text(state.request),
+                # Same reasoning as rank_stage: XID promotion is dispositive and
+                # ungated, so the re-rank must use the narrow (signature) text too.
+                _alert_signature_text(state.request),
                 eligible_support_ids=eligible_support_ids,
             ),
             known_issue_matches,
@@ -3710,6 +3924,17 @@ async def _translate_report_lines_ko(
     pending = _translatable_report_lines(detail)
     if not pending:
         return detail, 0
+    translations = await _translate_pending_lines(settings, pending, diagnostics)
+    missing = len(pending) - len(translations)
+    return _apply_line_translations(detail, translations), missing
+
+
+async def _translate_pending_lines(
+    settings: Settings, pending: dict[str, str], diagnostics: list[str] | None
+) -> dict[str, str]:
+    """Batch-translate a keyed dict of English lines. Shared by the report-body
+    and warnings localization passes -- both need the identical batching/
+    concurrency/failure handling, just different line extraction."""
     translations: dict[str, str] = {}
     try:
         semaphore = asyncio.Semaphore(_TRANSLATION_BATCH_CONCURRENCY)
@@ -3724,8 +3949,33 @@ async def _translate_report_lines_ko(
         if diagnostics is not None:
             diagnostics.append(message)
         _log.warning("korean synthesis call failed: %s", message)
+    return translations
+
+
+async def _translate_warnings_ko(
+    settings: Settings, warnings: list[str], diagnostics: list[str] | None = None
+) -> tuple[list[str], int]:
+    """Localize warning strings the same way the report body is localized.
+
+    ``state.warnings`` never passed through ``_translate_report_lines_ko`` -- it
+    is a flat list, not the markdown document that function parses -- so a
+    Korean report always shipped English warnings verbatim (a real run: 9/9
+    warnings stayed English). Returns ``(warnings, untranslated_count)``; a
+    line that already contains Hangul, or that fails to translate, keeps its
+    original text.
+    """
+    pending = {
+        str(index): warning
+        for index, warning in enumerate(warnings)
+        if warning.strip() and not _HANGUL_RE.search(warning)
+    }
+    if not pending:
+        return warnings, 0
+    translations = await _translate_pending_lines(settings, pending, diagnostics)
     missing = len(pending) - len(translations)
-    return _apply_line_translations(detail, translations), missing
+    return [
+        translations.get(str(index), warning) for index, warning in enumerate(warnings)
+    ], missing
 
 
 _COMMAND_ONLY_ACTION = re.compile(
@@ -3932,197 +4182,6 @@ def _compact_synthesis_value(value: object, *, limit: int) -> str:
     return " ".join(text.split())[:limit]
 
 
-_SYNTHESIS_SIGNAL_TERMS: dict[str, tuple[str, ...]] = {
-    "networkunavailable": ("networkunavailable",),
-    "memorypressure": ("memorypressure",),
-    "diskpressure": ("diskpressure",),
-    "pidpressure": ("pidpressure",),
-    "preemption": ("preempt", "preemption", "선점", "프리엠션"),
-    "oomkilled": ("oomkill", "out of memory"),
-    "restart_loop": (
-        "crashloopbackoff",
-        "restart loop",
-        "restarting loop",
-        "재시작 루프",
-    ),
-    "unschedulable": ("unschedulable", "failedscheduling", "스케줄링 불가"),
-}
-
-
-def _synthesis_supported_signal_groups(
-    request: AlertAnalysisRequest,
-    results: list[CollectorResult],
-    evidence_eligibility: Mapping[str, object] | None,
-) -> set[str]:
-    """Return problem-signal groups backed by alert/support observations."""
-    markers = list(salient_markers(_alert_text(request), limit=20))
-    for result in results:
-        for artifact in result.artifacts:
-            payload = _synthesis_artifact_payload(
-                artifact, evidence_eligibility=evidence_eligibility
-            )
-            if payload.get("evidence_role") != "support":
-                continue
-            for check in payload.get("condition_checks") or []:
-                if isinstance(check, dict) and check.get("active") is True:
-                    markers.append(str(check.get("condition") or ""))
-            raw_result = getattr(artifact, "result", None)
-            extractor = (
-                kubernetes_salient_markers
-                if str(getattr(artifact, "agent", "") or "") == "kubernetes"
-                else salient_markers
-            )
-            markers.extend(extractor(raw_result, limit=20))
-
-    normalized = " ".join(markers).casefold()
-    supported: set[str] = set()
-    for group, terms in _SYNTHESIS_SIGNAL_TERMS.items():
-        if any(term.casefold() in normalized for term in terms):
-            supported.add(group)
-    return supported
-
-
-def _synthesis_claim_fragments(text: str) -> list[str]:
-    return [
-        fragment.strip()
-        for fragment in re.split(r"(?<=[.!?。！？])|[\r\n]+", text or "")
-        if fragment.strip()
-    ]
-
-
-_SYNTHESIS_CLAUSE_BREAK = re.compile(
-    r"[.;!?。！？\r\n]+|\b(?:but|however|though|yet)\b|(?:하지만|반면|지만)",
-    re.IGNORECASE,
-)
-
-
-def _synthesis_signal_mentions(
-    fragment: str, terms: tuple[str, ...]
-) -> list[tuple[int, int]]:
-    """Return every case-insensitive signal span in a report fragment."""
-    lowered = fragment.casefold()
-    spans: list[tuple[int, int]] = []
-    for term in terms:
-        needle = term.casefold()
-        start = 0
-        while needle:
-            index = lowered.find(needle, start)
-            if index < 0:
-                break
-            end = index + len(needle)
-            spans.append((index, end))
-            start = end
-    return spans
-
-
-_SYNTHESIS_ENUM_LEFT = frozenset("/,、(")
-_SYNTHESIS_ENUM_RIGHT = frozenset("/,、)")
-_SYNTHESIS_ENUM_SEPARATOR = frozenset("/,、")
-
-
-def _synthesis_mention_in_enumeration(fragment: str, start: int, end: int) -> bool:
-    """Whether the signal term is one item of a slash/comma enumeration.
-
-    A condition named inside a list to inspect — ``(MemoryPressure/DiskPressure/
-    NetworkUnavailable)`` or ``(quota/gang/preempt/reclaim)`` — is not an
-    assertion that the condition occurred, so it must not reject the synthesis.
-    """
-    left = start - 1
-    while left >= 0 and fragment[left].isspace():
-        left -= 1
-    right = end
-    length = len(fragment)
-    while right < length and fragment[right].isspace():
-        right += 1
-    left_char = fragment[left] if left >= 0 else ""
-    right_char = fragment[right] if right < length else ""
-    if left_char in _SYNTHESIS_ENUM_LEFT and right_char in _SYNTHESIS_ENUM_RIGHT:
-        return left_char in _SYNTHESIS_ENUM_SEPARATOR or right_char in _SYNTHESIS_ENUM_SEPARATOR
-    return False
-
-
-def _synthesis_mention_in_code_span(fragment: str, start: int) -> bool:
-    """Whether the mention falls inside a backtick-delimited command/code span.
-
-    A signal word inside a suggested probe (``kubectl ... preempt``) is a thing
-    to look for, not a claim that it happened.
-    """
-    return fragment.count("`", 0, start) % 2 == 1
-
-
-def _synthesis_fragment_asserts_signal(fragment: str, start: int, end: int) -> bool:
-    """Whether one signal mention is asserted rather than negated or conditional.
-
-    Polarity must be evaluated around the specific signal. A whole-fragment
-    check reverses Korean statements such as ``MemoryPressure가 아닌 ...`` and
-    can also let a different positive signal hide behind an unrelated negation.
-    An enumeration item, or a token inside a probe command, names a thing to
-    inspect rather than a condition claimed to have occurred.
-    """
-    lowered = fragment.casefold()
-    if _keyword_negated(lowered, start, end):
-        return False
-    if _synthesis_mention_in_enumeration(fragment, start, end):
-        return False
-    if _synthesis_mention_in_code_span(fragment, start):
-        return False
-
-    prefix = fragment[:start]
-    suffix = fragment[end:]
-    local_prefix = _SYNTHESIS_CLAUSE_BREAK.split(prefix)[-1]
-    local_suffix = _SYNTHESIS_CLAUSE_BREAK.split(suffix, maxsplit=1)[0]
-    local_clause = f"{local_prefix}{fragment[start:end]}{local_suffix}"
-    if _SYNTHESIS_ASSERTION_CONDITIONAL.search(local_clause):
-        return False
-    return True
-
-
-def _synthesis_semantic_conflict(
-    summary: str,
-    detail: str,
-    *,
-    request: AlertAnalysisRequest,
-    results: list[CollectorResult],
-    evidence_eligibility: Mapping[str, object] | None,
-) -> str:
-    """Reject free-form prose that reverses typed evidence truth.
-
-    This is deliberately a rejection guard, not a prose rewriter.  On conflict
-    the pipeline keeps its deterministic report rather than trying to repair a
-    causal statement with another unconstrained model call.
-    """
-    text = f"{summary}\n{detail}"
-    if _SYNTHESIS_PRIVATE_FACT_CITATION.search(text):
-        return "private F-* evidence citation escaped into the report"
-
-    known_evidence_ids = {
-        str(getattr(artifact, "evidence_id", "") or "")
-        for result in results
-        for artifact in result.artifacts
-        if str(getattr(artifact, "evidence_id", "") or "")
-    }
-    unknown_citations = sorted(
-        {
-            match.group(1)
-            for match in _SYNTHESIS_PUBLIC_EVIDENCE_CITATION.finditer(text)
-            if match.group(1) not in known_evidence_ids
-        }
-    )
-    if unknown_citations:
-        return f"unknown evidence citation(s): {', '.join(unknown_citations)}"
-
-    supported = _synthesis_supported_signal_groups(
-        request, results, evidence_eligibility
-    )
-    for fragment in _synthesis_claim_fragments(text):
-        for group, terms in _SYNTHESIS_SIGNAL_TERMS.items():
-            if group in supported:
-                continue
-            for start, end in _synthesis_signal_mentions(fragment, terms):
-                if _synthesis_fragment_asserts_signal(fragment, start, end):
-                    return f"unsupported positive {group} claim: {fragment[:180]}"
-    return ""
-
 
 def _quality_from(results: list[CollectorResult]) -> str:
     counts = Counter(result.status for result in results)
@@ -4255,21 +4314,29 @@ def _failure_mode_root_cause_statement(
             eligible_evidence_ids=eligible_evidence_ids,
             language=language,
         )
-    provenance = _runtime_failure_mode_provenance(matches, candidates)
+    provenance = _runtime_failure_mode_provenance(matches, candidates, language)
     return f"{statement} ({provenance})" if provenance else statement
 
 
 def _runtime_failure_mode_provenance(
-    matches: list[tuple[str, dict]], candidates: list[RankedCause] | None
+    matches: list[tuple[str, dict]],
+    candidates: list[RankedCause] | None,
+    language: str = "en",
 ) -> str:
     """Describe the runtime symptom that supplied the selected conclusion."""
     top_family = candidates[0].family if candidates else ""
     for family, symptom in matches:
         package_id = str(symptom.get("runtime_package_id") or "").strip()
         if package_id and (not top_family or family == top_family):
-            symptom_name = str(symptom.get("symptom") or "").strip()
+            symptom_name = localized_failure_mode_name(symptom, language)
             status = str(symptom.get("runtime_status") or "").strip()
             if symptom_name and status:
+                if language == "ko":
+                    return (
+                        "런타임 지식 출처: "
+                        f"패키지 {package_id}; family {family}; 매칭된 symptom "
+                        f"{symptom_name}; 상태 {status}"
+                    )
                 return (
                     "Runtime knowledge provenance: "
                     f"package {package_id}; family {family}; matched symptom "
@@ -4450,8 +4517,12 @@ def _detail_from(
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
     lines.extend(
+        # This section headlines "Recognised known issue: **X**" as settled fact
+        # (not a hedged suggestion), so its fuzzy_query must be the narrow text —
+        # match_runai_known_issues ignores fuzzy_query today, but this call site
+        # should not depend on that staying true to remain safe.
         _known_issue_cause_lines(
-            known_issues, observed_text, language, _alert_text(request)
+            known_issues, observed_text, language, _alert_signature_text(request)
         )
     )
     supporting = _supporting_evidence(results, eligible_support_ids=eligible_support_ids)
@@ -4508,11 +4579,14 @@ def _detail_from(
     lines.extend(["", h["appendix"]])
     lines.extend(_investigation_plan_lines(plan))
     lines.extend(
+        # fuzzy_query here reaches match_failure_mode_symptoms's BM25 recall and
+        # can render "Matched symptom **X**; known fixes ..." unconditionally —
+        # the narrow text, not investigation-order guidance.
         _knowledge_base_lines(
             kg_context,
             root_cause_candidates,
             observed_text,
-            _alert_text(request),
+            _alert_signature_text(request),
             masker,
             allow_remediation=allow_cause_specific_actions,
         )
@@ -4552,13 +4626,16 @@ def _detail_from(
     lines.extend(_affected_pods_lines(request, language))
     lines.extend(["", "### Troubleshooting Playbook", ""])
     lines.extend(
+        # Same reasoning as _knowledge_base_lines above: a fuzzy hit here can
+        # become the headline playbook entry (including the exclusive_actions
+        # short-circuit), so it must not be sourced from operator/runbook prose.
         _playbook_lines(
             root_cause_candidates,
             observed_text,
             failure_modes or {},
             troubleshooting_cases,
             known_issues or [],
-            _alert_text(request),
+            _alert_signature_text(request),
             components,
             masker,
             component=getattr(plan, "component", "") if plan is not None else "",
@@ -4741,6 +4818,29 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
         for observed, root_list in sorted(roots.items())
         if root_status.get(observed) == "complete-but-unordered"
     ]
+    # xid_catalog.yaml's linkage_note documents the driver/CUDA version an
+    # escalating XID's leads_to edge was actually CONFIRMED under. This line can
+    # carry up to 21 codes across unrelated chains, so a parenthetical per code
+    # does not scale here (see _xid_diagnostic_guidance_lines / _numbered_actions
+    # for the per-code identity clause); add at most one short clause per
+    # resolved chain, keyed to that chain's causal root (root_list[0] -- the
+    # topological origin _root_chain_for already resolved).
+    root_notes = list(
+        dict.fromkeys(
+            note
+            for observed, root_list in sorted(roots.items())
+            if root_status.get(observed, "ordered") == "ordered"
+            and root_list
+            and (note := graph_fixes.xid_linkage_notes.get(root_list[0]))
+        )
+    )
+    if language == "ko":
+        # Same rule as the mnemonic/description/fix text elsewhere in this file:
+        # the catalog carries no Korean linkage_note, so do not leak raw English
+        # into a ko report.
+        root_notes = [note for note in root_notes if re.search(r"[가-힣]", note)]
+    note_suffix = f" Escalation confirmed on: {'; '.join(root_notes)}." if root_notes else ""
+    note_suffix_ko = f" 승격 확인 환경: {'; '.join(root_notes)}." if root_notes else ""
     statuses = set(root_status.values())
     if "degraded" in statuses:
         qualification = (
@@ -4762,7 +4862,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
                 return (
                     f"- 관련 GPU 오류(XID): {rendered_codes} — "
                     f"인과 사슬(뿌리→관측): {'; '.join(ordered_chains)}; {details}. "
-                    "근본 원인을 먼저 조치하세요."
+                    "근본 원인을 먼저 조치하세요." + note_suffix_ko
                 )
             return (
                 f"- 관련 GPU 오류(XID): {rendered_codes} — "
@@ -4772,6 +4872,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
                     if not qualification_ko
                     else qualification_ko.strip()
                 )
+                + note_suffix_ko
             )
         if unordered:
             details = "; ".join(
@@ -4795,12 +4896,13 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
             return (
                 f"- Related GPU errors (XID): {rendered_codes} — causal chain "
                 f"(root → observed): {'; '.join(ordered_chains)}; {details}. "
-                "Fix the origin first."
+                "Fix the origin first." + note_suffix
             )
         return (
             f"- Related GPU errors (XID): {rendered_codes} — causal chain (root → observed): "
             f"{'; '.join(ordered_chains)}."
             + (" Fix the root XID first." if not qualification else qualification)
+            + note_suffix
         )
     if unordered:
         details = "; ".join(
@@ -4816,6 +4918,39 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
     )
 
 
+def _xid_identity_clause(
+    graph_fixes: GraphRemediation | None, code: int, masker: Masker | None = None
+) -> str:
+    """"name (severity)" naming what an XID itself IS -- e.g. "GPU has fallen
+    off the bus (fatal)" -- not just its fix. Prefers the graph's own catalog
+    projection (kg_enrichment._fill_xid_detail); falls back to the local
+    knowledge/xid_catalog.yaml when the graph has no detail for this code (a
+    full TypeDB outage, or a partial/stale ingest), so that outage degrades
+    the wording rather than deleting it. Empty when neither source has a
+    mnemonic/description for this code -- never invented.
+    """
+    name = ""
+    severity = ""
+    if graph_fixes is not None:
+        name = str(
+            (graph_fixes.xid_descriptions or {}).get(code)
+            or (graph_fixes.xid_mnemonics or {}).get(code)
+            or ""
+        ).strip()
+        severity = str((graph_fixes.xid_severities or {}).get(code) or "").strip()
+    if not name:
+        entry = load_xid_catalog(os.getenv("XID_CATALOG_FILE", "knowledge/xid_catalog.yaml")).get(
+            code
+        )
+        if entry:
+            name = str(entry.get("description") or entry.get("mnemonic") or "").strip()
+            severity = severity or str(entry.get("severity") or "").strip()
+    if not name:
+        return ""
+    name = _safe_line(name, limit=80, masker=masker)
+    return f"{name} ({severity})" if severity else name
+
+
 def _xid_diagnostic_guidance_lines(
     graph_fixes: GraphRemediation | None, language: str
 ) -> list[str]:
@@ -4823,11 +4958,18 @@ def _xid_diagnostic_guidance_lines(
         return []
     masker = build_masker(())
     label = "진단 안내" if language == "ko" else "Diagnostic guidance"
-    return [
-        f"- {label} (XID {code}): {_safe_line(trigger, limit=360, masker=masker)}"
-        for code, trigger in sorted(graph_fixes.xid_triggers.items())
-        if language != "ko" or re.search(r"[가-힣]", str(trigger))
-    ]
+    lines: list[str] = []
+    for code, trigger in sorted(graph_fixes.xid_triggers.items()):
+        if language == "ko" and not re.search(r"[가-힣]", str(trigger)):
+            continue
+        identity = _xid_identity_clause(graph_fixes, code, masker)
+        # Same rule as the trigger text above: the catalog carries no Korean
+        # mnemonic/description, so do not leak raw English into a ko report.
+        if identity and language == "ko" and not re.search(r"[가-힣]", identity):
+            identity = ""
+        header = f"XID {code} — {identity}" if identity else f"XID {code}"
+        lines.append(f"- {label} ({header}): {_safe_line(trigger, limit=360, masker=masker)}")
+    return lines
 
 
 def _specific_keyword(kw: str) -> bool:
@@ -4961,7 +5103,38 @@ def _promote_signature_cause(
     """A specific signature names the headline family; the keyword ranker is only
     the no-signal fallback. Precedence: NVIDIA XID (dispositive) > known-issue
     signature > curated symptom keyword > ranker. When the signature agrees with
-    the ranker's top family the richer ranked entry is kept as-is."""
+    the ranker's top family the richer ranked entry is kept as-is.
+
+    Every match -- agreement with the ranker included -- passes a specificity
+    gate first (``_promotable``): a match too weak to promote must not floor
+    an unearned score, and (being a ``continue`` rather than a ``return``)
+    must not stop a later, stronger signature for a DIFFERENT family from
+    being evaluated in this same loop (S3).
+
+    A non-catalog family additionally requires the keyword to appear in
+    ``evidence_text`` (observed EVIDENCE, no alert text) -- an unvalidated
+    label needs more than the alert's own word for it (S7's non-catalog case,
+    unchanged). A CATALOG family does not: the alert's own text is a
+    first-class signature source everywhere else in this pipeline
+    (``_alert_signature_text``'s docstring: "it often carries the signature
+    ... even when every collector comes back empty"), proven by dozens of
+    tests where an alert's summary/description alone must reach the correct
+    catalog family with zero collector evidence -- gating catalog promotion
+    on non-alert evidence would kill exactly the promotions S7's own
+    guardrail protects ("must not kill a promotion whose keyword IS in the
+    evidence" -- alert text, by this codebase's own definition, counts). The
+    real fix for S7's confirmed harm (a non-evidence alert FIELD like
+    runbook_url contaminating the match) is S1, which keeps that text out of
+    ``state.observed`` in the first place by building it from
+    ``_alert_signature_text`` rather than the permissive ``_alert_text``
+    (see that pair's docstrings for the guidance-vs-promotion boundary); S2
+    additionally stops a support-less promotion (catalog or not) from
+    outranking a stronger evidence-backed one.
+
+    A promotion may also not displace a candidate that already scores higher
+    AND carries real evidence support -- a bare signature must not leapfrog a
+    stronger, evidence-backed ranked cause (S2).
+    """
     if xid_codes:
         return _promote_xid_cause(candidates, xid_codes)
     if typed_state[0]:
@@ -4976,6 +5149,11 @@ def _promote_signature_cause(
         support_ids = support.get("evidence_ids") or []
         support_agents = support.get("agents") or []
         support_groups = support.get("groups") or []
+        matched_keywords = entry.get("matched_keywords") or []
+        if not _promotable(matched_keywords, family):
+            continue
+        if family not in FAMILIES and not _keyword_hits(evidence_text, matched_keywords)[0]:
+            continue
         if family == top_family:
             return [
                 _with_signature_support(
@@ -4988,11 +5166,6 @@ def _promote_signature_cause(
                 ),
                 *candidates[1:],
             ]
-        matched_keywords = entry.get("matched_keywords") or []
-        if not _promotable(matched_keywords, family):
-            continue
-        if family not in FAMILIES and not _keyword_hits(evidence_text, matched_keywords)[0]:
-            continue
         rationale = f"matched known-issue signature: {issue}"
         existing = next((candidate for candidate in candidates if candidate.family == family), None)
         lead = (
@@ -5024,6 +5197,10 @@ def _promote_signature_cause(
                 ],
             )
         )
+        # S2: a promotion may not displace a candidate that already scores
+        # higher AND carries real evidence support.
+        if candidates and candidates[0].score > lead.score and candidates[0].support_evidence_ids:
+            continue
         return [lead] + [c for c in candidates if c.family != family]
     for family, symptom in symptom_matches:
         if not family or is_matcher_only_family(family):
@@ -5035,6 +5212,12 @@ def _promote_signature_cause(
         support_agents = support.get("agents") or []
         support_groups = support.get("groups") or []
         matched_keywords = [str(item) for item in symptom.get("matched_keywords") or []]
+        if not _promotable(matched_keywords, family):
+            continue
+        # No evidence_text gate here: every curated symptom family is a
+        # catalog family (the closed-vocabulary invariant), so this loop's
+        # matches are the SAME "alert text is a legitimate signature source"
+        # case documented on this function -- see the known-issue loop above.
         if family == top_family:
             return [
                 _with_signature_support(
@@ -5049,8 +5232,6 @@ def _promote_signature_cause(
                 ),
                 *candidates[1:],
             ]
-        if not _promotable(symptom.get("matched_keywords") or [], family):
-            continue
         rationale = f"matched curated symptom: {symptom.get('symptom')}"
         existing = next((candidate for candidate in candidates if candidate.family == family), None)
         lead = (
@@ -5085,6 +5266,10 @@ def _promote_signature_cause(
                 ],
             )
         )
+        # S2: same "cannot displace a stronger evidence-backed candidate" rule
+        # as the known-issue loop above.
+        if candidates and candidates[0].score > lead.score and candidates[0].support_evidence_ids:
+            continue
         return [lead] + [c for c in candidates if c.family != family]
     return candidates
 
@@ -5524,6 +5709,12 @@ def _known_issue_cause_lines(
         line = f"- {label}: **{name}**{ver}"
         if reason:
             line += f" — {reason}"
+        # Source/KB citations (e.g. "NVIDIA Case 01074073") -- identifiers, not
+        # prose, so (like the affected/fixed version above) they render in both
+        # languages rather than going through the no-Korean-text ko suppression
+        # used for catalog mnemonics/descriptions elsewhere in this file.
+        if refs := [str(r) for r in (issue.get("refs") or []) if str(r).strip()]:
+            line += f" ({', '.join(refs)})"
         out.append(line)
     return out
 
@@ -5625,7 +5816,11 @@ def _numbered_actions(
         allow_cause_specific_actions = allow_graph_remediation
     ordered: list[str] = []
     specific_actions = 0
-    fuzzy = _alert_text(request)
+    # NOT ``_alert_text``: this fuzzy-matches a symptom whose actions get
+    # rendered straight into the numbered list below (including the
+    # exclusive_actions short-circuit) with no LLM verify gate in front of it
+    # here, so it must be the narrow, non-evidence-field-free text.
+    fuzzy = _alert_signature_text(request)
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
     symptom_matches = _actionable_failure_mode_matches(
@@ -5718,14 +5913,22 @@ def _numbered_actions(
             if graph_fixes.root_xid_status.get(observed, "ordered") == "ordered"
             for root in roots
         }
+        masker = build_masker(())
         # Fix the ROOT of the causal chain before its downstream symptoms.
         for code in sorted(graph_fixes.xid_fixes, key=lambda c: (c not in root_codes, c)):
             if language == "ko":
                 label = "근본 XID" if code in root_codes else "XID"
             else:
                 label = "root XID" if code in root_codes else "XID"
+            identity = _xid_identity_clause(graph_fixes, code, masker)
+            # Same rule as the fix-text filter below: the catalog carries no
+            # Korean mnemonic/description, so do not leak raw English into a
+            # ko report.
+            if identity and language == "ko" and not re.search(r"[가-힣]", identity):
+                identity = ""
+            header = f"{label} {code} — {identity}" if identity else f"{label} {code}"
             fixes = [
-                f"({label} {code}) {fix}"
+                f"({header}) {fix}"
                 for fix in graph_fixes.xid_fixes[code]
                 # TypeDB's graph-remediation statements currently have no
                 # locale field. Do not leak raw English into a deterministic
@@ -7174,12 +7377,25 @@ def _catalog_only_knowledge(
     }
 
 
-def _alert_text(request: AlertAnalysisRequest) -> str:
-    """The alert's own labels+annotations text — it often carries the signature
-    (e.g. 'XID 79 ... GPU has fallen off the bus') even when every collector
-    comes back empty."""
-    alert = request.alert
-    labels = alert.labels or {}
+# A link says where to READ about an alert; it never observes one. Every
+# kube-prometheus-stack rule ships runbook_url=https://runbooks.prometheus-
+# operator.dev/..., so leaving a raw link in made the vendor's own
+# documentation host a matchable signature: INC-…-000001 headlined
+# observability_accuracy ("this alert is a false alarm", 7.0/medium, zero
+# supporting evidence) on the single keyword "prometheus-operator" taken from
+# that URL. Same rule as the ranker's METADATA_VALUE_KEYS — what we ASKED or
+# where to look is not what came back. A URL is never a signal either way
+# (guidance has no use for a doc host name any more than the matcher does), so
+# both ``_alert_text`` and ``_alert_signature_text`` below strip it out of
+# annotation prose while keeping the human-readable text around it.
+_ALERT_LINK_RE = re.compile(r"https?://\S+", re.I)
+
+
+def _compose_alert_text(labels: dict[str, Any], annotations: dict[str, Any]) -> str:
+    """Shared assembly for ``_alert_text``/``_alert_signature_text``: recompose
+    Boolean condition/status label pairs, then append the remaining label and
+    annotation values (links stripped out of the latter). Callers choose what
+    goes IN via ``labels``/``annotations`` — this function only renders it."""
     # Prometheus/Kubernetes alerts commonly encode a Boolean condition across
     # two independent labels (for example condition=DiskPressure,status=false).
     # Flattening mapping values preserves sender insertion order, so a false
@@ -7212,8 +7428,53 @@ def _alert_text(request: AlertAnalysisRequest) -> str:
         for key, value in labels.items()
         if str(key).casefold() not in paired
     )
-    parts.extend(str(v) for v in (alert.annotations or {}).values())
+    parts.extend(
+        stripped
+        for value in annotations.values()
+        if (stripped := _ALERT_LINK_RE.sub(" ", str(value)).strip())
+    )
     return " ".join(parts)
+
+
+def _alert_text(request: AlertAnalysisRequest) -> str:
+    """The alert's own labels+annotations text, permissively — every field
+    (including ``runbook_url`` and the operator's own ``operator_prompt``
+    speculation) is available here. This feeds investigation ORDER: component
+    identification, fuzzy recall, and the non-diagnostic guidance block, where
+    the operator saying "check CoreDNS" should steer what gets shown. It must
+    never be used as the haystack a signature/symptom match can be PROMOTED
+    from — that is ``_alert_signature_text``, the deliberately narrower
+    sibling below. (A bare link is still stripped out of annotation prose: a
+    URL is not useful investigation-order signal either, and dropping it keeps
+    the human-readable text around it.)"""
+    alert = request.alert
+    return _compose_alert_text(alert.labels or {}, alert.annotations or {})
+
+
+def _alert_signature_text(request: AlertAnalysisRequest) -> str:
+    """The alert's own text, narrowed to what may support a signature/symptom
+    match — it often carries the signature (e.g. 'XID 79 ... GPU has fallen
+    off the bus') even when every collector comes back empty. Non-evidence
+    fields (runbook/operator_prompt/query/..., see
+    ``_ALERT_NON_EVIDENCE_FIELD_RE``) are excluded entirely: operator guidance
+    may steer investigation order (``_alert_text``) but must never promote a
+    cause. Feeds ``_observed_text``'s alert branch (state.observed, XID
+    extraction, self-check's declared-alert, and the actions/playbook/
+    knowledge-base fuzzy recall that can render a matched symptom's actions
+    into the report) — every consumer that can turn a match into rendered
+    output, as opposed to a conditional suggestion."""
+    alert = request.alert
+    labels = {
+        key: value
+        for key, value in (alert.labels or {}).items()
+        if not _ALERT_NON_EVIDENCE_FIELD_RE.search(str(key))
+    }
+    annotations = {
+        key: value
+        for key, value in (alert.annotations or {}).items()
+        if not _ALERT_NON_EVIDENCE_FIELD_RE.search(str(key))
+    }
+    return _compose_alert_text(labels, annotations)
 
 
 def _observed_text(
@@ -7228,8 +7489,10 @@ def _observed_text(
     if request is not None:
         # The alert message itself is evidence: signature matching (symptoms, known
         # issues, XIDs) must see it, or an alert whose collectors all came back
-        # empty matches NOTHING even though its own text names the fault.
-        parts.append(_alert_text(request))
+        # empty matches NOTHING even though its own text names the fault. Use the
+        # NARROW alert text here (not ``_alert_text``): this haystack feeds
+        # ``state.observed``, which promotes causes — see ``_alert_signature_text``.
+        parts.append(_alert_signature_text(request))
     for result in results:
         if not _collector_is_evidence(result):
             continue
@@ -7616,17 +7879,17 @@ def _short_sentence(value: str, *, limit: int) -> str:
     text = " ".join(value.split())
     if not text:
         return "The agent has not received enough alert context to name a root cause."
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+    # ponytail: textwrap.shorten cuts at a word boundary instead of mid-word --
+    # the naive text[:limit] slice this replaced produced garbage like
+    # "...ResourceQu…입니다." in a real report (word chopped, then a Korean
+    # copula glued onto the fragment). Same fix as general_guidance._safe.
+    return textwrap.shorten(text, width=limit, placeholder="…")
 
 
 def _safe_line(value: object, *, limit: int, masker: Masker | None = None) -> str:
     active_masker = masker or build_masker(())
     text = " ".join(active_masker.mask_text(str(value or "")).split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+    return textwrap.shorten(text, width=limit, placeholder="…") if text else text
 
 
 def _investigation_plan_lines(plan: InvestigationPlan | None) -> list[str]:
@@ -7894,6 +8157,19 @@ def _recommended_action_lines(
     include_similar: bool = True,
 ) -> list[str]:
     # Concrete actions only — no generic "trust the evidence" filler.
+    #
+    # R2: this used to also emit "Restore Run:ai API authentication" /
+    # "Fix Loki reachability" / "Restore Postgres connectivity" whenever
+    # ``missing`` carried the matching key — regardless of WHY it was missing.
+    # In a real run that gap was OUR OWN transport failure (MCP unavailable:
+    # self-signed certificate, HTTP 404), and it was the ONLY action on a
+    # GPU-exhaustion incident: fixing our own tooling is not incident
+    # remediation. ``missing`` (kept for callers/signature stability) and its
+    # human-readable cause already surface honestly via ``response.missing_data``
+    # and ``response.warnings`` (populated straight from each collector's own
+    # ``missing_data``/``warnings``, see ``_aggregate_evidence``) and, when the
+    # RCA could not settle, via ``_operator_questions``'s "is X reachable?" —
+    # this list stays reserved for fixing the CLUSTER problem.
     lines: list[str] = []
     # Weave the proven RCA/fix from a high-similarity past incident into the actions.
     top = _top_similar_incident(request) if request and include_similar else None
@@ -7905,22 +8181,6 @@ def _recommended_action_lines(
                 f"{top.similarity:.2f}) was resolved by: {proven} — verify this fix "
                 "applies here before repeating it."
             )
-    if "runai.auth" in missing or "runai.query" in missing:
-        lines.append(
-            "- Restore Run:ai API authentication so the agent can attach "
-            "workload/project context on the next analysis run."
-        )
-    if "loki.auth" in missing or "loki.query" in missing:
-        lines.append(
-            "- Fix Loki reachability for the next analysis run: prefer the direct "
-            "loki-read service, and only add tenant/auth settings when the endpoint "
-            "explicitly requires them."
-        )
-    if "postgres.query" in missing or "postgres.connection" in missing:
-        lines.append(
-            "- Restore Postgres connectivity so RCA memory and similar-incident "
-            "evidence stay current."
-        )
     return lines
 
 
@@ -7931,13 +8191,21 @@ async def _operator_questions(
     target: AnalysisTarget,
     next_check: str,
     executed_queries: list[str] | None = None,
+    held_evidence: list[str] | None = None,
 ) -> list[str]:
     """2-4 concrete follow-up questions when the RCA could not settle.
 
     Derived deterministically from missing_data + the plan; the LLM only sharpens
     the wording when configured (deterministic list is the fallback).
+
+    ``held_evidence`` (eligible artifact summaries, e.g. "E01: gpu_capacity 8 /
+    gpu_requested 8") cross-checks every draft question -- R4: a real run asked
+    for kube-scheduler logs already held as E113 and per-node GPU usage already
+    held as E01, because this function previously saw only executed QUERY
+    strings, never what they returned.
     """
     ko = getattr(settings, "language", "en") == "ko"
+    held_text = " ".join(held_evidence or [])
 
     def has(prefix: str) -> bool:
         return any(item.startswith(prefix) for item in missing)
@@ -7982,6 +8250,10 @@ async def _operator_questions(
             if ko
             else "Is the node this alert fired on accessible (system agent or SSH)?"
         )
+    # R4: drop any draft an eligible artifact already answers BEFORE the
+    # "ensure at least 2" fallback, so a filtered-out ask is genuinely replaced
+    # rather than just padding a list that already had one held-evidence dup.
+    questions = [q for q in questions if not _already_answered(q, held_text)]
     if len(questions) < 2:
         questions.append(
             "알림 발생 시각 전후에 배포나 설정 변경이 있었는지 확인해 주세요."
@@ -7993,13 +8265,45 @@ async def _operator_questions(
     if llm_configured(settings, getattr(settings, "llm_model_insight", "")):
         try:
             sharpened = await _sharpen_operator_questions(
-                settings, questions, missing, plan, executed_queries or []
+                settings, questions, missing, plan, executed_queries or [], held_evidence or []
             )
         except Exception:  # noqa: BLE001 - sharpening is best-effort
             sharpened = None
         if sharpened:
+            sharpened = [q for q in sharpened if not _already_answered(q, held_text)]
+        if sharpened:
             return sharpened
     return [_short_sentence(question, limit=240) for question in questions]
+
+
+_QUESTION_STOPWORDS = frozenset(
+    {
+        "the", "is", "are", "was", "were", "this", "that", "for", "and", "or",
+        "please", "check", "confirm", "verify", "provide", "does", "did",
+        "확인해", "주세요", "있는지", "설정되어", "가능한지", "대한", "관련",
+    }
+)
+
+
+def _already_answered(question: str, held_text: str) -> bool:
+    """True when an eligible artifact's own text already covers a draft
+    question -- most of its salient (4+ char) words already appear in
+    ``held_text``. Deliberately conservative (>=60% overlap, needs 2+ salient
+    words) so a generic connectivity question ("Is the Kubernetes token
+    valid?") is never spuriously dropped; it only catches a near-duplicate ask
+    for content an eligible artifact literally already carries."""
+    if not question or not held_text:
+        return False
+    words = [
+        w
+        for w in re.findall(r"[a-z0-9가-힣]+", question.casefold())
+        if len(w) > 3 and w not in _QUESTION_STOPWORDS
+    ]
+    if len(words) < 2:
+        return False
+    held = held_text.casefold()
+    hits = sum(1 for w in words if w in held)
+    return hits / len(words) >= 0.6
 
 
 def _executed_evidence_queries(artifacts: list[object], limit: int = 12) -> list[str]:
@@ -8019,12 +8323,36 @@ def _executed_evidence_queries(artifacts: list[object], limit: int = 12) -> list
     return queries
 
 
+def _held_evidence_summaries(
+    artifacts: list[object], eligible_support_ids: set[str] | None, limit: int = 12
+) -> list[str]:
+    """What an eligible artifact already SAYS -- R4's other half. Query strings
+    alone (``_executed_evidence_queries``) tell a reader what was ASKED, not
+    what came back, so a probe that ran and returned "gpu_capacity 8 /
+    gpu_requested 8" gave no signal that the question was already answered."""
+    out: list[str] = []
+    for item in artifacts:
+        evidence_id = str(getattr(item, "evidence_id", "") or "")
+        if not evidence_id or not _artifact_is_scoped_support(
+            item, eligible_support_ids=eligible_support_ids
+        ):
+            continue
+        summary = " ".join(str(getattr(item, "summary", "") or "").split())
+        if not summary:
+            continue
+        out.append(f"{evidence_id}: {summary}")
+        if len(out) == limit:
+            break
+    return out
+
+
 async def _sharpen_operator_questions(
     settings: Settings,
     questions: list[str],
     missing: list[str],
     plan: InvestigationPlan | None,
     executed_queries: list[str] | None = None,
+    held_evidence: list[str] | None = None,
 ) -> list[str] | None:
     """LLM-sharpened operator questions; None keeps the deterministic list."""
     ko = getattr(settings, "language", "en") == "ko"
@@ -8033,7 +8361,8 @@ async def _sharpen_operator_questions(
         "settle on a root cause. Rewrite the draft questions to be sharper and more "
         "specific to the missing data and investigation plan. Do not invent facts, "
         "do not add generic filler. Do not ask the operator to run checks equivalent "
-        "to any query in the already-executed evidence list; target only genuinely "
+        "to any query in the already-executed evidence list, and never ask for "
+        "something an item in held_evidence already states; target only genuinely "
         "missing evidence. "
         + ("반드시 한국어로 작성하세요. " if ko else "Write in English. ")
         + 'Respond with ONLY JSON: {"questions": [str, ...]} containing 2 to 4 questions.'
@@ -8044,6 +8373,7 @@ async def _sharpen_operator_questions(
             "missing_data": missing,
             "plan": plan.as_dict() if plan else {},
             "already_executed_evidence_queries": executed_queries or [],
+            "held_evidence": held_evidence or [],
         },
         ensure_ascii=False,
         default=str,
@@ -8158,13 +8488,18 @@ def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
     # remedies must arrive through a symptom->action relation; this renderer is
     # reserved for signature-specific graph facts such as XID codes.
     for code, fixes in graph_fixes.xid_fixes.items():
-        lines.append(f"  - NVIDIA Xid {code}:")
+        identity = _xid_identity_clause(graph_fixes, code, masker)
+        suffix = f" — {identity}" if identity else ""
+        lines.append(f"  - NVIDIA Xid {code}{suffix}:")
         lines.extend(
             f"    - {_safe_line(statement, limit=360, masker=masker)}" for statement in fixes[:5]
         )
     for code, trigger in graph_fixes.xid_triggers.items():
+        identity = _xid_identity_clause(graph_fixes, code, masker)
+        suffix = f" — {identity}" if identity else ""
         lines.append(
-            f"  - Diagnostic guidance (XID {code}): {_safe_line(trigger, limit=360, masker=masker)}"
+            f"  - Diagnostic guidance (XID {code}{suffix}): "
+            f"{_safe_line(trigger, limit=360, masker=masker)}"
         )
     for model, xids in graph_fixes.model_xids.items():
         rendered = ", ".join(str(x) for x in xids)

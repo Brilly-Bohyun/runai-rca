@@ -31,6 +31,7 @@ from app.services.root_cause_ranking import (
     FAMILIES,
     rank_root_cause_candidates,
 )
+from ontology import load_knowledge, load_troubleshooting
 
 ROOT = Path(__file__).parents[1]
 FAMILY_ENTRIES = yaml.safe_load((ROOT / "knowledge/families.yaml").read_text())
@@ -266,3 +267,68 @@ def test_every_conclusion_has_executable_diagnostic_reasoning() -> None:
             and alternative.get("discriminator")
             for alternative in alternatives
         ), f"{node_id}: invalid alternative"
+
+
+class _PastFamilyGate(Exception):
+    """Raised by _DummyTx.query so a test can tell "rejected at the family
+    gate" (ValueError) apart from "accepted, and only then tried TypeDB"."""
+
+
+class _DummyTx:
+    def query(self, _match: str) -> None:
+        raise _PastFamilyGate
+
+
+def test_new_catalog_family_is_not_silently_dropped_by_the_ontology_loaders(
+    tmp_path, monkeypatch
+) -> None:
+    """Regression guard for a defect this repo shipped twice: load_knowledge.py
+    and load_troubleshooting.py each carried their OWN hardcoded FAMILIES copy
+    of the schema.tql/families.yaml vocabulary instead of reading
+    families.yaml, so when platform_version_bug/expected_known_behavior were
+    added to the real catalog, load_knowledge.main() silently `skip`ped every
+    knowledge entry declaring them and load_troubleshooting._ensure_cause
+    hard-`raise`d on every runbook conclusion declaring them. Both now derive
+    FAMILIES from app.knowledge.load_family_catalog(families.yaml), so a new
+    family reaches both loaders the moment it lands in the YAML, with no
+    matching code change required.
+    """
+    # The real, non-synthetic catalog first (before any monkeypatching below):
+    # every family families.yaml declares today -- including the two that
+    # previously triggered this exact bug -- reaches both loaders from their
+    # default (no-argument / module-level) wiring.
+    for family in ("platform_version_bug", "expected_known_behavior"):
+        assert family in load_knowledge.FAMILIES
+        with pytest.raises(_PastFamilyGate):
+            load_troubleshooting._ensure_cause(_DummyTx(), family)
+
+    # Now prove the mechanism generalizes to a family that does not exist yet:
+    # load_knowledge must pick it up from a families.yaml it has never seen,
+    # with no code change.
+    synthetic = tmp_path / "families.yaml"
+    synthetic.write_text(
+        yaml.safe_dump(
+            [
+                {
+                    "family": "zz_new_test_family",
+                    "canonical_agent": "loki",
+                    "agents": ["loki"],
+                    "keywords": ["zz totally new signature"],
+                    "planner_keywords": ["zz totally new signature"],
+                    "reason": "synthetic family for the loader-sync regression test",
+                }
+            ]
+        )
+    )
+    families = load_knowledge._catalog_families(synthetic)
+    assert "zz_new_test_family" in families
+    assert "insufficient_evidence" in families  # schema sentinel, not a families.yaml entry
+
+    # load_troubleshooting._ensure_cause's gate is the SAME name (imported,
+    # not re-declared): swapping what it points at changes what the gate
+    # accepts, proving it is not a second hardcoded literal.
+    monkeypatch.setattr(load_troubleshooting, "FAMILIES", families)
+    with pytest.raises(_PastFamilyGate):
+        load_troubleshooting._ensure_cause(_DummyTx(), "zz_new_test_family")
+    with pytest.raises(ValueError, match="unknown root-cause family"):
+        load_troubleshooting._ensure_cause(_DummyTx(), "definitely_not_a_catalog_family")

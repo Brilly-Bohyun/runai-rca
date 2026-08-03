@@ -620,11 +620,28 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	}
 	confidence, _ := numberToFloat(hypothesis["confidence"])
 	evidenceSummaries, observedTerms := traceEvidenceSummaries(trace, support)
+	// mechanism is the ranking LLM's internal hypothesis text -- English by
+	// construction, never localized, regardless of the deployment's report
+	// language. analysis_summary IS in that language (Korean by chart default),
+	// and the gate above already guarantees it is non-empty, so its headline
+	// sentence is the only genuinely-localized text this snapshot carries.
+	// Without a "_ko" pair, agent/app/knowledge.py (localized_failure_mode_name /
+	// _failure_mode_root_cause_statement) silently fell back to the English
+	// mechanism for every learned remediation in a Korean report -- confirmed
+	// live via a "이전 인시던트에서 학습된 지식" playbook line bolding an English
+	// mechanism sentence mid-Korean-paragraph.
+	localizedMechanism := firstAnalysisSentence(stringValue(snapshot.Snapshot["analysis_summary"]))
+	actions := operatorConfirmedActions(card)
 	payload := map[string]any{
 		"schema_version": 1, "source_case_id": snapshot.CaseID, "root_cause_family": snapshot.RootCauseFamily,
 		"quality_score": quality, "quality_source": source, "hypothesis_id": hypothesis["hypothesis_id"],
 		"family": family, "mechanism": mechanism, "confidence": confidence, "supporting_evidence_ids": sortedStringSet(support),
-		"title": family, "summary": "Evidence-backed " + family + " — " + mechanism,
+		// Not "Evidence-backed " + family + " — " + mechanism: family is a raw
+		// snake_case slug and mechanism may already be Korean, so that
+		// concatenation produced a malformed, no-language sentence fragment
+		// (e.g. "Evidence-backed runai_scheduling_quota — 대상 Pod가 15분..."). The
+		// family is already its own field; the mechanism alone reads as prose.
+		"title": family, "summary": mechanism,
 		"provenance":         map[string]any{"source": "approved_case_snapshot", "case_id": snapshot.CaseID, "incident_id": snapshot.IncidentID},
 		"evidence_summaries": evidenceSummaries, "analysis_run_id": snapshot.RunID, "analysis_hash": snapshot.AnalysisHash,
 		"runtime_status": "not_published", "mirror_status": "current",
@@ -637,8 +654,14 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 					// they indicate (name), and what the operator confirmed
 					// fixed it (actions, from the evaluation's effective-action
 					// field on this case). Actions attach to this mechanism,
-					// never to the family as a whole.
-					"name": mechanism, "keywords": compiledSymptomKeywords(card, observedTerms), "actions": operatorConfirmedActions(card),
+					// never to the family as a whole. name_ko/reason_ko carry
+					// the deployment-language pair for Korean reports;
+					// actions_ko mirrors actions (there is only ever one
+					// authored version of the operator's confirmed remediation).
+					"name": mechanism, "name_ko": localizedMechanism,
+					"reason": mechanism, "reason_ko": localizedMechanism,
+					"keywords": compiledSymptomKeywords(card, observedTerms),
+					"actions":  actions, "actions_ko": actions,
 				}},
 			}},
 			"probe_template_ids": map[string]any{family: probeTemplateIDs},

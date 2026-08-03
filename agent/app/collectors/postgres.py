@@ -1113,6 +1113,13 @@ def _postgres_history_artifacts(
                         **({"evidence_window": evidence_window} if evidence_window else {}),
                         **({"observed_entity": observed_entity} if observed_entity else {}),
                         **({"naive_timestamps_assumed_utc": True} if _history_rows_assume_utc(table) else {}),
+                        # investigator._attach_typed_artifacts only auto-attaches a
+                        # present+scoped artifact when the collector itself confirms
+                        # this specific target identity -- kubernetes.py has stamped
+                        # this for a while; postgres.py never did. rows_verified
+                        # already re-checked identity per sampled row (see
+                        # _verified_target_history_rows), so it is the same proof.
+                        **({"target_identity_verified": True} if rows_verified else {}),
                     },
                     "target_matching_rows": matches,
                     "target_rows": table.get("target_rows") or [],
