@@ -199,3 +199,166 @@ def test_node_label_reaches_the_model_gate_as_a_catalog_name() -> None:
     assert _node_gpu_product([{"name": "node", "data": bare}]) == ""
     assert _gpu_model_candidates("") == []
     assert _gpu_model_candidates("some-accelerator") == ["some-accelerator"]
+
+
+def test_no_node_cluster_inventory_reaches_the_model_gate() -> None:
+    """A real operator question ("XID48 에러가 발생했는데 어떤 걸 해야할까요?")
+    names no node, so the Kubernetes node label (the other test above) can
+    never populate ``gpu_model``. The Run:ai cluster-wide inventory
+    (``get_cluster_physical_inventory``'s ``byGpuModel``, surfaced by the
+    runai drill-down into its own CollectorResult.details -- see
+    test_drilldown.py's ``test_cluster_physical_inventory_sets_runai_gpu_model_with_no_node``)
+    is the only reachable source. This closes the full chain: no-node target
+    -> runai collector result -> ``_gpu_model_from`` -> ``_query_remediation``
+    dropping XID 48's B100/GB200-only ancestors while keeping 48's own fix.
+    """
+    from app.collectors.base import AnalysisTarget, CollectorResult
+    from app.services.pipeline import _gpu_model_from
+
+    target = AnalysisTarget(
+        cluster="prod-cluster",
+        project="",
+        queue="",
+        namespace="runai-vision",
+        workload_name="",
+        workload_type="",
+        runai_workload_id="",
+        node="",  # the operator's question named no node
+        pod="",
+        severity="warning",
+        alert_name="Xid48",
+    )
+    # What drilldown._run_query writes into the runai CollectorResult once
+    # get_cluster_physical_inventory succeeds.
+    runai_result = CollectorResult(
+        agent="runai",
+        status="ok",
+        summary="Run:ai queried",
+        details={"gpu_model": "NVIDIA-H100-80GB-HBM3"},
+    )
+    kubernetes_result = CollectorResult(
+        agent="kubernetes", status="unavailable", summary="no node in the alert"
+    )
+
+    detected_model = _gpu_model_from(target, [kubernetes_result, runai_result])
+    assert detected_model == "NVIDIA-H100-80GB-HBM3"
+
+    def extra(query: str) -> list[dict]:
+        if "fixes_for_xid(48)" in query:
+            return [{"x": "Power-cycle or reset the GPU."}]
+        if "fixes_for_xid(144)" in query:
+            return [{"x": "Reseat or replace the NVLink cable."}]
+        if "fixes_for_xid(145)" in query:
+            return [{"x": "Reset the NVLink fabric."}]
+        if "fixes_for_xid(146)" in query:
+            return [{"x": "Replace the NVSwitch tray."}]
+        if "trigger_for_xid(48)" in query:
+            return [{"x": "Check ECC counters before reset."}]
+        if "xids_for_gpu_model" in query:
+            return [{"x": code} for code in (8, 11, 48, 79)]  # no 144/145/146
+        return []
+
+    out = _query_remediation(
+        _FakeClient(_root_chain_run(extra)), "", [48], detected_model
+    )  # type: ignore[arg-type]
+
+    # The B100/GB200-only upstream ancestors are gone from every map the
+    # recommended-actions renderer reads...
+    assert 48 not in out.root_xids
+    assert 144 not in out.xid_fixes and 145 not in out.xid_fixes and 146 not in out.xid_fixes
+    # ...but the OBSERVED xid keeps its own fix and trigger.
+    assert out.xid_fixes == {48: ["Power-cycle or reset the GPU."]}
+    assert out.xid_triggers == {48: "Check ECC counters before reset."}
+    assert len(out.warnings) == 1
+    for code in ("144", "145", "146"):
+        assert code in out.warnings[0]
+
+
+def test_cluster_inventory_is_gathered_without_the_llm_choosing_it() -> None:
+    """The model gate must not depend on which tools the LLM happened to pick.
+
+    GPU model is an invariant property of the cluster and the input to a
+    correctness gate, so it is gathered like list_node_pools -- unconditionally
+    -- not as a drill-down. Before this, the same XID question answered
+    differently on the same cluster depending on the model's tool choice.
+    """
+    import asyncio
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from app.collectors import runai_mcp
+    from app.collectors.runai import _mcp_cluster_gpu_model
+    from tests.test_orchestrator import make_settings, make_target
+
+    called: list[tuple[str, dict]] = []
+
+    async def fake_mcp_call(url, tool, arguments, headers=None):  # noqa: ANN001
+        called.append((tool, dict(arguments)))
+        # The official server returns structuredContent per its outputSchema.
+        payload = (
+            {"byGpuModel": [{"gpuModel": "NVIDIA-H100-80GB-HBM3", "nodes": 4}]}
+            if tool == "get_cluster_physical_inventory"
+            else {}
+        )
+        return SimpleNamespace(isError=False, structuredContent=payload)
+
+    async def fake_resolve(_settings, _target):  # noqa: ANN001
+        return "11111111-2222-3333-4444-555555555555"
+
+    original_call, original_resolve = runai_mcp.mcp_call, runai_mcp.resolve_runai_cluster_id
+    runai_mcp.mcp_call = fake_mcp_call
+    runai_mcp.resolve_runai_cluster_id = fake_resolve
+    try:
+        # No node, no workload id, no project: an operator question's shape.
+        target = replace(make_target(), node="", pod="", runai_workload_id="", project="")
+        settings = replace(make_settings(), runai_mcp_url="http://runai-mcp.local")
+        results = asyncio.run(
+            runai_mcp.gather_runai_via_mcp(
+                settings, target, headers={"Authorization": "Bearer t"}
+            )
+        )
+    finally:
+        runai_mcp.mcp_call = original_call
+        runai_mcp.resolve_runai_cluster_id = original_resolve
+
+    tools = [tool for tool, _args in called]
+    assert "get_cluster_physical_inventory" in tools, tools
+    assert _mcp_cluster_gpu_model(results) == "NVIDIA-H100-80GB-HBM3"
+
+
+def test_cluster_inventory_failure_never_breaks_the_gather() -> None:
+    """Resolution failure is one evidence row, not a lost Run:ai snapshot."""
+    import asyncio
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from app.collectors import runai_mcp
+    from app.collectors.runai import _mcp_cluster_gpu_model
+    from tests.test_orchestrator import make_settings, make_target
+
+    async def fake_mcp_call(url, tool, arguments, headers=None):  # noqa: ANN001
+        return SimpleNamespace(isError=False, structuredContent={"ok": True})
+
+    async def boom(_settings, _target):  # noqa: ANN001
+        raise RuntimeError("Run:ai base URL is not configured")
+
+    original_call, original_resolve = runai_mcp.mcp_call, runai_mcp.resolve_runai_cluster_id
+    runai_mcp.mcp_call = fake_mcp_call
+    runai_mcp.resolve_runai_cluster_id = boom
+    try:
+        results = asyncio.run(
+            runai_mcp.gather_runai_via_mcp(
+                replace(make_settings(), runai_mcp_url="http://runai-mcp.local"),
+                replace(make_target(), node=""),
+                headers={"Authorization": "Bearer t"},
+            )
+        )
+    finally:
+        runai_mcp.mcp_call = original_call
+        runai_mcp.resolve_runai_cluster_id = original_resolve
+
+    assert any(not item.get("error") for item in results), "other tools must survive"
+    inventory = [item for item in results if item.get("name") == "cluster_inventory"]
+    assert len(inventory) == 1 and inventory[0]["error"]
+    # Unknown model => gate stays off rather than guessing.
+    assert _mcp_cluster_gpu_model(results) == ""
