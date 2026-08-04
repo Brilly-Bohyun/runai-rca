@@ -323,7 +323,10 @@ def test_cluster_inventory_is_gathered_without_the_llm_choosing_it() -> None:
 
     tools = [tool for tool, _args in called]
     assert "get_cluster_physical_inventory" in tools, tools
-    assert _mcp_cluster_gpu_model(results) == "NVIDIA-H100-80GB-HBM3"
+    # The catalog token, not the raw product label: the mixed-cluster check has
+    # to compare at catalog granularity (two memory sizes of one A100 are one
+    # model), and once it does there is no single raw string left to hand back.
+    assert _mcp_cluster_gpu_model(results) == "H100"
 
 
 def test_cluster_inventory_failure_never_breaks_the_gather() -> None:
@@ -362,3 +365,68 @@ def test_cluster_inventory_failure_never_breaks_the_gather() -> None:
     assert len(inventory) == 1 and inventory[0]["error"]
     # Unknown model => gate stays off rather than guessing.
     assert _mcp_cluster_gpu_model(results) == ""
+
+
+def test_two_memory_sizes_of_one_model_are_not_a_mixed_cluster() -> None:
+    """The live cluster that exposed this reported
+
+        byGpuModel: [NVIDIA-A100-SXM4-40GB, NVIDIA-A100-SXM4-80GB]
+
+    Two memory sizes of one A100 -- which the XID catalog knows as a single
+    model, since gpu_models lists A100. Counting the RAW product strings called
+    that a mixed cluster and switched the gate off, so B100/GB200-only upstream
+    XIDs kept surfacing on hardware that cannot raise them.
+    """
+    from app.collectors.runai_mcp import runai_cluster_gpu_model
+
+    def inventory(*models: str) -> dict:
+        return {"byGpuModel": [{"gpuModel": m, "nodes": 1} for m in models]}
+
+    assert (
+        runai_cluster_gpu_model(
+            inventory("NVIDIA-A100-SXM4-40GB", "NVIDIA-A100-SXM4-80GB")
+        )
+        == "A100"
+    )
+    # A genuine mix still gives up: gating on either would delete the other's
+    # upstream knowledge.
+    assert runai_cluster_gpu_model(
+        inventory("NVIDIA-A100-SXM4-40GB", "NVIDIA-H100-80GB-HBM3")
+    ) == ""
+    assert runai_cluster_gpu_model(inventory("NVIDIA-H100-80GB-HBM3")) == "H100"
+    assert runai_cluster_gpu_model(inventory()) == ""
+    # No recognisable token: hand the raw string back rather than dropping it,
+    # so the consumer's own resolver still gets its chance.
+    assert runai_cluster_gpu_model(inventory("SomeAccelerator-XYZ")) == "SomeAccelerator-XYZ"
+
+
+def test_same_model_two_memory_sizes_gates_the_inapplicable_upstream_xids() -> None:
+    """End to end: the live inventory shape must now reach the gate."""
+    from app.collectors.runai_mcp import runai_cluster_gpu_model
+    from app.services.kg_enrichment import _query_remediation
+
+    model = runai_cluster_gpu_model(
+        {
+            "byGpuModel": [
+                {"gpuModel": "NVIDIA-A100-SXM4-40GB", "gpusTotal": 8, "nodes": 1},
+                {"gpuModel": "NVIDIA-A100-SXM4-80GB", "gpusTotal": 8, "nodes": 1},
+            ]
+        }
+    )
+    assert model == "A100"
+
+    def extra(query: str) -> list[dict]:
+        if "fixes_for_xid(48)" in query:
+            return [{"x": "Power-cycle or reset the GPU."}]
+        if "xids_for_gpu_model" in query:
+            # A100's catalog set: no 144/145/146, which are B100/GB200-only.
+            return [{"x": code} for code in (45, 48, 63, 64, 79)]
+        return []
+
+    out = _query_remediation(
+        _FakeClient(_root_chain_run(extra)), "", [48], model
+    )  # type: ignore[arg-type]
+    # 144/145/146 are B100/GB200-only: gone. The observed XID keeps its fix.
+    assert out.root_xids == {}
+    assert 48 in out.xid_fixes
+    assert any("144" in w for w in out.warnings), out.warnings

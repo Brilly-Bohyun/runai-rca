@@ -19,13 +19,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.collectors.base import AnalysisTarget
 from app.config import Settings
-from app.knowledge import _keyword_hits
+from app.knowledge import _keyword_hits, gpu_model_tokens
 from app.ontology.typedb_client import TypeDBClient, escape_typeql
 from ontology.normalization import workload_uid
 
@@ -547,26 +546,20 @@ def _query_remediation(
     return out
 
 
-# A100/H100/B100 and the GB-prefixed superchips, as the XID catalog names them.
-_GPU_MODEL_TOKEN = re.compile(r"\b(?:GB\d{2,4}|[A-Z]\d{3,4})\b")
-
-
 def _gpu_model_candidates(gpu_model: str) -> list[str]:
     """The reported GPU string, then the catalog-shaped model tokens inside it.
 
     ``xids_for_gpu_model`` matches the catalog name exactly (A100, H100, GB200),
-    but a node reports the GPU Feature Discovery product label — for example
+    but a node reports the GPU Feature Discovery product label -- for example
     ``NVIDIA-H100-80GB-HBM3``. Trying the raw value first keeps an
     already-canonical name working; the tokens are what make the per-model gate
     reachable from a real cluster at all, instead of a guard that never fires.
-    A string with no recognisable token contributes no extra candidate, so an
-    unknown model leaves the gate off rather than guessing at one.
     """
     value = str(gpu_model or "").strip()
     if not value:
         return []
     candidates = [value]
-    for token in _GPU_MODEL_TOKEN.findall(value.upper()):
+    for token in gpu_model_tokens(value):
         if token not in candidates:
             candidates.append(token)
     return candidates

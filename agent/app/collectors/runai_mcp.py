@@ -20,6 +20,7 @@ from uuid import UUID
 from app.collectors.base import AnalysisTarget
 from app.collectors.http_json import get_json
 from app.config import Settings
+from app.knowledge import gpu_model_tokens
 from app.masking import build_masker
 from app.mcp_client import (
     mcp_budget,
@@ -267,9 +268,24 @@ def runai_cluster_gpu_model(payload: Any) -> str:
     by_model = payload.get("byGpuModel") if isinstance(payload, dict) else None
     if not isinstance(by_model, list):
         return ""
-    models = {
+    raw_models = [
         str(entry.get("gpuModel")).strip()
         for entry in by_model
         if isinstance(entry, dict) and str(entry.get("gpuModel") or "").strip()
+    ]
+    if not raw_models:
+        return ""
+    # Compare at CATALOG granularity, not on the raw product string. A real
+    # cluster reported NVIDIA-A100-SXM4-40GB alongside NVIDIA-A100-SXM4-80GB --
+    # two memory sizes of one A100, which the XID catalog knows as a single
+    # model. Counting the raw strings called that a mixed cluster and switched
+    # the gate off, so B100/GB200-only upstream XIDs kept surfacing on hardware
+    # that cannot raise them. Only a genuine mix (A100 next to H100) gives up.
+    catalog_models = {
+        token for model in raw_models for token in gpu_model_tokens(model)[:1]
     }
-    return next(iter(models)) if len(models) == 1 else ""
+    if len(catalog_models) > 1:
+        return ""
+    # An unrecognised product string yields no token at all; hand back the raw
+    # value so the caller's own resolver still gets its chance at it.
+    return raw_models[0] if not catalog_models else next(iter(catalog_models))

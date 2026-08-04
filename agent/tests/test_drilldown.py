@@ -2357,7 +2357,10 @@ def test_runai_cluster_gpu_model_extracts_the_single_distinct_model() -> None:
             {"gpuModel": "NVIDIA-H100-80GB-HBM3", "nodes": 4, "gpusTotal": 32},
         ],
     }
-    assert drilldown.runai_cluster_gpu_model(payload) == "NVIDIA-H100-80GB-HBM3"
+    # The catalog token, not the raw product label: the mixed-cluster check
+    # compares at catalog granularity, so two memory sizes of one A100 count as
+    # one model -- and then there is no single raw string left to return.
+    assert drilldown.runai_cluster_gpu_model(payload) == "H100"
 
 
 def test_runai_cluster_gpu_model_leaves_mixed_cluster_unresolved() -> None:
@@ -2406,7 +2409,7 @@ async def test_cluster_physical_inventory_sets_runai_gpu_model_with_no_node() ->
         drilldown._drilldown_masker(drill_settings()),
     )
 
-    assert result.details["gpu_model"] == "NVIDIA-H100-80GB-HBM3"
+    assert result.details["gpu_model"] == "H100"
 
 
 @pytest.mark.asyncio
