@@ -2016,3 +2016,20 @@ def _redact_negated_keywords(text: str, keywords: list[str]) -> str:
             chars[idx:end] = " " * (end - idx)
             redacted.append((idx, end))
     return "".join(chars)
+
+
+# A100/H100/B100 and the GB-prefixed superchips, as the XID catalog names them.
+# Lives here so the Run:ai collector and the ontology lookup share one
+# definition: the collector must decide whether a cluster is genuinely
+# multi-model, and that question is only answerable at CATALOG granularity.
+_GPU_MODEL_TOKEN = re.compile(r"\b(?:GB\d{2,4}|[A-Z]\d{3,4})\b")
+
+
+def gpu_model_tokens(value: str) -> list[str]:
+    """Catalog-shaped model tokens inside a raw GPU product string.
+
+    ``NVIDIA-A100-SXM4-80GB`` -> ``["A100"]``. A string with no recognisable
+    token yields none, so an unknown product leaves every caller's gate off
+    rather than guessing at a model.
+    """
+    return _GPU_MODEL_TOKEN.findall(str(value or "").upper())
